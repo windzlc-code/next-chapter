@@ -161,12 +161,14 @@ function resolveProviderTarget(provider, session) {
   const base = PROVIDERS[provider];
   const fields = PROVIDER_FIELD_MAP[provider];
   const config = session?.config || {};
-  const geminiEndpoint = String(config.geminiEndpoint || "").trim() || PROVIDERS.gemini.endpoint;
+  const sharedGeminiEndpoint = String(config.geminiEndpoint || "").trim() || PROVIDERS.gemini.endpoint;
   const geminiKey = String(config.geminiKey || "").trim() || PROVIDERS.gemini.apiKey;
+  const explicitProviderEndpoint = String(config[fields.endpoint] || "").trim();
   const endpoint =
-    String(config[fields.endpoint] || "").trim() ||
-    (provider === "gemini" ? geminiEndpoint : geminiEndpoint || base.endpoint) ||
-    base.endpoint;
+    explicitProviderEndpoint ||
+    base.endpoint ||
+    (provider === "gemini" ? sharedGeminiEndpoint : sharedGeminiEndpoint) ||
+    PROVIDERS.gemini.endpoint;
   let apiKey = String(config[fields.apiKey] || "").trim();
 
   if (!apiKey) {
