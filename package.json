@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "vite",
     "proxy:start": "node server/ai-proxy.mjs",
+    "doc:mobile-api": "node scripts/generate-api-docx.mjs",
     "playwright-server": "node playwright-server.mjs",
     "dev:full": "concurrently \"npm run playwright-server\" \"npm run dev\"",
     "build": "vite build",
