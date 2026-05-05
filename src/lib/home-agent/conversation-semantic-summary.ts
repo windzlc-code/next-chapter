@@ -1,6 +1,7 @@
 import { callModelAPI } from "@/lib/agent/api-client";
 import type { ConversationProjectSnapshot, HomeAgentMessage } from "./types";
 import { buildFallbackCompactedConversationSummary } from "./conversation-compact";
+import { isServerProxyEndpoint } from "@/lib/server-proxy";
 
 interface RefineCompactedConversationSummaryInput {
   existingSummary: string;
@@ -158,7 +159,7 @@ export async function refineCompactedConversationSummary(
   const apiKey = input.apiKey?.trim();
   const model = input.model?.trim();
 
-  if (!apiKey || !model || !input.compactedMessages.length) {
+  if ((!apiKey && !isServerProxyEndpoint(input.baseUrl)) || !model || !input.compactedMessages.length) {
     return fallback;
   }
 

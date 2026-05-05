@@ -6,6 +6,7 @@ import {
   type JimengExecutionMode,
 } from "@/lib/api-config";
 import { dreaminaCliGetStatus } from "@/lib/dreamina-cli";
+import { hasUsableApiCredential, isServerProxyEndpoint } from "@/lib/server-proxy";
 
 export type HomeAgentLaunchActionId =
   | "open_settings"
@@ -55,17 +56,24 @@ let readinessInflightPromise: Promise<HomeAgentLaunchReadiness> | null = null;
 
 function hasUsableTextModelKey(): boolean {
   const config = getApiConfig();
-  return Boolean(config.claudeKey?.trim() || config.geminiKey?.trim() || config.gptKey?.trim());
+  return (
+    hasUsableApiCredential(config.claudeEndpoint, config.claudeKey) ||
+    hasUsableApiCredential(config.geminiEndpoint, config.geminiKey) ||
+    hasUsableApiCredential(config.gptEndpoint, config.gptKey)
+  );
 }
 
 function hasUsableSeedanceApiKey(): boolean {
   const config = getApiConfig();
-  return Boolean(resolveJimengApiKey(config));
+  return isServerProxyEndpoint(config.jimengEndpoint) || Boolean(resolveJimengApiKey(config));
 }
 
 function hasUsableImageModelKey(): boolean {
   const config = getApiConfig();
-  return Boolean(config.geminiKey?.trim() || config.tuziKey?.trim());
+  return (
+    hasUsableApiCredential(config.geminiEndpoint, config.geminiKey) ||
+    hasUsableApiCredential(config.tuziEndpoint, config.tuziKey)
+  );
 }
 
 function buildImageState(): HomeAgentLaunchReadiness["image"] {
@@ -235,11 +243,11 @@ export async function readHomeAgentLaunchReadiness(): Promise<HomeAgentLaunchRea
   });
   const cacheKey = JSON.stringify({
     mode,
-    claude: Boolean(config.claudeKey?.trim()),
-    gemini: Boolean(config.geminiKey?.trim()),
-    gpt: Boolean(config.gptKey?.trim()),
-    tuzi: Boolean(config.tuziKey?.trim()),
-    jimeng: Boolean(resolveJimengApiKey(config)),
+    claude: hasUsableApiCredential(config.claudeEndpoint, config.claudeKey),
+    gemini: hasUsableApiCredential(config.geminiEndpoint, config.geminiKey),
+    gpt: hasUsableApiCredential(config.gptEndpoint, config.gptKey),
+    tuzi: hasUsableApiCredential(config.tuziEndpoint, config.tuziKey),
+    jimeng: isServerProxyEndpoint(config.jimengEndpoint) || Boolean(resolveJimengApiKey(config)),
     endpoint: config.jimengEndpoint || "",
     cliAccessible: Boolean(window.electronAPI?.dreaminaCli?.exec),
   });

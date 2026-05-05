@@ -8,6 +8,7 @@
 import type Anthropic from '@anthropic-ai/sdk'
 import { v4 as uuidv4 } from 'uuid'
 import { getNetworkRetrySettings } from '@/lib/network-retry-settings'
+import { isServerProxyEndpoint } from '@/lib/server-proxy'
 import type { Tool } from './tool'
 import type { AssistantMessage, ContentBlock, UsageStats } from './types'
 
@@ -102,6 +103,21 @@ function buildChatCompletionsApiUrl(baseUrl?: string): string {
   return `${root}/v1/chat/completions`
 }
 
+function withOptionalAuthorization(
+  headers: Record<string, string>,
+  apiKey: string,
+  url: string,
+): Record<string, string> {
+  if (!apiKey || isServerProxyEndpoint(url)) {
+    return headers
+  }
+
+  return {
+    ...headers,
+    Authorization: `Bearer ${apiKey}`,
+  }
+}
+
 async function fetchWithRetry(opts: {
   url: string
   apiKey: string
@@ -114,11 +130,10 @@ async function fetchWithRetry(opts: {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const response = await fetch(opts.url, {
       method: 'POST',
-      headers: {
+      headers: withOptionalAuthorization({
         'content-type': 'application/json',
-        Authorization: `Bearer ${opts.apiKey}`,
         ...(opts.headers ?? {}),
-      },
+      }, opts.apiKey, opts.url),
       body: JSON.stringify(opts.body),
       signal: opts.signal,
     })
@@ -972,10 +987,9 @@ export async function callModelAPI(opts: CallModelOptions): Promise<AssistantMes
     : await (async () => {
         const response = await fetch(requestUrl, {
           method: 'POST',
-          headers: {
+          headers: withOptionalAuthorization({
             'content-type': 'application/json',
-            Authorization: `Bearer ${apiKey}`,
-          },
+          }, apiKey, requestUrl),
           body: JSON.stringify(requestParams),
         })
 
@@ -1156,11 +1170,10 @@ export async function* callModelAPIStream(opts: CallModelOptions): AsyncGenerato
 
   const response = await fetch(requestUrl, {
     method: 'POST',
-    headers: {
+    headers: withOptionalAuthorization({
       'content-type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
       'anthropic-version': '2023-06-01',
-    },
+    }, apiKey, requestUrl),
     body: JSON.stringify(requestParams),
   })
 

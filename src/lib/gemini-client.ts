@@ -9,6 +9,7 @@ import {
   resolveConfiguredModelName,
   resolveJimengApiKey,
 } from "@/lib/api-config";
+import { isServerProxyEndpoint } from "@/lib/server-proxy";
 import { getNetworkRetrySettings } from "@/lib/network-retry-settings";
 import { getResolvedFilesStoragePath } from "@/lib/storage-path";
 import {
@@ -217,14 +218,14 @@ export async function directFetch(
   signal?: AbortSignal,
   serviceHint: AiService | null = null,
 ): Promise<Response> {
-  const apiKey = resolveDirectApiKey(serviceHint);
+  const apiKey = isServerProxyEndpoint(targetUrl) ? "" : resolveDirectApiKey(serviceHint);
 
   const { maxRetries: MAX_RETRIES, delayMs: BASE_DELAY_MS } =
     getNetworkRetrySettings();
 
   const doFetch = () => {
     const headers: Record<string, string> = { ...targetHeaders };
-    if (!headers["Authorization"] && !headers["authorization"]) {
+    if (apiKey && !headers["Authorization"] && !headers["authorization"]) {
       headers["Authorization"] = `Bearer ${apiKey}`;
     }
     // Determine method: POST if Content-Type is set OR if body is FormData
@@ -281,7 +282,7 @@ export async function geminiFetch(
 ): Promise<Response> {
   await waitForGeminiSlot();
   try {
-    const apiKey = resolveDirectApiKey("gemini");
+    const apiKey = isServerProxyEndpoint(targetUrl) ? "" : resolveDirectApiKey("gemini");
     const { maxRetries: MAX_RETRIES, delayMs: BASE_DELAY_MS } =
       getNetworkRetrySettings();
 
@@ -290,7 +291,7 @@ export async function geminiFetch(
 
       try {
         const headers: Record<string, string> = { ...targetHeaders };
-        if (!headers["Authorization"] && !headers["authorization"]) {
+        if (apiKey && !headers["Authorization"] && !headers["authorization"]) {
           headers["Authorization"] = `Bearer ${apiKey}`;
         }
         const resp = await fetch(targetUrl, {

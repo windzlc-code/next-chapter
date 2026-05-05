@@ -10,6 +10,7 @@ import {
 import { buildAutoResearchPlan } from "@/lib/home-agent/auto-research";
 import type { HomeAgentMessage, StudioRuntimeState } from "@/lib/home-agent/types";
 import { resolveHomeAgentTextModelRuntime } from "@/lib/home-agent/text-models";
+import { isServerProxyEndpoint } from "@/lib/server-proxy";
 
 export type HomeAgentEngineDeps = {
   createDefaultTools: typeof import("@/lib/agent/tools").createDefaultTools;
@@ -54,7 +55,7 @@ export async function getOrCreateHomeAgentEngine(params: {
     );
   const resolvedRuntime = resolveHomeAgentTextModelRuntime(apiConfig, selectedTextModelKey);
 
-  if (!resolvedRuntime.apiKey) {
+  if (!resolvedRuntime.apiKey && !isServerProxyEndpoint(resolvedRuntime.baseUrl)) {
     throw new Error(`当前未配置 ${resolvedRuntime.option.supplierLabel} / ${resolvedRuntime.option.familyLabel} 的文本模型密钥，请先在设置中完成配置。`);
   }
 
@@ -122,7 +123,7 @@ export async function launchHomeAgentAutoResearchTasks(params: {
 
   const apiConfig = await loadApiConfigModule();
   const resolvedRuntime = resolveHomeAgentTextModelRuntime(apiConfig, selectedTextModelKey);
-  if (!resolvedRuntime.apiKey) return null;
+  if (!resolvedRuntime.apiKey && !isServerProxyEndpoint(resolvedRuntime.baseUrl)) return null;
 
   const tool = new AgentTool();
   const context = new ToolUseContext({

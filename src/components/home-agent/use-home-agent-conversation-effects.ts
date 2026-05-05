@@ -10,6 +10,7 @@ import {
 import { buildMediaContentSummary } from "@/lib/home-agent/media-generation-copy";
 import { resolveHomeAgentTextModelRuntime } from "@/lib/home-agent/text-models";
 import { extractAssistantProjectTitle } from "@/lib/home-agent/project-title";
+import { isServerProxyEndpoint } from "@/lib/server-proxy";
 import type {
   AgentConversationMode,
   AutomationMode,
@@ -714,7 +715,7 @@ export function useHomeAgentConversationEffects(params: {
           loadApiConfigModule(),
         ]);
         const resolvedRuntime = resolveHomeAgentTextModelRuntime(apiConfig, selectedTextModelKey);
-        if (!resolvedRuntime.apiKey) return;
+        if (!resolvedRuntime.apiKey && !isServerProxyEndpoint(resolvedRuntime.baseUrl)) return;
         const refinedSummary = await semanticSummary.refineCompactedConversationSummary({
           existingSummary: baseSummary,
           compactedMessages: plan.compactedMessages,

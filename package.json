@@ -8,6 +8,7 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
+    "proxy:start": "node server/ai-proxy.mjs",
     "playwright-server": "node playwright-server.mjs",
     "dev:full": "concurrently \"npm run playwright-server\" \"npm run dev\"",
     "build": "vite build",

@@ -6,6 +6,7 @@
 import { ToolBase, type ToolUseContext, type CanUseToolFn } from '../tool'
 import type { AssistantMessage, ToolResult } from '../types'
 import { QueryEngine } from '../query-engine'
+import { isServerProxyEndpoint } from '@/lib/server-proxy'
 import {
   clearTaskStopHandler,
   getTask,
@@ -70,7 +71,7 @@ export class AgentTool extends ToolBase {
 
     const apiKey = context.options.apiKey
     const baseUrl = context.options.baseUrl
-    if (!apiKey) {
+    if (!apiKey && !isServerProxyEndpoint(baseUrl)) {
       throw new Error('Agent tool requires an API key in the current tool context.')
     }
 

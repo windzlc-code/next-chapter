@@ -12,6 +12,7 @@ import {
   resolveJimengApiKey,
 } from "@/lib/api-config";
 import { dreaminaCliGetStatus } from "@/lib/dreamina-cli";
+import { hasUsableApiCredential, isServerProxyEndpoint } from "@/lib/server-proxy";
 import {
   buildCharacterAssetFileStem,
   buildCharacterAssetLabel,
@@ -2012,7 +2013,7 @@ async function ensureVideoGenerationTransport(
   }
 
   if (provider === "tuzi") {
-    if (!config.tuziKey?.trim()) {
+    if (!hasUsableApiCredential(config.tuziEndpoint, config.tuziKey)) {
       throw new Error("当前指定了 Tuzi / Sora 2，但缺少可用 API Key，无法发起出片。");
     }
 
@@ -2023,7 +2024,7 @@ async function ensureVideoGenerationTransport(
     };
   }
 
-  if (!resolveJimengApiKey(config)) {
+  if (!resolveJimengApiKey(config) && !isServerProxyEndpoint(config.jimengEndpoint)) {
     throw new Error(
       usesArkSeedanceApi
         ? "当前已锁定 API，但缺少 Seedance / Ark 专用 Key，无法发起出片。"

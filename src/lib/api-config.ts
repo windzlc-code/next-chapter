@@ -1,3 +1,8 @@
+import {
+  getServerProxyEndpoint,
+  shouldPreferServerProxyDefaults,
+} from "@/lib/server-proxy";
+
 export type ApiMode = "builtin";
 export type JimengExecutionMode = "api" | "cli";
 const DEFAULT_NETWORK_RETRY_COUNT = 1;
@@ -424,32 +429,83 @@ function readEnvString(name: string): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function getPreferredProxyDefaults(): Partial<ApiConfig> {
+  if (!shouldPreferServerProxyDefaults()) return {};
+  return {
+    geminiEndpoint: getServerProxyEndpoint("gemini"),
+    gptEndpoint: getServerProxyEndpoint("gpt"),
+    claudeEndpoint: getServerProxyEndpoint("claude"),
+    grokEndpoint: getServerProxyEndpoint("grok"),
+    seedreamEndpoint: getServerProxyEndpoint("seedream"),
+    jimengEndpoint: getServerProxyEndpoint("jimeng"),
+    tuziEndpoint: getServerProxyEndpoint("tuzi"),
+  };
+}
+
 function getEnvDefaultApiConfig(): Partial<ApiConfig> {
+  const proxyDefaults = getPreferredProxyDefaults();
   const unifiedKey = readEnvString("VITE_DEFAULT_UNIFIED_API_KEY");
   const textEndpoint = readEnvString("VITE_DEFAULT_TEXT_ENDPOINT");
   const imageEndpoint = readEnvString("VITE_DEFAULT_IMAGE_ENDPOINT") || textEndpoint;
   const videoEndpoint = readEnvString("VITE_DEFAULT_VIDEO_ENDPOINT") || imageEndpoint || textEndpoint;
 
   return {
-    geminiEndpoint: readEnvString("VITE_DEFAULT_GEMINI_ENDPOINT") || imageEndpoint,
+    geminiEndpoint:
+      readEnvString("VITE_DEFAULT_GEMINI_ENDPOINT") ||
+      proxyDefaults.geminiEndpoint ||
+      imageEndpoint,
     geminiKey: readEnvString("VITE_DEFAULT_GEMINI_KEY") || unifiedKey,
-    gptEndpoint: readEnvString("VITE_DEFAULT_GPT_ENDPOINT") || textEndpoint,
+    gptEndpoint:
+      readEnvString("VITE_DEFAULT_GPT_ENDPOINT") ||
+      proxyDefaults.gptEndpoint ||
+      textEndpoint,
     gptKey: readEnvString("VITE_DEFAULT_GPT_KEY") || unifiedKey,
-    claudeEndpoint: readEnvString("VITE_DEFAULT_CLAUDE_ENDPOINT") || textEndpoint,
+    claudeEndpoint:
+      readEnvString("VITE_DEFAULT_CLAUDE_ENDPOINT") ||
+      proxyDefaults.claudeEndpoint ||
+      textEndpoint,
     claudeKey: readEnvString("VITE_DEFAULT_CLAUDE_KEY") || unifiedKey,
-    grokEndpoint: readEnvString("VITE_DEFAULT_GROK_ENDPOINT") || textEndpoint,
+    grokEndpoint:
+      readEnvString("VITE_DEFAULT_GROK_ENDPOINT") ||
+      proxyDefaults.grokEndpoint ||
+      textEndpoint,
     grokKey: readEnvString("VITE_DEFAULT_GROK_KEY") || unifiedKey,
-    seedreamEndpoint: readEnvString("VITE_DEFAULT_SEEDREAM_ENDPOINT") || imageEndpoint,
+    seedreamEndpoint:
+      readEnvString("VITE_DEFAULT_SEEDREAM_ENDPOINT") ||
+      proxyDefaults.seedreamEndpoint ||
+      imageEndpoint,
     seedreamKey: readEnvString("VITE_DEFAULT_SEEDREAM_KEY") || unifiedKey,
-    jimengEndpoint: readEnvString("VITE_DEFAULT_JIMENG_ENDPOINT") || videoEndpoint,
+    jimengEndpoint:
+      readEnvString("VITE_DEFAULT_JIMENG_ENDPOINT") ||
+      proxyDefaults.jimengEndpoint ||
+      videoEndpoint,
     jimengKey: readEnvString("VITE_DEFAULT_JIMENG_KEY") || unifiedKey,
     jimengExecutionMode:
       readEnvString("VITE_DEFAULT_JIMENG_EXECUTION_MODE") === "api" ||
       readEnvString("VITE_DEFAULT_JIMENG_EXECUTION_MODE") === "cli"
         ? (readEnvString("VITE_DEFAULT_JIMENG_EXECUTION_MODE") as JimengExecutionMode)
         : undefined,
-    tuziEndpoint: readEnvString("VITE_DEFAULT_TUZI_ENDPOINT") || textEndpoint,
+    tuziEndpoint:
+      readEnvString("VITE_DEFAULT_TUZI_ENDPOINT") ||
+      proxyDefaults.tuziEndpoint ||
+      textEndpoint,
     tuziKey: readEnvString("VITE_DEFAULT_TUZI_KEY") || unifiedKey,
+  };
+}
+
+function applyProxyEndpointFallbacks(config: ApiConfig): ApiConfig {
+  const proxyDefaults = getPreferredProxyDefaults();
+  if (!Object.keys(proxyDefaults).length) return config;
+
+  return {
+    ...config,
+    geminiEndpoint: config.geminiEndpoint || proxyDefaults.geminiEndpoint || "",
+    gptEndpoint: config.gptEndpoint || proxyDefaults.gptEndpoint || "",
+    claudeEndpoint: config.claudeEndpoint || proxyDefaults.claudeEndpoint || "",
+    grokEndpoint: config.grokEndpoint || proxyDefaults.grokEndpoint || "",
+    seedreamEndpoint: config.seedreamEndpoint || proxyDefaults.seedreamEndpoint || "",
+    jimengEndpoint: config.jimengEndpoint || proxyDefaults.jimengEndpoint || "",
+    tuziEndpoint: config.tuziEndpoint || proxyDefaults.tuziEndpoint || "",
   };
 }
 
@@ -576,12 +632,12 @@ export function getStoredApiConfig(): ApiConfig {
     } as ApiConfig;
     merged = applyLegacyCompatibility(parsed, merged);
     merged = decodeSensitiveFields(merged);
-    return normalizeStoredConfig(merged);
+    return applyProxyEndpointFallbacks(normalizeStoredConfig(merged));
   } catch {
-    return normalizeStoredConfig({
+    return applyProxyEndpointFallbacks(normalizeStoredConfig({
       ...DEFAULT_API_CONFIG,
       ...getEnvDefaultApiConfig(),
-    });
+    }));
   }
 }
 
@@ -700,9 +756,9 @@ export function resolveJimengExecutionMode(
 
 export function getApiConfig(): ApiConfig {
   try {
-    return resolveApiConfigForRuntime(getStoredApiConfig());
+    return applyProxyEndpointFallbacks(resolveApiConfigForRuntime(getStoredApiConfig()));
   } catch {
-    return applyBuiltinOverlay(DEFAULT_API_CONFIG);
+    return applyProxyEndpointFallbacks(applyBuiltinOverlay(DEFAULT_API_CONFIG));
   }
 }
 

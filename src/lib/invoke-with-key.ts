@@ -32,6 +32,7 @@ import {
   STORYBOARD_STYLE_MAP,
   DEFAULT_GEMINI_BASE_URL,
 } from "@/lib/gemini-client";
+import { isServerProxyEndpoint } from "@/lib/server-proxy";
 import {
   DEFAULT_DECOMPOSE_MODEL,
   readStoredDecomposeModel,
@@ -160,10 +161,12 @@ async function videoHttpRequest(params: {
     throw new Error("请求已取消");
   }
 
-  const mergedHeaders: Record<string, string> = {
-    ...headers,
-    Authorization: headers.Authorization || headers.authorization || `Bearer ${resolveDirectApiKey(service)}`,
-  };
+  const authHeader = headers.Authorization ||
+    headers.authorization ||
+    (isServerProxyEndpoint(url) ? "" : `Bearer ${resolveDirectApiKey(service)}`);
+  const mergedHeaders: Record<string, string> = authHeader
+    ? { ...headers, Authorization: authHeader }
+    : { ...headers };
   const finalHeaders = body instanceof FormData
     ? Object.fromEntries(
         Object.entries(mergedHeaders).filter(([key]) => key.toLowerCase() !== "content-type"),
@@ -4333,13 +4336,15 @@ async function localGenerateVideo(body: any, abortSignal?: AbortSignal) {
 
     const targetUrl = seedanceVideoTasksBaseUrl;
 
-    const res = await fetch(targetUrl, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${resolveDirectApiKey("jimeng")}`,
-      },
-      body: formData,
-    });
+      const res = await fetch(targetUrl, {
+        method: "POST",
+        headers: isServerProxyEndpoint(targetUrl)
+          ? {}
+          : {
+              "Authorization": `Bearer ${resolveDirectApiKey("jimeng")}`,
+            },
+        body: formData,
+      });
 
     if (!res.ok) {
       const errText = await res.text();

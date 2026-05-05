@@ -4,6 +4,7 @@
 
 import { getApiConfig, isArkJimengEndpoint, resolveJimengApiKey } from "@/lib/api-config";
 import { smartDirectOrProxyFetch } from "@/lib/gemini-client";
+import { isServerProxyEndpoint } from "@/lib/server-proxy";
 
 const DEFAULT_TIMEOUT = 300_000;
 
@@ -26,7 +27,7 @@ export async function callAiApi<T = any>(
   const path = options.path || "/chat/completions";
   const timeout = options.timeout || DEFAULT_TIMEOUT;
 
-  if (!config.geminiKey?.trim()) {
+  if (!config.geminiKey?.trim() && !isServerProxyEndpoint(endpoint)) {
     throw new Error("请先在设置中配置 Gemini API Key");
   }
 
@@ -71,7 +72,7 @@ export async function callVideoApi<T = any>(
     options.endpoint || config.jimengEndpoint || config.geminiEndpoint || "https://api.zhanhu.ai/v1";
   const timeout = options.timeout || 600_000;
 
-  if (!resolveJimengApiKey(config)) {
+  if (!resolveJimengApiKey(config) && !isServerProxyEndpoint(endpoint)) {
     throw new Error(
       isArkJimengEndpoint(config.jimengEndpoint)
         ? "请先在设置中配置即梦 / Ark 专用 API Key"
@@ -124,7 +125,7 @@ export async function* callAiStreamingApi(
   const path = options.path || "/chat/completions";
   const timeout = options.timeout || DEFAULT_TIMEOUT;
 
-  if (!config.geminiKey?.trim()) {
+  if (!config.geminiKey?.trim() && !isServerProxyEndpoint(endpoint)) {
     throw new Error("请先在设置中配置 Gemini API Key");
   }
 

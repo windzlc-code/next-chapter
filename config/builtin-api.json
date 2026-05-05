@@ -10,7 +10,7 @@
   "seedreamEndpoint": "",
   "seedreamKey": "",
   "jimengEndpoint": "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks",
-  "jimengKey": "a0115da6-dddb-43af-9536-731c8487bec4",
+  "jimengKey": "",
   "tuziEndpoint": "https://api.tuziapi.com",
   "tuziKey": "",
   "modelMappings": {
