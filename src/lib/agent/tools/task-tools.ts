@@ -160,7 +160,7 @@ export function stopTask(taskId: string): boolean {
   const stop = stopHandlers.get(taskId)
   stop?.()
   stopHandlers.delete(taskId)
-  updateTask(taskId, { status: 'cancelled', output: task.output ?? 'Task cancelled by user.' })
+  updateTask(taskId, { status: 'cancelled', output: task.output ?? '任务已取消。' })
   return true
 }
 

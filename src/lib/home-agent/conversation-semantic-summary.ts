@@ -78,9 +78,6 @@ function buildProjectMemoryHints(snapshot: ConversationProjectSnapshot): string[
   if (snapshot.projectKind === "video") {
     hints.push(
       memory.shotPackets?.length ? `镜头指令包：${memory.shotPackets.length} 个` : "",
-      memory.reviewQueue?.length
-        ? `待审阅项：${memory.reviewQueue.filter((item) => item.status !== "approved").length} 条`
-        : "",
       memory.assetManifest ? `素材资产：${memory.assetManifest.items.length} 项` : "",
       memory.styleLock ? `风格锁定：${memory.styleLock.tone} / ${memory.styleLock.visualStyle}` : "",
     );

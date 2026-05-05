@@ -1,13 +1,11 @@
 const { spawn } = require("node:child_process");
+const electronBinary = require("electron");
 
 const env = { ...process.env };
 delete env.ELECTRON_RUN_AS_NODE;
 
-const launcher = process.platform === "win32" ? "npx.cmd" : "npx";
-
-const child = spawn(launcher, ["electron", "."], {
+const child = spawn(electronBinary, ["."], {
   stdio: "inherit",
-  shell: true,
   env,
 });
 

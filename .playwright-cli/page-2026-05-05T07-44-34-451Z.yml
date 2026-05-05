@@ -1,0 +1,138 @@
+- generic [active] [ref=e1]:
+  - link "跳转至主内容" [ref=e2] [cursor=pointer]:
+    - /url: "#theia-app-shell"
+  - generic [ref=e3]:
+    - generic [ref=e4]:
+      - generic [ref=e5]:
+        - generic [ref=e6]:
+          - generic [ref=e7]:
+            - generic:
+              - generic "logo"
+            - generic [ref=e9] [cursor=pointer]: 
+          - tablist [ref=e13] [cursor=pointer]:
+            - listitem [ref=e14]:
+              - generic [ref=e16]: 
+            - listitem [ref=e17]:
+              - generic [ref=e19]: 
+            - listitem [ref=e20]:
+              - generic [ref=e22]: 
+            - listitem [ref=e23]:
+              - generic [ref=e25]: 
+          - generic [ref=e27]:
+            - generic "切换主题" [ref=e29] [cursor=pointer]: 
+            - generic [ref=e31]: 
+            - generic [ref=e33] [cursor=pointer]: 
+          - generic:
+            - generic: 
+        - generic [ref=e34]:
+          - generic [ref=e35]:
+            - generic "当前连接" [ref=e36]
+            - generic [ref=e37]:
+              - generic [ref=e38] [cursor=pointer]: 
+              - generic [ref=e39] [cursor=pointer]: 
+          - generic [ref=e40]:
+            - text:    
+            - tabpanel " 当前连接" [ref=e41]:
+              - generic [ref=e46]:
+                - generic [ref=e47]: 你尚未连接实例
+                - button "新建连接" [ref=e48] [cursor=pointer]:
+                  - generic [ref=e49]: 新建连接
+            - text:          
+      - generic [ref=e52]:
+        - generic [ref=e54]:
+          - tablist [ref=e56] [cursor=pointer]: 
+          - generic [ref=e57]:
+            - generic [ref=e59] [cursor=pointer]: 返回旧版
+            - generic "终端助手" [ref=e62] [cursor=pointer]: 
+        - tabpanel [ref=e63]:
+          - generic [ref=e67]:
+            - generic [ref=e68]: 
+            - generic [ref=e71] [cursor=pointer]:
+              - generic [ref=e72]: 
+              - generic [ref=e73]: 新建连接
+            - generic [ref=e76] [cursor=pointer]:
+              - generic [ref=e77]: 
+              - generic [ref=e78]: 最近访问
+            - generic [ref=e79] [cursor=pointer]:
+              - generic [ref=e81]:
+                - generic [ref=e82]: 
+                - generic [ref=e83]: 设置
+              - generic [ref=e84]:
+                - generic [ref=e86]: Ctrl
+                - generic [ref=e88]: ","
+            - generic [ref=e91] [cursor=pointer]:
+              - generic [ref=e92]: 
+              - generic [ref=e93]: 终端助手
+    - generic "没有通知" [ref=e97]:
+      - generic [ref=e98]: 
+  - generic [ref=e99]:
+    - generic "关闭" [ref=e100]: ✖
+    - generic [ref=e101] [cursor=pointer]: 反馈
+  - generic:
+    - generic:  
+  - generic [ref=e124]:
+    - generic [ref=e125]:
+      - generic [ref=e126]: 新建连接
+      - generic [ref=e127] [cursor=pointer]: 
+    - generic [ref=e129]:
+      - generic [ref=e130]:
+        - tablist [ref=e131]:
+          - generic [ref=e133]:
+            - tab "云服务器ECS" [selected] [ref=e135] [cursor=pointer]
+            - tab "弹性容器ECI" [ref=e137] [cursor=pointer]
+        - generic:
+          - generic:
+            - tabpanel "云服务器ECS"
+      - generic [ref=e138]:
+        - text:  
+        - generic [ref=e140]:
+          - generic "实例" [ref=e142]
+          - generic [ref=e146] [cursor=pointer]:
+            - generic [ref=e147]:
+              - combobox [ref=e149]
+              - generic [ref=e151]:
+                - generic [ref=e152]:
+                  - generic [ref=e153]:
+                    - generic [ref=e154]: iZj6c9rlopwbbcolimeg8iZ
+                    - generic [ref=e155]: /
+                    - generic [ref=e157]: i-j6c9rlopwbbcolimeg8i
+                    - img [ref=e159]
+                  - generic [ref=e162]:
+                    - generic [ref=e165]: 
+                    - generic [ref=e167]: 运行中
+                - generic [ref=e168]:
+                  - generic [ref=e169]:
+                    - text: 公网 47.243.99.2
+                    - generic [ref=e170]: /
+                    - text: 私网 172.21.150.42
+                  - generic [ref=e172]: 香港
+            - generic:
+              - img: 
+        - generic [ref=e174]:
+          - generic "连接方式" [ref=e176]
+          - generic [ref=e183]:
+            - generic [ref=e184] [cursor=pointer]:
+              - radio "免密连接" [checked]
+              - generic [ref=e186]: 免密连接
+            - generic [ref=e187] [cursor=pointer]:
+              - radio "终端连接"
+              - generic [ref=e188]: 终端连接
+        - generic [ref=e190]:
+          - generic "用户名" [ref=e192]
+          - generic [ref=e196]:
+            - textbox "请输入用户名，例如 root、ecs-user" [ref=e197]: root
+            - generic [ref=e198]:
+              - button "close-circle" [ref=e199] [cursor=pointer]:
+                - img "close-circle": 
+              - generic [ref=e200]: 
+        - text:   
+    - generic [ref=e201]:
+      - button "完整选项 " [ref=e202] [cursor=pointer]:
+        - generic [ref=e203]:
+          - text: 完整选项
+          - generic [ref=e204]: 
+      - generic [ref=e205]: 如无法正常登录，通过VNC连接实例
+      - button "登录" [ref=e206] [cursor=pointer]
+      - button "取消" [ref=e207] [cursor=pointer]
+  - iframe [ref=e209]:
+    

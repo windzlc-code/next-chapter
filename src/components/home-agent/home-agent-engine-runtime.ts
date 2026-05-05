@@ -46,8 +46,7 @@ export async function getOrCreateHomeAgentEngine(params: {
     selectedTextModelKey,
   } = params;
 
-  const deps = await loadEngineDeps();
-  const apiConfig = await loadApiConfigModule();
+  const [deps, apiConfig] = await Promise.all([loadEngineDeps(), loadApiConfigModule()]);
   const tools = deps
     .createDefaultTools()
     .filter((tool) =>
@@ -114,10 +113,12 @@ export async function launchHomeAgentAutoResearchTasks(params: {
   planOverride?: ReturnType<typeof buildAutoResearchPlan>;
   taskIdFilter?: string[];
   sequential?: boolean;
-}): Promise<{ plan: ReturnType<typeof buildAutoResearchPlan>; taskIds: string[] } | null> {
+}): Promise<{ plan?: ReturnType<typeof buildAutoResearchPlan>; taskIds: string[] } | null> {
   const { prompt, runtime, loadApiConfigModule, selectedTextModelKey, planOverride, taskIdFilter, sequential } = params;
   const plan = planOverride ?? buildAutoResearchPlan(prompt, runtime.currentProjectSnapshot);
   if (!plan) return null;
+  // 改编研究（改编路线/受众适配/角色重塑）暂时隐藏，不触发后台任务
+  if (plan.reason === "adaptation-research") return null;
 
   const apiConfig = await loadApiConfigModule();
   const resolvedRuntime = resolveHomeAgentTextModelRuntime(apiConfig, selectedTextModelKey);
@@ -135,7 +136,7 @@ export async function launchHomeAgentAutoResearchTasks(params: {
   });
 
   const parentMessage = {
-    type: "assistant",
+    type: "assistant" as const,
     uuid: crypto.randomUUID(),
     message: {
       role: "assistant" as const,

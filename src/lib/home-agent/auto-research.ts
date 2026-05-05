@@ -165,117 +165,6 @@ export function buildResearchPromptOverlay(plan: AutoResearchPlan, taskIds: stri
   ].join("\n");
 }
 
-function buildScriptFollowupQuestion(headings: string[], taskIds: string[]): ComposerQuestion {
-  return {
-    id: `research-followup:${taskIds.join(",")}`,
-    title: "后台研究已返回，下一步怎么推进？",
-    description: `已完成：${headings.join("、")}`,
-    options: [
-      {
-        id: "research-followup-script-summary",
-        label: "先汇总结论",
-        value: `请先汇总刚完成的研究结论，重点整理 ${headings.join("、")} ，并给我一个清晰的创作判断。`,
-      },
-      {
-        id: "research-followup-script-plan",
-        label: "整理立项方案",
-        value: `请结合刚完成的研究，直接整理成可执行的原创剧本立项方案，明确目标受众、风格方向、核心卖点和开篇抓手。`,
-      },
-      {
-        id: "research-followup-script-characters",
-        label: "推进角色设计",
-        value: `请把刚完成的研究转成角色设计建议，先给我主角关系、人物卖点和冲突结构。`,
-      },
-    ],
-    allowCustomInput: true,
-    submissionMode: "immediate",
-    multiSelect: false,
-    stepIndex: 0,
-    totalSteps: 1,
-    answerKey: "research-followup",
-  };
-}
-
-function buildAdaptationFollowupQuestion(headings: string[], taskIds: string[]): ComposerQuestion {
-  return {
-    id: `research-followup:${taskIds.join(",")}`,
-    title: "后台研究已返回，下一步怎么推进？",
-    description: `已完成：${headings.join("、")}`,
-    options: [
-      {
-        id: "research-followup-adaptation-summary",
-        label: "先汇总结论",
-        value: `请先汇总刚完成的改编研究结论，重点整理 ${headings.join("、")} ，并给我一个最值得采用的改编判断。`,
-      },
-      {
-        id: "research-followup-adaptation-route",
-        label: "锁定改编路线",
-        value: "请基于刚完成的研究，直接给我一版最可行的改编路线，明确哪些原内容保留、哪些需要重做、哪些要本地化转译。",
-      },
-      {
-        id: "research-followup-adaptation-characters",
-        label: "重塑人物关系",
-        value: "请把刚完成的研究转成人物关系重塑方案，先给我角色卖点、关系张力和新版冲突结构。",
-      },
-    ],
-    allowCustomInput: true,
-    submissionMode: "immediate",
-    multiSelect: false,
-    stepIndex: 0,
-    totalSteps: 1,
-    answerKey: "research-followup",
-  };
-}
-
-function buildVideoFollowupQuestion(headings: string[], taskIds: string[]): ComposerQuestion {
-  return {
-    id: `research-followup:${taskIds.join(",")}`,
-    title: "后台研究已返回，下一步怎么推进？",
-    description: `已完成：${headings.join("、")}`,
-    options: [
-      {
-        id: "research-followup-video-summary",
-        label: "先汇总结论",
-        value: `请先汇总刚完成的视频研究结论，重点整理 ${headings.join("、")} ，并给我一个最稳妥的视频推进判断。`,
-      },
-      {
-        id: "research-followup-video-package",
-        label: "锁定包装方向",
-        value: "请把刚完成的研究整合成视频包装方向，明确平台节奏、视觉调性、镜头语言和首屏抓力。",
-      },
-      {
-        id: "research-followup-video-production",
-        label: "直接准备出片",
-        value: "请把刚完成的研究结论直接转成出片准备方案，告诉我下一步该先做脚本拆解、镜头包、提示词批次还是资产准备。",
-      },
-    ],
-    allowCustomInput: true,
-    submissionMode: "immediate",
-    multiSelect: false,
-    stepIndex: 0,
-    totalSteps: 1,
-    answerKey: "research-followup",
-  };
-}
-
-export function buildResearchFollowupQuestion(
-  snapshot: ConversationProjectSnapshot | null,
-  headings: string[],
-  taskIds: string[],
-): ComposerQuestion | null {
-  if (!headings.length || !taskIds.length) return null;
-
-  if (snapshot?.projectKind === "video") {
-    return buildVideoFollowupQuestion(headings, taskIds);
-  }
-
-  if (snapshot?.projectKind === "adaptation") {
-    return buildAdaptationFollowupQuestion(headings, taskIds);
-  }
-
-  return buildScriptFollowupQuestion(headings, taskIds);
-}
-
 export function buildAutoResearchChoiceQuestion(plan: AutoResearchPlan): ComposerQuestion {
   return buildAutoResearchStepQuestion(plan, 0) as ComposerQuestion;
 }
@@ -287,12 +176,12 @@ function buildAutoResearchStepOptions(task: AutoResearchTaskSpec): Array<{
 }> {
   if (task.id === "market-fit" || task.title.includes("目标市场")) {
     return [
-      { id: "cn-zh", label: "中国（中文）", rationale: "面向中文用户与中文平台生态。"},
-      { id: "us-eu-en", label: "欧美（英文）", rationale: "面向英语用户与海外平台分发。"},
-      { id: "jp-kr", label: "日韩（本地语）", rationale: "面向日语/韩语语境与审美偏好。"},
-      { id: "sea", label: "东南亚（英语/本地语）", rationale: "兼顾英语与本地化语境，重短视频扩散。"},
-      { id: "global", label: "全球多语", rationale: "从一开始按多语言版本规划。"},
-      { id: "uncertain", label: "暂不确定，先给推荐", rationale: "由系统先给默认市场建议。"},
+      { id: "cn-zh", label: "中国（中文）", rationale: "面向中文用户与中文平台生态。" },
+      { id: "us-eu-en", label: "欧美（英文）", rationale: "面向英语用户与海外平台分发。" },
+      { id: "jp-kr", label: "日韩（本地语）", rationale: "面向日语/韩语语境与审美偏好。" },
+      { id: "sea", label: "东南亚（英语/本地语）", rationale: "兼顾英语与本地化语境，重短视频扩散。" },
+      { id: "global", label: "全球多语", rationale: "从一开始按多语言版本规划。" },
+      { id: "uncertain", label: "暂不确定，先给推荐", rationale: "由系统先给默认市场建议。" },
     ];
   }
 
@@ -302,7 +191,7 @@ function buildAutoResearchStepOptions(task: AutoResearchTaskSpec): Array<{
       { id: "emotion-share", label: "情绪共鸣可分享", rationale: "强调情绪击中与转发讨论，适合社媒扩散。" },
       { id: "realist-trust", label: "现实纪实可信感", rationale: "强调真实语境与可信表达，利于信任沉淀。" },
       { id: "premium-brand", label: "高级质感品牌向", rationale: "强调画面质感与调性统一，利于品牌化内容。" },
-      { id: "uncertain", label: "暂不确定，先给推荐", rationale: "由系统先给默认风格路线。"},
+      { id: "uncertain", label: "暂不确定，先给推荐", rationale: "由系统先给默认风格路线。" },
     ];
   }
 
@@ -312,7 +201,7 @@ function buildAutoResearchStepOptions(task: AutoResearchTaskSpec): Array<{
       { id: "character-hook", label: "人物关系卖点优先", rationale: "通过角色关系拉扯提升持续追更。" },
       { id: "twist-hook", label: "连续反转卖点优先", rationale: "通过节奏反转提升留存与讨论。" },
       { id: "emotion-hook", label: "情绪金句传播优先", rationale: "优先打造可截取、可传播的情绪点。" },
-      { id: "uncertain", label: "暂不确定，先给推荐", rationale: "由系统先给默认卖点结构。"},
+      { id: "uncertain", label: "暂不确定，先给推荐", rationale: "由系统先给默认卖点结构。" },
     ];
   }
 

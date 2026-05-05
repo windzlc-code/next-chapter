@@ -5,11 +5,16 @@ import {
   writeSkillDrafts,
 } from "./project-store";
 import { upsertStoredVideoProject } from "@/hooks/use-local-persistence";
+import { isExpiredRemoteSignedMediaUrl } from "./media-url";
 import {
   buildVideoProductionBundlePreviewMessage,
   exportVideoProductionBundle,
   resolveVideoProductionBundleDirectory,
 } from "./production-state-export";
+import {
+  buildVideoAssetBundleExportSummary,
+  exportVideoAssetBundle,
+} from "./video-asset-export";
 import {
   exportApprovedSkillDraftBundle,
   exportApprovedSkillDrafts,
@@ -23,39 +28,63 @@ import type {
   WorkflowActionResult,
 } from "./types";
 import {
+  analyzeExportPatchAction,
   analyzeReferenceScriptAction,
+  applyComplianceAdjustmentAction,
+  autoAdjustComplianceAction,
+  confirmAdaptationEpisodeCountAction,
+  confirmAdaptationGenresAction,
+  confirmAdaptationTargetMarketAction,
   continueDramaStepAction,
+  enterDramaStepAction,
   exportDramaProjectAction,
+  exportCompliancePaletteAction,
+  refineDramaExportAction,
   generateCharacterTransformAction,
   generateCharactersAction,
   generateCreativePlanAction,
   generateDirectoryAction,
+  generateEpisodeBatchAction,
   generateEpisodeAction,
   generateOutlinesAction,
   generateStructureTransformAction,
   lockCharacterCardsAction,
   lockStoryBeatsAction,
   reopenComplianceRevisionsAction,
+  reviewEpisodeQualityAction,
+  rewriteEpisodeFromReviewAction,
   resolveComplianceRevisionsAction,
   runComplianceReviewAction,
   saveDramaSetupAction,
+  setEpisodeDurationPreferenceAction,
+  skipComplianceReviewAction,
+  updateComplianceWorkspaceAction,
+  updateDramaArtifactTextAction,
 } from "./services/drama-workflow-service";
 import {
-  approveVideoAssetsAction,
   advanceVideoWorkflowAction,
   advanceVideoWorkflowRoundAction,
   analyzeScriptForVideoAction,
   compileVideoShotPacketsAction,
+  compileSegmentVideosAction,
   continueVideoStepAction,
   createVideoBridgeArtifactAction,
+  exportStoryboardXlsxAction,
+  generateStoryboardFramesAction,
   generateVideoAssetsAction,
-  refreshVideoAssetsAction,
-  redoVideoAssetsAction,
+  generateVideoReferenceAssetsAction,
+  approveVideoAssetsAction,
   extractVideoEntitiesAction,
   prepareStoryboardBatchAction,
   prepareVideoGenerationAction,
   prepareVideoPromptBatchAction,
+  redoVideoAssetsAction,
+  refreshVideoAssetsAction,
+  refreshSegmentVideoAction,
   reviewVideoAssetsAction,
+  generateProjectImageAction,
+  prepareSegmentVideoPromptAction,
+  generateSegmentVideoAction,
 } from "./services/video-workflow-service";
 
 function buildContextSummary(runtime: StudioRuntimeState): string {
@@ -90,7 +119,7 @@ function buildContextSummary(runtime: StudioRuntimeState): string {
       ? `合规修订包：${memory.complianceRevisionPackets.length} 条`
       : "",
     memory?.assetManifest
-      ? `资产清单：${memory.assetManifest.items.length} 项 / 待审阅 ${memory.reviewQueue?.filter((item) => item.status !== "approved").length ?? 0} 项`
+      ? `资产清单：${memory.assetManifest.items.length} 项`
       : "",
     memory?.shotPackets?.length ? `镜头指令包：${memory.shotPackets.length} 个` : "",
     artifactSummary ? `可用产物：\n- ${artifactSummary}` : "",
@@ -435,6 +464,123 @@ async function exportVideoProductionBundleAction(
   };
 }
 
+/**
+ * 检查一个素材 URL 是否真实存在：
+ * - data: URL → 内联数据，直接视为存在
+ * - http/https URL → 远端资源，视为存在（无法离线验证）
+ * - 其他（本地文件路径）→ 通过 Electron readBase64 验证磁盘文件是否存在
+ */
+async function exportVideoAssetBundleAction(
+  runtime: StudioRuntimeState,
+): Promise<WorkflowActionResult> {
+  const project = runtime.currentVideoProject;
+  if (!project) {
+    throw new Error("当前没有可导出的首页视频项目。");
+  }
+
+  const manifest = runtime.currentProjectSnapshot?.memory?.assetManifest ?? project.assetManifest;
+  const exported = await exportVideoAssetBundle(project, manifest);
+  const summary = buildVideoAssetBundleExportSummary(project.title || project.id, exported);
+
+  return {
+    summary,
+    data: runtime.currentProjectSnapshot
+      ? {
+          projectSnapshot: runtime.currentProjectSnapshot,
+        }
+      : undefined,
+  };
+}
+
+async function assetExists(url: string | undefined): Promise<boolean> {
+  if (!url) return false;
+  if (isExpiredRemoteSignedMediaUrl(url)) return false;
+  // 内联数据或远端 URL：字段有值即视为存在
+  if (url.startsWith("data:") || url.startsWith("http://") || url.startsWith("https://")) return true;
+  // blob: 是浏览器临时对象 URL，无法持久化验证，字段有值即视为存在
+  if (url.startsWith("blob:")) return true;
+  // 其余均视为本地绝对文件路径（Electron 写入后返回的路径，如 D:/files/projects/.../xxx.jpg）
+  // 通过 Electron IPC readBase64 调用 fs.existsSync 做真实磁盘验证
+  const readBase64 = window.electronAPI?.storage?.readBase64;
+  if (!readBase64) return true; // 非 Electron 环境无法验证，保守视为存在
+  const result = await readBase64(url);
+  return !!result?.exists;
+}
+
+async function queryAssetStatusAction(runtime: StudioRuntimeState): Promise<WorkflowActionResult> {
+  const project = runtime.currentVideoProject;
+  const manifest = runtime.currentProjectSnapshot?.memory?.assetManifest;
+
+  if (!project && !manifest?.items.length) {
+    return { summary: "当前没有视频项目，也没有素材库记录，无法查询素材状态。" };
+  }
+
+  // 只检查 assetManifest 中已经登记的素材。
+  // 这里会同时包含项目内自动生成并已同步的图片/视频，以及用户手动拖入素材库的条目。
+  const items = manifest?.items ?? [];
+
+  if (items.length === 0) {
+    return {
+      summary: [
+        "## 素材库状态",
+        "",
+        "素材库当前为空。",
+        "当前只会识别已经同步到项目资产清单（assetManifest）的图片和视频。",
+        "项目内真实生成出的参考图、分镜图和视频会自动进入素材库；手动拖入的素材也会同步到这里。",
+        "请先生成或上传素材，再推进下一步。",
+      ].join("\n"),
+    };
+  }
+
+  const imageItems = items.filter((item) => item.kind !== "video-segment");
+  const videoItems = items.filter((item) => item.kind === "video-segment");
+
+  const lines: string[] = [`## 素材库清单（共 ${items.length} 项）\n`];
+
+  // 图片类素材
+  lines.push("### 图片素材");
+  if (imageItems.length === 0) {
+    lines.push("- 暂无图片素材");
+  } else {
+    lines.push("| 名称 | 类型 | 状态 | 文件验证 |");
+    lines.push("|------|------|------|---------|");
+    for (const item of imageItems) {
+      const exists = await assetExists(item.url);
+      const kindLabel =
+        item.kind === "character-reference" ? "角色参考图" :
+        item.kind === "costume-reference" ? "服装参考图" :
+        item.kind === "scene-reference" ? "场景参考图" :
+        item.kind === "time-variant" ? "时间变体" :
+        item.kind === "storyboard-frame" ? "分镜图" : item.kind;
+      const statusLabel = item.status === "ready" ? "就绪" : item.status === "needs-review" ? "待审阅" : "失败";
+      lines.push(`| ${item.label} | ${kindLabel} | ${statusLabel} | ${exists ? "✅ 存在" : "❌ 文件缺失"} |`);
+    }
+  }
+
+  // 视频类素材
+  lines.push("\n### 视频素材");
+  if (videoItems.length === 0) {
+    lines.push("- 暂无视频素材");
+  } else {
+    lines.push("| 名称 | 状态 | 文件验证 |");
+    lines.push("|------|------|---------|");
+    for (const item of videoItems) {
+      const exists = await assetExists(item.url);
+      const statusLabel = item.status === "ready" ? "就绪" : item.status === "needs-review" ? "待审阅" : "失败";
+      lines.push(`| ${item.label} | ${statusLabel} | ${exists ? "✅ 存在" : "❌ 文件缺失"} |`);
+    }
+  }
+
+  const missingCount = await Promise.all(items.map((i) => assetExists(i.url))).then(
+    (results) => results.filter((ok) => !ok).length,
+  );
+  if (missingCount > 0) {
+    lines.push(`\n> ⚠️ 有 ${missingCount} 个素材文件在磁盘上不存在，请重新生成或重新同步到素材库。`);
+  }
+
+  return { summary: lines.join("\n") };
+}
+
 async function previewVideoProductionBundleAction(
   runtime: StudioRuntimeState,
 ): Promise<WorkflowActionResult> {
@@ -501,6 +647,11 @@ const workflowActions: WorkflowAction[] = [
     run: continueDramaStepAction,
   },
   {
+    id: "enter-drama-step",
+    kind: "enter_drama_step",
+    run: enterDramaStepAction,
+  },
+  {
     id: "analyze-reference-script",
     kind: "analyze_reference_script",
     run: analyzeReferenceScriptAction,
@@ -514,6 +665,21 @@ const workflowActions: WorkflowAction[] = [
     id: "generate-structure-transform",
     kind: "generate_structure_transform",
     run: generateStructureTransformAction,
+  },
+  {
+    id: "confirm-adaptation-episode-count",
+    kind: "confirm_adaptation_episode_count",
+    run: confirmAdaptationEpisodeCountAction,
+  },
+  {
+    id: "confirm-adaptation-target-market",
+    kind: "confirm_adaptation_target_market",
+    run: confirmAdaptationTargetMarketAction,
+  },
+  {
+    id: "confirm-adaptation-genres",
+    kind: "confirm_adaptation_genres",
+    run: confirmAdaptationGenresAction,
   },
   {
     id: "generate-characters",
@@ -541,9 +707,59 @@ const workflowActions: WorkflowAction[] = [
     run: generateEpisodeAction,
   },
   {
+    id: "generate-episode-batch",
+    kind: "generate_episode_batch",
+    run: generateEpisodeBatchAction,
+  },
+  {
+    id: "set-episode-duration-preference",
+    kind: "set_episode_duration_preference",
+    run: setEpisodeDurationPreferenceAction,
+  },
+  {
+    id: "review-episode-quality",
+    kind: "review_episode_quality",
+    run: reviewEpisodeQualityAction,
+  },
+  {
+    id: "rewrite-episode-from-review",
+    kind: "rewrite_episode_from_review",
+    run: rewriteEpisodeFromReviewAction,
+  },
+  {
     id: "run-compliance-review",
     kind: "run_compliance_review",
     run: runComplianceReviewAction,
+  },
+  {
+    id: "skip-compliance-review",
+    kind: "skip_compliance_review",
+    run: skipComplianceReviewAction,
+  },
+  {
+    id: "update-compliance-workspace",
+    kind: "update_compliance_workspace",
+    run: updateComplianceWorkspaceAction,
+  },
+  {
+    id: "apply-compliance-adjustment",
+    kind: "apply_compliance_adjustment",
+    run: applyComplianceAdjustmentAction,
+  },
+  {
+    id: "auto-adjust-compliance",
+    kind: "auto_adjust_compliance",
+    run: autoAdjustComplianceAction,
+  },
+  {
+    id: "export-compliance-palette",
+    kind: "export_compliance_palette",
+    run: exportCompliancePaletteAction,
+  },
+  {
+    id: "update-drama-artifact-text",
+    kind: "update_drama_artifact_text",
+    run: updateDramaArtifactTextAction,
   },
   {
     id: "lock-character-cards",
@@ -591,9 +807,34 @@ const workflowActions: WorkflowAction[] = [
     run: extractVideoEntitiesAction,
   },
   {
+    id: "generate-video-reference-assets",
+    kind: "generate_video_reference_assets",
+    run: generateVideoReferenceAssetsAction,
+  },
+  {
+    id: "export-storyboard-xlsx",
+    kind: "export_storyboard_xlsx",
+    run: exportStoryboardXlsxAction,
+  },
+  {
+    id: "compile-segment-videos",
+    kind: "compile_segment_videos",
+    run: compileSegmentVideosAction,
+  },
+  {
     id: "prepare-storyboard-batch",
     kind: "prepare_storyboard_batch",
     run: prepareStoryboardBatchAction,
+  },
+  {
+    id: "generate-storyboard-frames",
+    kind: "generate_storyboard_frames",
+    run: generateStoryboardFramesAction,
+  },
+  {
+    id: "generate-project-image",
+    kind: "generate_project_image",
+    run: generateProjectImageAction,
   },
   {
     id: "compile-video-shot-packets",
@@ -604,6 +845,21 @@ const workflowActions: WorkflowAction[] = [
     id: "prepare-video-prompt-batch",
     kind: "prepare_video_prompt_batch",
     run: prepareVideoPromptBatchAction,
+  },
+  {
+    id: "prepare-segment-video-prompt",
+    kind: "prepare_segment_video_prompt",
+    run: prepareSegmentVideoPromptAction,
+  },
+  {
+    id: "generate-segment-video",
+    kind: "generate_segment_video",
+    run: generateSegmentVideoAction,
+  },
+  {
+    id: "refresh-segment-video",
+    kind: "refresh_segment_video",
+    run: refreshSegmentVideoAction,
   },
   {
     id: "generate-video-assets",
@@ -641,9 +897,24 @@ const workflowActions: WorkflowAction[] = [
     run: createVideoBridgeArtifactAction,
   },
   {
+    id: "generate-project-image",
+    kind: "generate_project_image",
+    run: generateProjectImageAction,
+  },
+  {
     id: "export-project",
     kind: "export_project",
     run: exportDramaProjectAction,
+  },
+  {
+    id: "analyze-export-patch",
+    kind: "analyze_export_patch",
+    run: analyzeExportPatchAction,
+  },
+  {
+    id: "refine-export-document",
+    kind: "refine_export_document",
+    run: refineDramaExportAction,
   },
   {
     id: "create-skill-draft",
@@ -681,6 +952,13 @@ const workflowActions: WorkflowAction[] = [
     },
   },
   {
+    id: "export-video-asset-bundle",
+    kind: "export_video_asset_bundle",
+    async run(_input, runtime) {
+      return exportVideoAssetBundleAction(runtime);
+    },
+  },
+  {
     id: "export-video-production-bundle",
     kind: "export_video_production_bundle",
     async run(_input, runtime) {
@@ -715,17 +993,25 @@ const workflowActions: WorkflowAction[] = [
       return updateSkillDraftStatusAction(input, "rejected");
     },
   },
+  {
+    id: "query-asset-status",
+    kind: "query_asset_status",
+    async run(_input, runtime) {
+      return queryAssetStatusAction(runtime);
+    },
+  },
 ];
 
 export async function runWorkflowAction(
   actionKind: string,
   input: Record<string, unknown>,
   runtime: StudioRuntimeState,
+  onProgress?: import("./types").WorkflowActionProgressCallback,
 ): Promise<WorkflowActionResult> {
   const action = workflowActions.find((item) => item.kind === actionKind);
   if (!action) {
     throw new Error(`Unsupported workflow action: ${actionKind}`);
   }
 
-  return action.run(input, runtime);
+  return action.run(input, runtime, onProgress);
 }

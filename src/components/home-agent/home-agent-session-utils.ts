@@ -1,5 +1,5 @@
 import type { AskUserQuestionRequest } from "@/lib/agent/tools/ask-user-question";
-import { readStudioSession } from "@/lib/home-agent/session-store";
+import { readStudioSessionBootstrap } from "@/lib/home-agent/session-store";
 import type {
   ComposerQuestion,
   ConversationProjectSnapshot,
@@ -11,8 +11,9 @@ import type {
 export function createInitialStudioSeed(): {
   session: StudioSessionState | null;
   runtime: StudioRuntimeState;
+  needsSessionHydration: boolean;
 } {
-  const session = readStudioSession();
+  const { session, needsHydration } = readStudioSessionBootstrap();
 
   return {
     session,
@@ -27,7 +28,9 @@ export function createInitialStudioSeed(): {
       recentProjects: [],
       recentProjectSessions: [],
       recentMessageSummary: session?.recentMessageSummary ?? "",
+      fullAutoRun: session?.fullAutoRun ?? null,
     },
+    needsSessionHydration: needsHydration,
   };
 }
 
@@ -69,7 +72,11 @@ export function hasSavedSessionContent(session: StudioSessionState | null | unde
     session?.messages?.length ||
       session?.qState ||
       session?.draft?.trim() ||
-      session?.selectedValues?.length,
+      session?.selectedValues?.length ||
+      session?.selectedImageModelFamily ||
+      session?.imageGenerationPrefs ||
+      session?.selectedVideoModelKey ||
+      session?.videoGenerationPrefs,
   );
 }
 
@@ -85,6 +92,7 @@ export function areProjectSnapshotsEquivalent(
     return (
       project.projectId === prev.projectId &&
       project.updatedAt === prev.updatedAt &&
+      project.automationMode === prev.automationMode &&
       project.derivedStage === prev.derivedStage &&
       project.currentObjective === prev.currentObjective &&
       project.agentSummary === prev.agentSummary
@@ -106,7 +114,18 @@ export function areRecentSessionsEquivalent(
     return (
       session.sessionId === prev.sessionId &&
       session.projectId === prev.projectId &&
+      session.automationMode === prev.automationMode &&
       session.selectedTextModelKey === prev.selectedTextModelKey &&
+      session.selectedImageModelFamily === prev.selectedImageModelFamily &&
+      session.selectedVideoModelKey === prev.selectedVideoModelKey &&
+      session.imageGenerationPrefs?.familyKey === prev.imageGenerationPrefs?.familyKey &&
+      session.imageGenerationPrefs?.resolution === prev.imageGenerationPrefs?.resolution &&
+      session.imageGenerationPrefs?.aspectRatio === prev.imageGenerationPrefs?.aspectRatio &&
+      session.imageGenerationPrefs?.styleCategory === prev.imageGenerationPrefs?.styleCategory &&
+      session.imageGenerationPrefs?.stylePreset === prev.imageGenerationPrefs?.stylePreset &&
+      session.imageGenerationPrefs?.customStylePrompt === prev.imageGenerationPrefs?.customStylePrompt &&
+      session.videoGenerationPrefs?.modelKey === prev.videoGenerationPrefs?.modelKey &&
+      session.videoGenerationPrefs?.resolution === prev.videoGenerationPrefs?.resolution &&
       session.mode === prev.mode &&
       session.compactedMessageCount === prev.compactedMessageCount &&
       session.messages.length === prev.messages.length &&
@@ -121,7 +140,7 @@ export function areRecentSessionsEquivalent(
 export function mergeRecentProjects(
   currentProjects: ConversationProjectSnapshot[],
   nextProject: ConversationProjectSnapshot,
-  limit = 8,
+  limit = 50,
 ): ConversationProjectSnapshot[] {
   const merged = [nextProject, ...currentProjects.filter((item) => item.projectId !== nextProject.projectId)].slice(0, limit);
   return areProjectSnapshotsEquivalent(merged, currentProjects) ? currentProjects : merged;
@@ -132,10 +151,19 @@ export function buildProjectSuggestionKey(
   question: ComposerQuestion | null | undefined,
 ): string | null {
   if (!snapshot || !question) return null;
+  const optionSignature = question.options
+    .slice(0, 4)
+    .map((option) => `${option.value}:${option.label}`)
+    .join("|");
   return [
     snapshot.projectId,
-    snapshot.updatedAt || snapshot.derivedStage || snapshot.currentObjective,
+    snapshot.projectKind,
+    snapshot.derivedStage,
+    snapshot.currentObjective,
     question.id,
+    question.title,
+    question.answerKey,
+    optionSignature,
   ]
     .filter(Boolean)
     .join(":");
@@ -159,6 +187,7 @@ export function qToComposer(state: StudioQuestionState | null): ComposerQuestion
       label: option.label,
       value: option.value || option.label,
       rationale: option.rationale || option.description,
+      confirmDialog: option.confirmDialog,
     })),
     presentation: activeQuestion.presentation === "chip" || activeQuestion.presentation === "card"
       ? activeQuestion.presentation

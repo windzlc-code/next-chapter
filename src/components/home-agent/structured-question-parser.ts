@@ -103,8 +103,8 @@ function buildToolRequest(
 
   const request: AskUserQuestionRequest = {
     id: crypto.randomUUID(),
-    title: Array.isArray(normalizedParsed) ? undefined : normalizedParsed.title,
-    description: Array.isArray(normalizedParsed) ? undefined : normalizedParsed.description,
+    title: Array.isArray(normalizedParsed) ? undefined : String(normalizedParsed.title ?? ""),
+    description: Array.isArray(normalizedParsed) ? undefined : String(normalizedParsed.description ?? ""),
     allowCustomInput: Array.isArray(normalizedParsed)
       ? rawQuestions.every((question) => question.allowCustomInput !== false)
       : normalizedParsed.allowCustomInput !== false,
@@ -539,14 +539,51 @@ function parseOptionLine(line: string): {
   };
 }
 
+function expandCollapsedOptionLines(text: string): string {
+  return text.replace(/([^\n])(?=(?:-\s+|\d+[.)]\s+))/g, "$1\n");
+}
+
+/**
+ * 检测形如 "1. 单集时长" 的编号标题，且其后紧跟非编号的子弹点选项。
+ * 用于兼容 LLM 未调用 AskUserQuestion 工具、直接输出 Markdown 编号列表的情况。
+ */
+function detectNumberedQuestionHeader(
+  lines: string[],
+  index: number,
+): { index: number; title: string } | null {
+  const normalized = stripMarkdownDecorators(lines[index].trim());
+  const numberedMatch = normalized.match(/^(\d+)[.)、]\s*(.+)$/u);
+  if (!numberedMatch) return null;
+
+  // 向前找下一个非空行
+  let lookahead = index + 1;
+  while (lookahead < lines.length && !lines[lookahead].trim()) {
+    lookahead += 1;
+  }
+  if (lookahead >= lines.length) return null;
+
+  const nextLine = lines[lookahead].trim();
+  if (!BULLET_PATTERN.test(nextLine)) return null;
+
+  // 下一行必须是非编号的子弹点（•、-、*），而非另一个编号标题
+  const nextNormalized = stripMarkdownDecorators(nextLine);
+  if (/^(\d+)[.)、]\s*/u.test(nextNormalized)) return null;
+
+  return {
+    index: Number.parseInt(numberedMatch[1], 10),
+    title: normalizeOptionLabel(numberedMatch[2]),
+  };
+}
+
 function buildMarkdownRequest(text: string): StructuredQuestionExtraction | null {
-  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const lines = expandCollapsedOptionLines(text).replace(/\r\n?/g, "\n").split("\n");
   const keptLines: string[] = [];
   const questions: AskUserQuestionRequest["questions"] = [];
   let inferredTotal: number | undefined;
 
   for (let index = 0; index < lines.length; ) {
-    const header = parseQuestionHeader(lines[index]);
+    const header =
+      parseQuestionHeader(lines[index]) ?? detectNumberedQuestionHeader(lines, index);
 
     if (!header) {
       keptLines.push(lines[index]);
@@ -556,10 +593,16 @@ function buildMarkdownRequest(text: string): StructuredQuestionExtraction | null
 
     const blockLines = [lines[index]];
     const questionPromptLines: string[] = [];
+    const trailingLines: string[] = [];
     const options: AskUserQuestionRequest["questions"][number]["options"] = [];
     let blockIndex = index + 1;
+    let seenOptions = false;
 
-    while (blockIndex < lines.length && !parseQuestionHeader(lines[blockIndex])) {
+    while (
+      blockIndex < lines.length &&
+      !parseQuestionHeader(lines[blockIndex]) &&
+      !detectNumberedQuestionHeader(lines, blockIndex)
+    ) {
       blockLines.push(lines[blockIndex]);
       const trimmedLine = lines[blockIndex].trim();
       if (!trimmedLine) {
@@ -569,6 +612,7 @@ function buildMarkdownRequest(text: string): StructuredQuestionExtraction | null
 
       const option = parseOptionLine(trimmedLine);
       if (option) {
+        seenOptions = true;
         if (!option.isCustomInputHint && option.label) {
           options.push({
             label: option.label,
@@ -580,7 +624,12 @@ function buildMarkdownRequest(text: string): StructuredQuestionExtraction | null
         continue;
       }
 
-      questionPromptLines.push(stripMarkdownDecorators(trimmedLine));
+      // 选项之后的非选项行视为尾部文本，保留到 keptLines 而非问题提示
+      if (seenOptions) {
+        trailingLines.push(lines[blockIndex]);
+      } else {
+        questionPromptLines.push(stripMarkdownDecorators(trimmedLine));
+      }
       blockIndex += 1;
     }
 
@@ -594,7 +643,8 @@ function buildMarkdownRequest(text: string): StructuredQuestionExtraction | null
         multiSelect: /多选|可多选|任选|1\s*[-~至到]\s*\d+/u.test(prompt),
         options,
       });
-      inferredTotal = header.total ?? inferredTotal;
+      inferredTotal = "total" in header ? header.total ?? inferredTotal : inferredTotal;
+      keptLines.push(...trailingLines);
     } else {
       keptLines.push(...blockLines);
     }
@@ -663,8 +713,48 @@ function extractDeclarativeSelectionPromptFromLine(line: string): {
   };
 }
 
+function buildDecisionPromptFromLead(line: string): {
+  question: string;
+  remainder: string;
+} | null {
+  const normalized = stripMarkdownDecorators(line).trim();
+  if (!normalized) return null;
+
+  const directHeading = normalized.match(
+    /^(?:#{1,6}\s*)?(下一步|接下来|后续|可选方案|建议路径|推荐路径|决策分支|关键分歧|请选择|你可以选择)([\s\S]*)$/iu,
+  );
+  if (directHeading) {
+    const question = stripMarkdownDecorators(directHeading[2] || "")
+      .replace(/^[：:\s-]+/u, "")
+      .replace(/[\s。！？?!]+$/u, "")
+      .trim();
+    return {
+      question:
+        !question || /^(?:建议|选项|方案|路径|分支)$/u.test(question)
+          ? "请选择下一步"
+          : question,
+      remainder: "",
+    };
+  }
+
+  if (
+    /(?:常见|通常|一般).*(?:目标|方向|类型|路径).*(?:分为|包括|如下|几类)/iu.test(normalized) ||
+    /(?:建议|接下来|下一步|后续).*(?:选择|确认|锁定).*(?:目标|方向|类型|路径|动作|方案)/iu.test(
+      normalized,
+    ) ||
+    /(?:可以|可先|可继续).*(?:选择|走|推进).*(?:路径|方案|步骤|动作)/iu.test(normalized)
+  ) {
+    return {
+      question: "请选择一个方向",
+      remainder: "",
+    };
+  }
+
+  return extractDeclarativeSelectionPromptFromLine(line);
+}
+
 function buildInlinePromptRequest(text: string): StructuredQuestionExtraction | null {
-  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const lines = expandCollapsedOptionLines(text).replace(/\r\n?/g, "\n").split("\n");
   let promptIndex = -1;
   let promptQuestion = "";
   let promptRemainder = "";
@@ -707,7 +797,15 @@ function buildInlinePromptRequest(text: string): StructuredQuestionExtraction | 
     }
 
     let candidatePromptIndex = clusterStart;
-    while (candidatePromptIndex >= 0) {
+    let fallbackPrompt:
+      | {
+          index: number;
+          question: string;
+          remainder: string;
+        }
+      | null = null;
+
+    while (candidatePromptIndex >= 0 && clusterStart - candidatePromptIndex <= 6) {
       const current = lines[candidatePromptIndex].trim();
       if (!current || /^[-*_]{3,}$/u.test(current)) {
         candidatePromptIndex -= 1;
@@ -715,7 +813,7 @@ function buildInlinePromptRequest(text: string): StructuredQuestionExtraction | 
       }
 
       const prompt = extractQuestionPromptFromLine(lines[candidatePromptIndex]);
-      const inferredPrompt = prompt ?? extractDeclarativeSelectionPromptFromLine(lines[candidatePromptIndex]);
+      const inferredPrompt = prompt ?? buildDecisionPromptFromLead(lines[candidatePromptIndex]);
       if (inferredPrompt) {
         promptIndex = candidatePromptIndex;
         promptQuestion = inferredPrompt.question;
@@ -723,8 +821,29 @@ function buildInlinePromptRequest(text: string): StructuredQuestionExtraction | 
         optionStart = clusterStart + 1;
         optionEnd = clusterEnd;
         options = clusterOptions;
+        fallbackPrompt = null;
+        break;
       }
-      break;
+
+      const genericPrompt = extractDeclarativeSelectionPromptFromLine(lines[candidatePromptIndex]);
+      if (!fallbackPrompt && genericPrompt) {
+        fallbackPrompt = {
+          index: candidatePromptIndex,
+          question: genericPrompt.question,
+          remainder: genericPrompt.remainder,
+        };
+      }
+
+      candidatePromptIndex -= 1;
+    }
+
+    if (promptIndex < 0 && fallbackPrompt) {
+      promptIndex = fallbackPrompt.index;
+      promptQuestion = fallbackPrompt.question;
+      promptRemainder = fallbackPrompt.remainder;
+      optionStart = clusterStart + 1;
+      optionEnd = clusterEnd;
+      options = clusterOptions;
     }
 
     if (promptIndex >= 0) {
@@ -765,6 +884,99 @@ function buildInlinePromptRequest(text: string): StructuredQuestionExtraction | 
     },
     workflowCall: null,
   };
+}
+
+function isPlainLineOptionCandidate(line: string): string | null {
+  const normalized = normalizeOptionLabel(line);
+  if (!normalized) return null;
+  if (BULLET_PATTERN.test(line)) return null;
+  if (normalized.length > 32) return null;
+  if (/[?？:：。！？；;，,]\s*$/u.test(normalized)) return null;
+  if (
+    /^(?:\u6216\u8005|\u4e5f\u53ef\u4ee5|\u8bf7|\u5982\u679c|\u4f60\u53ef\u4ee5|\u6ca1\u7406\u89e3|\u4ee5\u4e0b|\u4e0b\u9762)/u.test(
+      normalized,
+    )
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+function buildPlainLineSelectionRequest(text: string): StructuredQuestionExtraction | null {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+
+  for (let promptIndex = lines.length - 1; promptIndex >= 0; promptIndex -= 1) {
+    const promptLine = stripMarkdownDecorators(lines[promptIndex]).trim();
+    if (!promptLine) continue;
+
+    const looksLikePrompt =
+      /[?？]\s*$/u.test(promptLine) ||
+      /(?:\u8bf7\u9009\u62e9|\u8bf7\u4ece\u4ee5\u4e0b\u9009\u9879\u4e2d\u9009\u62e9|\u6216\u8005\u544a\u8bc9\u6211|\u4f60\u60f3\u505a\u4ec0\u4e48)/u.test(
+        promptLine,
+      );
+    if (!looksLikePrompt) continue;
+
+    const options: AskUserQuestionRequest["questions"][number]["options"] = [];
+    const consumed = new Set<number>([promptIndex]);
+    let title = "";
+
+    for (let index = promptIndex - 1; index >= 0; index -= 1) {
+      const current = stripMarkdownDecorators(lines[index]).trim();
+      if (!current) {
+        if (options.length > 0) {
+          consumed.add(index);
+        }
+        continue;
+      }
+
+      if (/[：:]\s*$/u.test(current)) {
+        if (options.length > 0) {
+          title = current.replace(/[：:]\s*$/u, "").trim();
+          consumed.add(index);
+          break;
+        }
+        continue;
+      }
+
+      const optionLabel = isPlainLineOptionCandidate(current);
+      if (!optionLabel) {
+        if (options.length > 0) break;
+        continue;
+      }
+
+      options.unshift({
+        label: optionLabel,
+        value: optionLabel,
+      });
+      consumed.add(index);
+    }
+
+    if (options.length < 2) continue;
+
+    const question = promptLine.replace(/[：:]\s*$/u, "").trim();
+    const keptLines = lines.filter((_, index) => !consumed.has(index));
+
+    return {
+      cleanedText: collapseSpacing(keptLines.join("\n")),
+      request: {
+        id: crypto.randomUUID(),
+        title: title || undefined,
+        allowCustomInput: true,
+        submissionMode: "immediate",
+        questions: [
+          {
+            question,
+            header: deriveHeaderFromQuestion(title || question),
+            multiSelect: false,
+            options,
+          },
+        ],
+      },
+      workflowCall: null,
+    };
+  }
+
+  return null;
 }
 
 export function extractStructuredQuestion(text: string): StructuredQuestionExtraction {
@@ -816,9 +1028,55 @@ export function extractStructuredQuestion(text: string): StructuredQuestionExtra
     }
   }
 
+  // Prefer real selectable options over freeform-only prompts; a request with no
+  // options renders as an empty choice panel.
+  if (!request) {
+    const plainLineExtraction = buildPlainLineSelectionRequest(workingText);
+    if (plainLineExtraction) {
+      workingText = plainLineExtraction.cleanedText;
+      request = plainLineExtraction.request;
+    }
+  }
+
+  if (!request) {
+    request = buildLeadingPromptFallback(workingText);
+  }
+
   return {
     cleanedText: collapseSpacing(workingText),
     request,
     workflowCall,
   };
+}
+
+/**
+ * Keep the old freeform-only fallback intentionally inert. Without at least two
+ * renderable options, the composer choice UI becomes an empty panel.
+ */
+function buildLeadingPromptFallback(text: string): AskUserQuestionRequest | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+
+  // 只处理较短的文本（长文本通常是正常回复，不是引导语）
+  if (trimmed.length > 300) return null;
+
+  const lastLine = trimmed.split("\n").filter(Boolean).at(-1)?.trim() ?? "";
+
+  const hasQuestionKeyword = /需要确认|请选择|请问|请告诉我|请提供|请说明|你希望|你想要|你倾向|你打算|想了解|想知道|能告诉我|可以告诉我/.test(trimmed);
+
+  const isLeadingPrompt =
+    // 以冒号结尾且含有问题关键词（避免"以下是分析结果："这类误触发）
+    (/[：:]\s*$/.test(lastLine) && hasQuestionKeyword) ||
+    // 含"需要确认"/"请选择"等关键词（不要求冒号结尾）
+    hasQuestionKeyword ||
+    // 以问号结尾
+    /[？?]\s*$/.test(lastLine);
+
+  if (!isLeadingPrompt) return null;
+
+  // 提取问题文本：去掉末尾冒号，作为问题提示
+  const question = lastLine.replace(/[：:]\s*$/, "").trim() || trimmed;
+
+  void question;
+  return null;
 }

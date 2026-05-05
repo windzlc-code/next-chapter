@@ -19,22 +19,6 @@ type DreaminaCliActionResult = {
   path?: string;
 };
 
-declare global {
-  interface Window {
-    electronAPI?: {
-      dreaminaCli?: {
-        exec: (args: string[], stdin?: string) => Promise<DreaminaExecResult>;
-      };
-      jimeng?: {
-        writeFile: (filePath: string, content: string) => Promise<{ ok: boolean; error?: string }>;
-      };
-      storage?: {
-        getDefaultPath?: () => Promise<{ files: string; db: string }>;
-      };
-    };
-  }
-}
-
 function extractFirstJsonObject(raw: string): string {
   const cleaned = String(raw || "").replace(/^\uFEFF/, "").trim();
   const fenceMatch =
@@ -249,6 +233,59 @@ export async function dreaminaCliQueryResult(taskId: string): Promise<{
     video_url: findFirstMediaUrl(payload) ?? findFirstMediaUrl(result.stdout || ""),
     raw: payload ?? result.stdout,
   };
+}
+
+function isDreaminaUnknownCommandMessage(message: string): boolean {
+  const lowered = message.toLowerCase();
+  return (
+    lowered.includes("unknown command") ||
+    lowered.includes("invalid choice") ||
+    lowered.includes("unrecognized arguments") ||
+    lowered.includes("no such command") ||
+    lowered.includes("not recognized") ||
+    lowered.includes("未知命令") ||
+    lowered.includes("未找到命令")
+  );
+}
+
+export async function dreaminaCliCancelVideo(taskId: string): Promise<{
+  task_id: string;
+  status: "cancelled";
+  provider: "dreamina-cli";
+}> {
+  const trimmedTaskId = taskId.trim();
+  if (!trimmedTaskId) throw new Error("缺少 Dreamina submit_id");
+
+  const commandCandidates = [
+    ["cancel", `--submit_id=${trimmedTaskId}`],
+    ["cancel_task", `--submit_id=${trimmedTaskId}`],
+  ];
+
+  let lastResult: DreaminaExecResult | null = null;
+  for (const args of commandCandidates) {
+    const result = await execDreamina(args);
+    lastResult = result;
+    if (result.ok) {
+      return {
+        task_id: trimmedTaskId,
+        status: "cancelled",
+        provider: "dreamina-cli",
+      };
+    }
+
+    const message = pickDreaminaMessage(result);
+    if (!isDreaminaUnknownCommandMessage(message)) {
+      throw new Error(message);
+    }
+  }
+
+  throw new Error(
+    pickDreaminaMessage(lastResult || {
+      ok: false,
+      installed: true,
+      error: "Dreamina CLI 当前不支持取消视频任务",
+    }),
+  );
 }
 
 export function getDreaminaCliModelCatalog() {

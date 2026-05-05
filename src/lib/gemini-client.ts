@@ -3,21 +3,136 @@
  *
  * 直接调用各服务 API，使用设置中配置的 API Key
  */
-import { getApiConfig, resolveConfiguredModelName } from "@/lib/api-config";
+import {
+  getApiConfig,
+  isArkJimengEndpoint,
+  resolveConfiguredModelName,
+  resolveJimengApiKey,
+} from "@/lib/api-config";
 import { getNetworkRetrySettings } from "@/lib/network-retry-settings";
+import { getResolvedFilesStoragePath } from "@/lib/storage-path";
 import {
   buildThumbnailRelativePath,
   persistAssetToProjectCache,
+  safeCacheName,
 } from "@/lib/upload-base64-to-storage";
 
 export const DEFAULT_GEMINI_BASE_URL = "https://api.tu-zi.com/v1beta";
 export const DEFAULT_GEMINI_RETRY_COUNT = 1;
 export const DEFAULT_GEMINI_RETRY_DELAY_MS = 800;
-export const DEFAULT_ASYNC_IMAGE_POLL_ATTEMPTS = 45;
-export const DEFAULT_ASYNC_IMAGE_POLL_INTERVAL_MS = 2000;
+
+/** 移除模型输出中的 <think>...</think> 推理块（含不完整块） */
+function stripThinkingBlocks(text: string): string {
+  // 移除完整的 <think>...</think> 块（含跨行内容）
+  return text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+}
+export const DEFAULT_ASYNC_IMAGE_POLL_ATTEMPTS = 240;
+export const DEFAULT_ASYNC_IMAGE_POLL_INTERVAL_MS = 2500;
+export const DEFAULT_ASYNC_IMAGE_POLL_MAX_DURATION_MS = 4 * 60_000;
+
+function formatDurationMs(durationMs: number): string {
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return "0 秒";
+  if (durationMs % 60_000 === 0) {
+    return `${durationMs / 60_000} 分钟`;
+  }
+  return `${Math.ceil(durationMs / 1_000)} 秒`;
+}
+
+function createAbortError(message = "请求已取消"): Error {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+export class AsyncImageTaskPendingError extends Error {
+  readonly taskId: string;
+  readonly status: string;
+  readonly progress: number | null;
+  readonly createdAt: number | null;
+  readonly attempts: number;
+  readonly maxDurationMs: number;
+
+  constructor(params: {
+    taskId: string;
+    status: string;
+    progress?: number | null;
+    createdAt?: number | null;
+    attempts: number;
+    maxDurationMs: number;
+    maxAttempts?: number;
+  }) {
+    super(
+      `异步图像任务仍在排队中。已等待约 ${formatDurationMs(params.maxDurationMs)}。`,
+    );
+    this.name = "AsyncImageTaskPendingError";
+    this.taskId = params.taskId;
+    this.status = params.status;
+    this.attempts = params.attempts;
+    this.maxDurationMs = params.maxDurationMs;
+    this.progress =
+      typeof params.progress === "number" && Number.isFinite(params.progress)
+        ? params.progress
+        : null;
+    this.createdAt =
+      typeof params.createdAt === "number" && Number.isFinite(params.createdAt)
+        ? params.createdAt
+        : null;
+  }
+}
+
+export function isAsyncImageTaskPendingError(error: unknown): error is AsyncImageTaskPendingError {
+  return (
+    error instanceof AsyncImageTaskPendingError ||
+    (typeof error === "object" &&
+      error !== null &&
+      "name" in error &&
+      (error as { name?: string }).name === "AsyncImageTaskPendingError")
+  );
+}
+
+export function getProgressiveAsyncImagePollIntervalMs(elapsedMs: number): number {
+  if (elapsedMs < 5_000) return 1_000;
+  if (elapsedMs < 15_000) return 2_000;
+  return 5_000;
+}
+
+async function waitForAsyncImagePollDelay(
+  delayMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!Number.isFinite(delayMs) || delayMs <= 0) return;
+  if (!signal) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    return;
+  }
+  if (signal.aborted) {
+    throw createAbortError();
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      cleanup();
+      reject(createAbortError());
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+const imageBase64Cache = new Map<
+  string,
+  Promise<{ data: string; mimeType: string } | null>
+>();
 
 /** 全局 Gemini 并发控制：同一时间最多 N 个请求打到 OneAPI */
-const MAX_CONCURRENT_GEMINI = 4;
+const MAX_CONCURRENT_GEMINI = 6;
 const geminiSem = { count: 0, queue: [] as Array<() => void> };
 
 function waitForGeminiSlot(): Promise<void> {
@@ -53,9 +168,13 @@ export function resolveDirectApiKey(service: AiService | null): string {
     return c.tuziKey.trim();
   }
   if (service === "jimeng") {
-    const k = c.jimengKey?.trim() || c.geminiKey?.trim();
-    if (!k)
+    const k = resolveJimengApiKey(c);
+    if (!k) {
+      if (isArkJimengEndpoint(c.jimengEndpoint)) {
+        throw new Error("请先在设置中配置 Seedance / Ark 专用 API Key；当前 Ark 直连不能复用 Gemini API Key");
+      }
       throw new Error("请先在设置中配置 Seedance API Key，或与 Gemini 共用同一密钥");
+    }
     return k;
   }
   if (service === "gpt") {
@@ -125,13 +244,13 @@ export async function directFetch(
   };
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    if (signal?.aborted) throw new Error("请求已取消");
+    if (signal?.aborted) throw createAbortError();
 
     try {
       const resp = await doFetch();
       if (RETRYABLE_STATUS_CODES.has(resp.status) && attempt < MAX_RETRIES) {
         const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 60_000);
-        await new Promise((r) => setTimeout(r, delay));
+        await waitForAsyncImagePollDelay(delay, signal);
         continue;
       }
       return resp;
@@ -139,7 +258,7 @@ export async function directFetch(
       if (signal?.aborted) throw fetchErr;
       if (attempt < MAX_RETRIES) {
         const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 60_000);
-        await new Promise((r) => setTimeout(r, delay));
+        await waitForAsyncImagePollDelay(delay, signal);
         continue;
       }
       throw fetchErr;
@@ -167,7 +286,7 @@ export async function geminiFetch(
       getNetworkRetrySettings();
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      if (signal?.aborted) throw new Error("请求已取消");
+      if (signal?.aborted) throw createAbortError();
 
       try {
         const headers: Record<string, string> = { ...targetHeaders };
@@ -183,7 +302,7 @@ export async function geminiFetch(
 
         if (RETRYABLE_STATUS_CODES.has(resp.status) && attempt < MAX_RETRIES) {
           const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 60_000);
-          await new Promise((r) => setTimeout(r, delay));
+          await waitForAsyncImagePollDelay(delay, signal);
           continue;
         }
         return resp;
@@ -191,7 +310,7 @@ export async function geminiFetch(
         if (signal?.aborted) throw fetchErr;
         if (attempt < MAX_RETRIES) {
           const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 60_000);
-          await new Promise((r) => setTimeout(r, delay));
+          await waitForAsyncImagePollDelay(delay, signal);
           continue;
         }
         throw fetchErr;
@@ -208,7 +327,7 @@ export async function geminiFetch(
 export { directFetch as proxiedFetch };
 export { directFetch as getFetchMethod };
 
-const smartDirectOrProxyFetch = directFetch;
+export const smartDirectOrProxyFetch = directFetch;
 
 function isChatCompletionsModel(model: string): boolean {
   return /^(gpt-|grok-)/i.test(String(model || "").trim());
@@ -255,7 +374,7 @@ function convertContentsToChatMessages(contents: any[]): Array<{
             .filter(Boolean)
             .join("\n\n")
         : "";
-      return { role, content: String(content || "").trim() };
+      return { role: role as "system" | "user" | "assistant", content: String(content || "").trim() };
     })
     .filter((message) => !!message.content);
 }
@@ -483,6 +602,7 @@ export async function callGeminiStream(
     let buffer = "";
 
     while (true) {
+      if (signal?.aborted) { void reader.cancel(); break; }
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -510,7 +630,8 @@ export async function callGeminiStream(
       }
     }
 
-    return accumulated.trim();
+    if (signal?.aborted) throw new Error("请求已取消");
+    return stripThinkingBlocks(accumulated);
   }
   if (isChatCompletionsModel(model) || isChatCompletionsModel(resolvedModel)) {
     const service: AiService = /^grok-/i.test(String(resolvedModel || model)) ? "grok" : "gpt";
@@ -540,6 +661,7 @@ export async function callGeminiStream(
     let buffer = "";
 
     while (true) {
+      if (signal?.aborted) { void reader.cancel(); break; }
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -564,7 +686,8 @@ export async function callGeminiStream(
       }
     }
 
-    return accumulated.trim();
+    if (signal?.aborted) throw new Error("请求已取消");
+    return stripThinkingBlocks(accumulated);
   }
   const baseUrl = (config.geminiEndpoint || DEFAULT_GEMINI_BASE_URL)
     .replace(/\/v1beta(\/.*)?$/, "")
@@ -600,6 +723,7 @@ export async function callGeminiStream(
   let buffer = "";
 
   while (true) {
+    if (signal?.aborted) { void reader.cancel(); break; }
     const { done, value } = await reader.read();
     if (done) break;
 
@@ -627,7 +751,8 @@ export async function callGeminiStream(
     }
   }
 
-  return accumulated.trim();
+  if (signal?.aborted) throw new Error("请求已取消");
+  return stripThinkingBlocks(accumulated);
 }
 
 // ===== Response Parsing =====
@@ -635,20 +760,25 @@ export async function callGeminiStream(
 export function extractText(data: any): string {
   const anthropicContent = data?.content;
   if (Array.isArray(anthropicContent)) {
-    return anthropicContent
-      .map((part: any) => (typeof part?.text === "string" ? part.text : ""))
-      .join("")
-      .trim();
+    return stripThinkingBlocks(
+      anthropicContent
+        .filter((part: any) => part?.type !== "thinking")
+        .map((part: any) => (typeof part?.text === "string" ? part.text : ""))
+        .join("")
+        .trim()
+    );
   }
   const chatContent = data?.choices?.[0]?.message?.content;
   if (typeof chatContent === "string") {
-    return chatContent.trim();
+    return stripThinkingBlocks(chatContent.trim());
   }
   if (Array.isArray(chatContent)) {
-    return chatContent
-      .map((part: any) => (typeof part?.text === "string" ? part.text : ""))
-      .join("")
-      .trim();
+    return stripThinkingBlocks(
+      chatContent
+        .map((part: any) => (typeof part?.text === "string" ? part.text : ""))
+        .join("")
+        .trim()
+    );
   }
   const parts = data?.candidates?.[0]?.content?.parts || [];
   return parts
@@ -701,27 +831,92 @@ export async function extractImageBase64(
 
 // ===== Image Utilities =====
 
+function normalizeLocalImagePath(value: string): string | null {
+  const trimmed = String(value || "").trim();
+  if (!trimmed || trimmed.startsWith("data:") || trimmed.startsWith("blob:")) {
+    return null;
+  }
+  if (/^https?:\/\//i.test(trimmed)) {
+    return null;
+  }
+  if (/^file:\/\//i.test(trimmed)) {
+    try {
+      const parsed = new URL(trimmed);
+      let pathname = decodeURIComponent(parsed.pathname || "");
+      if (/^\/[a-z]:/i.test(pathname)) {
+        pathname = pathname.slice(1);
+      }
+      return pathname || null;
+    } catch {
+      return trimmed.replace(/^file:\/\/\/?/i, "");
+    }
+  }
+  if (/^[a-z]:[\\/]/i.test(trimmed) || /^\\\\/.test(trimmed)) {
+    return trimmed;
+  }
+  return trimmed.includes("/") || trimmed.includes("\\") ? trimmed : null;
+}
+
+async function readLocalImageAsBase64(
+  source: string,
+): Promise<{ data: string; mimeType: string } | null> {
+  const localPath = normalizeLocalImagePath(source);
+  if (!localPath) return null;
+
+  const electronAPI = (window as any).electronAPI;
+  if (!electronAPI?.storage?.readBase64) return null;
+
+  try {
+    const result = await electronAPI.storage.readBase64(localPath);
+    if (result?.ok && result?.base64) {
+      return {
+        data: result.base64,
+        mimeType: result.mimeType || "image/jpeg",
+      };
+    }
+  } catch {
+    // Fall through to null; callers can decide whether to skip or fail.
+  }
+  return null;
+}
+
 export async function fetchImageAsBase64(
   url: string,
 ): Promise<{ data: string; mimeType: string } | null> {
-  try {
-    const resp = url.startsWith("http://")
-      ? await smartDirectOrProxyFetch(url, {}, undefined, undefined, "gemini")
-      : await fetch(url);
-    if (!resp.ok) return null;
-    const buf = await resp.arrayBuffer();
-    const bytes = new Uint8Array(buf);
-    let binary = "";
-    const chunkSize = 8192;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  const cached = imageBase64Cache.get(url);
+  if (cached) return cached;
+
+  const pending = (async () => {
+    try {
+      const localImage = await readLocalImageAsBase64(url);
+      if (localImage) return localImage;
+      if (normalizeLocalImagePath(url)) return null;
+
+      const resp = url.startsWith("http://")
+        ? await smartDirectOrProxyFetch(url, {}, undefined, undefined, "gemini")
+        : await fetch(url);
+      if (!resp.ok) return null;
+      const buf = await resp.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let binary = "";
+      const chunkSize = 8192;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+      }
+      const base64 = btoa(binary);
+      const contentType = resp.headers.get("content-type") || "image/png";
+      return { mimeType: contentType.split(";")[0], data: base64 };
+    } catch {
+      return null;
     }
-    const base64 = btoa(binary);
-    const contentType = resp.headers.get("content-type") || "image/png";
-    return { mimeType: contentType.split(";")[0], data: base64 };
-  } catch {
-    return null;
+  })();
+
+  imageBase64Cache.set(url, pending);
+  const result = await pending;
+  if (!result) {
+    imageBase64Cache.delete(url);
   }
+  return result;
 }
 
 export async function getInlineData(
@@ -735,19 +930,11 @@ export async function getInlineData(
   if (imageUrl.startsWith("http")) {
     return fetchImageAsBase64(imageUrl);
   }
-  // 🛡️ Local file path — read via Electron API to avoid CORS/canvas crash
   const isLocalFilePath = imageUrl.length > 0 && !imageUrl.startsWith("blob:");
   if (isLocalFilePath) {
-    const electronAPI = (window as any).electronAPI;
-    if (electronAPI?.storage?.readBase64) {
-      try {
-        const result = await electronAPI.storage.readBase64(imageUrl);
-        if (result?.ok && result?.base64 && result?.mimeType) {
-          return { mimeType: result.mimeType, data: result.base64 };
-        }
-      } catch {
-        // fall through to null
-      }
+    const localImage = await readLocalImageAsBase64(imageUrl);
+    if (localImage) {
+      return { mimeType: localImage.mimeType, data: localImage.data };
     }
   }
   return null;
@@ -763,6 +950,7 @@ export async function uploadImageToStorage(
   base64: string,
   mimeType: string,
   folder: string,
+  suggestedFileStem?: string,
 ): Promise<string> {
   // 🛡️ 验证参数
   if (!base64 || typeof base64 !== "string" || base64.trim().length === 0) {
@@ -785,12 +973,15 @@ export async function uploadImageToStorage(
 
   try {
     // 获取项目根目录
-    const paths = await electronAPI.storage.getDefaultPath();
+    const filesRoot = await getResolvedFilesStoragePath();
     const projectId = localStorage.getItem("storyforge_current_project");
 
-    if (!projectId || !paths?.files) {
+    if (!projectId || !filesRoot) {
       // 无法获取项目路径，返回 data URL
-      console.warn("No project ID or files path, returning data URL");
+      console.warn("No project ID or files path, returning data URL", {
+        hasProjectId: Boolean(projectId),
+        hasFilesPath: Boolean(filesRoot),
+      });
       return `data:${safeMimeType};base64,${base64}`;
     }
 
@@ -798,10 +989,11 @@ export async function uploadImageToStorage(
     const ext = safeMimeType.includes("png") ? ".png" : safeMimeType.includes("webp") ? ".webp" : ".jpg";
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const hash = Math.random().toString(36).substring(2, 8);
-    const fileName = `${timestamp}-${hash}${ext}`;
+    const semanticStem = suggestedFileStem?.trim() ? safeCacheName(suggestedFileStem.trim()) : "";
+    const fileName = semanticStem ? `${semanticStem}_${timestamp}-${hash}${ext}` : `${timestamp}-${hash}${ext}`;
 
     // 构建文件路径 - 使用正斜杠以确保跨平台兼容性
-    const filePath = `${paths.files}/projects/${projectId}/images/generated/${folder}/${fileName}`;
+    const filePath = `${filesRoot.replace(/[\\/]+$/, "")}/projects/${projectId}/images/generated/${folder}/${fileName}`;
 
     console.log("Saving image to:", filePath, "size:", Math.round(base64.length * 0.75 / 1024), "KB");
 
@@ -883,10 +1075,15 @@ export async function callSeedreamImage(
             processedImages.push(
               `data:${fetched.mimeType};base64,${fetched.data}`,
             );
+          } else if (normalizeLocalImagePath(img)) {
+            throw new Error(`无法读取本地参考图：${img}`);
           } else {
             processedImages.push(img);
           }
         } catch {
+          if (normalizeLocalImagePath(img)) {
+            throw new Error(`无法读取本地参考图：${img}`);
+          }
           processedImages.push(img);
         }
       }
@@ -935,6 +1132,129 @@ export async function callSeedreamImage(
     };
   }
   throw new Error("Seedream 未返回图片");
+}
+
+export async function callTuziImageGeneration(
+  prompt: string,
+  options: {
+    model?: string;
+    size?: string;
+    aspectRatio?: string;
+    imageSize?: "1K" | "2K" | "4K";
+    input_reference?: string | string[];
+    signal?: AbortSignal;
+  } = {},
+): Promise<{ base64: string; mimeType: string }> {
+  const config = getApiConfig();
+  const resolvedModel = resolveConfiguredModelName(options.model || "nano-banana-pro");
+  const imageService: AiService = resolvedModel.startsWith("gpt-image-")
+    ? "gpt"
+    : config.geminiKey?.trim()
+      ? "gemini"
+      : "tuzi";
+  const imageEndpoint =
+    imageService === "gpt"
+      ? config.gptEndpoint || config.tuziEndpoint || config.geminiEndpoint || DEFAULT_GEMINI_BASE_URL
+      : config.geminiEndpoint || config.tuziEndpoint || DEFAULT_GEMINI_BASE_URL;
+  const baseUrl = imageEndpoint
+    .replace(/\/v1beta(\/.*)?$/, "")
+    .replace(/\/v1(\/.*)?$/, "");
+
+  const payload: any = {
+    model: resolvedModel,
+    prompt,
+    n: 1,
+    size: options.size || "1024x1024",
+  };
+
+  const references = (Array.isArray(options.input_reference)
+    ? options.input_reference
+    : [options.input_reference])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+
+  if (references.length > 0) {
+    const processedImages: string[] = [];
+    for (const reference of references) {
+      if (reference.startsWith("data:")) {
+        processedImages.push(reference);
+        continue;
+      }
+
+      const fetched = await fetchImageAsBase64(reference);
+      if (fetched?.data) {
+        processedImages.push(`data:${fetched.mimeType};base64,${fetched.data}`);
+      } else if (normalizeLocalImagePath(reference)) {
+        throw new Error(`无法读取本地参考图：${reference}`);
+      } else {
+        processedImages.push(reference);
+      }
+    }
+
+    if (processedImages.length > 0) {
+      payload.image = processedImages;
+    }
+  }
+
+  console.info("[image-generation] submitting /v1/images/generations", {
+    model: payload.model,
+    service: imageService,
+    size: payload.size,
+    aspectRatio: options.aspectRatio || null,
+    imageSize: options.imageSize || null,
+    referenceCount: references.length,
+  });
+
+  const resp = await smartDirectOrProxyFetch(
+    `${baseUrl}/v1/images/generations`,
+    {
+      "Content-Type": "application/json",
+    },
+    JSON.stringify(payload),
+    options.signal,
+    imageService,
+  );
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(
+      `Tuzi 图像生成失败 (${resp.status}): ${errText.slice(0, 300)}`,
+    );
+  }
+
+  const data = await resp.json();
+  const imageItem =
+    data?.data?.[0] ??
+    data?.images?.[0] ??
+    data?.output?.[0] ??
+    data?.result?.[0] ??
+    null;
+
+  const base64 = imageItem?.b64_json || imageItem?.base64 || data?.b64_json;
+  if (typeof base64 === "string" && base64.trim()) {
+    return {
+      base64,
+      mimeType: imageItem?.mime_type || imageItem?.mimeType || "image/png",
+    };
+  }
+
+  const imageUrl =
+    imageItem?.url ||
+    imageItem?.image_url ||
+    data?.url ||
+    data?.image_url ||
+    data?.output?.image_url ||
+    data?.output?.url ||
+    data?.result?.url;
+
+  if (typeof imageUrl === "string" && imageUrl.trim()) {
+    const fetched = await fetchImageAsBase64(imageUrl.trim());
+    if (fetched?.data) {
+      return { base64: fetched.data, mimeType: fetched.mimeType };
+    }
+  }
+
+  throw new Error("Tuzi 图像接口未返回可用图片");
 }
 
 // ===== Text Processing =====
@@ -1052,34 +1372,122 @@ export const STORYBOARD_STYLE_MAP: Record<string, string> = {
 
 // ===== Async Image Generation (Gemini 3 Pro Image Preview Async) =====
 
+function inferAsyncFallbackImageSize(model?: string | null): "1K" | "2K" | "4K" {
+  const normalized = String(model || "").trim().toLowerCase();
+  if (normalized.includes("-4k")) return "4K";
+  if (normalized.includes("-2k")) return "2K";
+  return "1K";
+}
+
+function decodeBase64ToUint8Array(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function inferReferenceFileExtension(mimeType: string): string {
+  const normalized = String(mimeType || "").trim().toLowerCase();
+  if (normalized.includes("png")) return ".png";
+  if (normalized.includes("webp")) return ".webp";
+  if (normalized.includes("gif")) return ".gif";
+  return ".jpg";
+}
+
+async function resolveAsyncReferenceInlineData(
+  reference: string,
+): Promise<{ mimeType: string; data: string } | null> {
+  const normalized = String(reference || "").trim();
+  if (!normalized) return null;
+
+  if (normalized.startsWith("blob:")) {
+    try {
+      const response = await fetch(normalized);
+      if (!response.ok) return null;
+      const blob = await response.blob();
+      const arrayBuffer = await blob.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuffer);
+      let binary = "";
+      const chunkSize = 8192;
+      for (let index = 0; index < bytes.length; index += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+      }
+      return {
+        mimeType: blob.type || "image/jpeg",
+        data: btoa(binary),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  return getInlineData(normalized);
+}
+
+async function appendAsyncImageReferences(
+  formData: FormData,
+  inputReference?: string | string[],
+): Promise<boolean> {
+  const references = (Array.isArray(inputReference) ? inputReference : [inputReference])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+
+  if (references.length === 0) return true;
+
+  for (const [index, reference] of references.entries()) {
+    const inlineData = await resolveAsyncReferenceInlineData(reference);
+    if (!inlineData?.data) {
+      return false;
+    }
+
+    const blob = new Blob([decodeBase64ToUint8Array(inlineData.data)], {
+      type: inlineData.mimeType || "image/jpeg",
+    });
+    const extension = inferReferenceFileExtension(inlineData.mimeType || "image/jpeg");
+    formData.append("input_reference", blob, `reference-${index + 1}${extension}`);
+  }
+
+  return true;
+}
+
 export async function callAsyncImageGeneration(
   prompt: string,
   options: {
     model?: string;
     size?: string;
-    input_reference?: string;
+    input_reference?: string | string[];
     signal?: AbortSignal;
   } = {},
 ): Promise<{ task_id: string; fallbackModel?: string; shouldUseFallback?: boolean }> {
   const config = getApiConfig();
-  const baseUrl = (config.geminiEndpoint || DEFAULT_GEMINI_BASE_URL)
+  const imageService: AiService = config.geminiKey?.trim() ? "gemini" : "tuzi";
+  const baseUrl = (config.geminiEndpoint || config.tuziEndpoint || DEFAULT_GEMINI_BASE_URL)
     .replace(/\/v1beta(\/.*)?$/, "")
     .replace(/\/v1(\/.*)?$/, "");
 
-  const requestedModel = options.model || "gemini-3-pro-image-preview-2k-async";
+  const requestedModel = options.model || "gemini-3-pro-image-preview-async";
 
   // 定义回退模型映射
   const fallbackMap: Record<string, string> = {
     "gemini-3-pro-image-preview-async": "gemini-3-pro-image-preview",
     "gemini-3-pro-image-preview-2k-async": "gemini-3-pro-image-preview-2k",
     "gemini-3-pro-image-preview-4k-async": "gemini-3-pro-image-preview-4k",
+    "ano-banana-pro": "nano-banana-pro",
+    "nano-banana-pro": "nano-banana-pro",
+    "nano-banana-pro-2k": "nano-banana-pro-2k",
+    "nano-banana-pro-4k": "nano-banana-pro-4k",
     "nano-banana-2": "gemini-3-pro-image-preview",
     "nano-banana-2-2k": "gemini-3-pro-image-preview-2k",
     "nano-banana-2-4k": "gemini-3-pro-image-preview-4k",
+    "nano-banana-2-async": "gemini-3-pro-image-preview",
+    "nano-banana-2-2k-async": "gemini-3-pro-image-preview-2k",
+    "nano-banana-2-4k-async": "gemini-3-pro-image-preview-4k",
   };
 
   // 如果有参考图像，异步API不支持，直接返回标记使用回退模型
-  if (options.input_reference) {
+  if (options.input_reference && !options.input_reference) {
     console.warn("异步API不支持参考图像，将使用同步回退模型");
     return {
       task_id: "",
@@ -1094,16 +1502,24 @@ export async function callAsyncImageGeneration(
   formData.append("model", requestedModel);
   formData.append("prompt", prompt);
   formData.append("size", options.size || "1:1");
+  // Tuzi async image tasks accept multipart `input_reference` uploads, so we keep
+  // Gemini-family requests on the async transport whenever the references can be resolved.
+  const referencesAttached = await appendAsyncImageReferences(formData, options.input_reference);
+  if (!referencesAttached) {
+    return {
+      task_id: "",
+      fallbackModel: fallbackMap[requestedModel],
+      shouldUseFallback: true,
+    };
+  }
 
   // Note: Don't set Content-Type for FormData - browser will set it with boundary
   const resp = await smartDirectOrProxyFetch(
     `${baseUrl}/v1/videos`,
-    {
-      Authorization: `Bearer ${config.geminiKey}`,
-    },
+    {},
     formData,
     options.signal,
-    "gemini",
+    imageService,
   );
 
   if (!resp.ok) {
@@ -1113,13 +1529,14 @@ export async function callAsyncImageGeneration(
 
   const data = await resp.json();
   console.log("异步图像生成任务已提交:", data);
-  if (!data.id) {
+  const taskId = data.id || data.task_id;
+  if (!taskId) {
     console.error("API 响应缺少任务 ID:", JSON.stringify(data, null, 2));
     throw new Error("API 未返回任务 ID");
   }
 
   return {
-    task_id: data.id,
+    task_id: taskId,
     fallbackModel: fallbackMap[requestedModel]
   };
 }
@@ -1129,34 +1546,44 @@ export async function pollAsyncImageResult(
   options: {
     maxAttempts?: number;
     intervalMs?: number;
+    maxDurationMs?: number;
     signal?: AbortSignal;
     fallbackModel?: string;
     prompt?: string;
     size?: string;
-    input_reference?: string;
+    input_reference?: string | string[];
   } = {},
 ): Promise<{ base64: string; mimeType: string; usedFallback?: boolean }> {
   const config = getApiConfig();
-  const baseUrl = (config.geminiEndpoint || DEFAULT_GEMINI_BASE_URL)
+  const imageService: AiService = config.geminiKey?.trim() ? "gemini" : "tuzi";
+  const baseUrl = (config.geminiEndpoint || config.tuziEndpoint || DEFAULT_GEMINI_BASE_URL)
     .replace(/\/v1beta(\/.*)?$/, "")
     .replace(/\/v1(\/.*)?$/, "");
 
-  const maxAttempts = options.maxAttempts || DEFAULT_ASYNC_IMAGE_POLL_ATTEMPTS; // 默认最多轮询 45 次
-  const intervalMs = options.intervalMs || DEFAULT_ASYNC_IMAGE_POLL_INTERVAL_MS; // 默认每 2 秒轮询一次
+  const maxAttempts = options.maxAttempts || DEFAULT_ASYNC_IMAGE_POLL_ATTEMPTS;
+  const maxDurationMs = options.maxDurationMs || DEFAULT_ASYNC_IMAGE_POLL_MAX_DURATION_MS;
+  let lastKnownStatus = "queued";
+  let lastKnownProgress: number | null = null;
+  let lastKnownCreatedAt: number | null = null;
+  const startedAt = Date.now();
+  let attemptsMade = 0;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    if (options.signal?.aborted) {
-      throw new Error("任务已取消");
+    if (Date.now() - startedAt >= maxDurationMs) {
+      break;
     }
+    if (options.signal?.aborted) {
+      throw createAbortError();
+    }
+
+    attemptsMade = attempt + 1;
 
     const resp = await smartDirectOrProxyFetch(
       `${baseUrl}/v1/videos/${taskId}`,
-      {
-        Authorization: `Bearer ${config.geminiKey}`,
-      },
+      {},
       undefined,
       options.signal,
-      "gemini",
+      imageService,
     );
 
     if (!resp.ok) {
@@ -1165,6 +1592,15 @@ export async function pollAsyncImageResult(
     }
 
     const data = await resp.json();
+    lastKnownStatus = typeof data.status === "string" ? data.status : lastKnownStatus;
+    lastKnownProgress =
+      typeof data.progress === "number" && Number.isFinite(data.progress)
+        ? data.progress
+        : lastKnownProgress;
+    lastKnownCreatedAt =
+      typeof data.created_at === "number" && Number.isFinite(data.created_at)
+        ? data.created_at
+        : lastKnownCreatedAt;
     console.log(`轮询异步图像任务 ${taskId} (第 ${attempt + 1}/${maxAttempts} 次):`, data);
 
     // 检查状态
@@ -1185,7 +1621,7 @@ export async function pollAsyncImageResult(
       }
 
       // 下载图像并转换为 base64
-      const imageResp = await fetch(imageUrl);
+      const imageResp = await fetch(imageUrl, { signal: options.signal });
       if (!imageResp.ok) {
         throw new Error(`下载生成的图像失败: ${imageResp.status}`);
       }
@@ -1222,10 +1658,15 @@ export async function pollAsyncImageResult(
 
         // 如果有参考图像，添加到 parts
         if (options.input_reference) {
+          const fallbackReference = Array.isArray(options.input_reference)
+            ? options.input_reference[0]
+            : options.input_reference;
           // 下载参考图像并转换为 base64
           try {
-            const refResp = await fetch(options.input_reference);
-            if (refResp.ok) {
+            const refResp = fallbackReference
+              ? await fetch(fallbackReference, { signal: options.signal })
+              : null;
+            if (refResp?.ok) {
               const refBlob = await refResp.blob();
               const refArrayBuffer = await refBlob.arrayBuffer();
 
@@ -1258,7 +1699,8 @@ export async function pollAsyncImageResult(
           {
             responseModalities: ["IMAGE", "TEXT"],
             imageSize: options.size === "1:1" ? "1K" : options.size === "16:9" ? "2K" : "2K",
-          }
+          },
+          options.signal,
         );
 
         const img = await extractImageBase64(fallbackData);
@@ -1276,9 +1718,21 @@ export async function pollAsyncImageResult(
       throw new Error(`异步图像生成失败: ${errorMsg}`);
     }
 
-    // 状态为 pending/processing，继续等待
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    // 状态为 pending/processing，继续等待（0-5 秒每 1 秒、5-15 秒每 2 秒、之后每 5 秒）
+    const adaptiveInterval =
+      typeof options.intervalMs === "number" && options.intervalMs > 0
+        ? options.intervalMs
+        : getProgressiveAsyncImagePollIntervalMs(Date.now() - startedAt);
+    await waitForAsyncImagePollDelay(adaptiveInterval, options.signal);
   }
 
-  throw new Error(`异步图像生成超时（已轮询 ${maxAttempts} 次）`);
+  throw new AsyncImageTaskPendingError({
+    taskId,
+    status: lastKnownStatus,
+    progress: lastKnownProgress,
+    createdAt: lastKnownCreatedAt,
+    attempts: attemptsMade,
+    maxDurationMs,
+    maxAttempts,
+  });
 }

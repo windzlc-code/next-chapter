@@ -6,6 +6,22 @@ export function stripHiddenThoughtBlocks(text: string): string {
   return String(text || "")
     .replace(/<think>\s*[\s\S]*?\s*<\/think>/gi, "")
     .replace(/^\s*<\/?think>\s*$/gim, "")
+    // 移除完整的 <function_calls>...</function_calls> 工具调用块（含多行）
+    .replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, "")
+    // 移除残留的 <invoke ...>...</invoke> 块
+    .replace(/<invoke[\s\S]*?<\/invoke>/gi, "")
+    // 移除残留的单个工具调用标签行
+    .replace(/<\/?(function_calls|invoke|parameter)[^>]*>/gi, "")
+    // 移除 LLM 暴露的工具调用描述行，如 "执行动作:" / "执行操作:"
+    .replace(/^[执行动作操作]{2,4}[：:]\s*$/gim, "")
+    // 移除独立的工具名称行（LLM 把工具名当文本输出）
+    .replace(/^\s*(AskUserQuestion|HomeStudioWorkflow|TaskOutput|TaskStop|Agent)\s*$/gm, "")
+    // 移除 "label ->" 后紧跟的纯 snake_case/camelCase 值行（选项 value 泄漏）
+    .replace(/^[a-z][a-z0-9_]{2,}$/gm, (match, offset, str) => {
+      // 只移除紧跟在 "->" 行之后的值行
+      const before = str.slice(0, offset).trimEnd();
+      return before.endsWith("->") ? "" : match;
+    })
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }

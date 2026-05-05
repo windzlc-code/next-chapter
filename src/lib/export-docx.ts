@@ -20,6 +20,15 @@ import {
 import { saveAs } from "file-saver";
 import type { DramaSetup, EpisodeScript } from "@/types/drama";
 
+export type ExportToDocxResult =
+  | { status: "saved"; filePath?: string }
+  | { status: "cancelled" };
+
+function isMissingSaveBinaryHandler(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("storage:saveBinaryFile") && message.includes("No handler registered");
+}
+
 const FONT = "Microsoft YaHei";
 const FONT_FALLBACK = "Arial";
 const PAGE_WIDTH = 11906; // A4
@@ -197,7 +206,7 @@ export async function exportToDocx(
   creativePlan: string,
   characters: string,
   episodes: EpisodeScript[]
-) {
+): Promise<ExportToDocxResult> {
   const sortedEpisodes = [...episodes].sort((a, b) => a.number - b.number);
   const totalWords = episodes.reduce((s, e) => s + e.wordCount, 0);
   const charRows = extractCharacterRows(characters);
@@ -501,5 +510,35 @@ export async function exportToDocx(
   });
 
   const buffer = await Packer.toBlob(doc);
-  saveAs(buffer, `${dramaTitle || "剧本"}.docx`);
+  const fileName = `${dramaTitle || "剧本"}.docx`;
+  const saveBinaryFile = window.electronAPI?.storage?.saveBinaryFile;
+
+  if (saveBinaryFile) {
+    try {
+      const bytes = new Uint8Array(await buffer.arrayBuffer());
+      let binary = "";
+      bytes.forEach((byte) => {
+        binary += String.fromCharCode(byte);
+      });
+      const result = await saveBinaryFile({
+        defaultFileName: fileName,
+        filters: [{ name: "Word Document", extensions: ["docx"] }],
+        base64: btoa(binary),
+      });
+      if (!result.ok) {
+        throw new Error(result.error || "保存 Word 文件失败。");
+      }
+      if (result.cancelled) {
+        return { status: "cancelled" };
+      }
+      return { status: "saved", filePath: result.filePath };
+    } catch (error) {
+      if (!isMissingSaveBinaryHandler(error)) {
+        throw error;
+      }
+    }
+  }
+
+  saveAs(buffer, fileName);
+  return { status: "saved" };
 }

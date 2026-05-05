@@ -33,16 +33,30 @@ function readEntries(): AssistantFeedbackLogEntry[] {
 }
 
 /**
- * Append a feedback event for local “training” / analytics (localStorage, capped).
+ * Append a feedback event for local training / analytics (localStorage, capped).
  * Safe to call from the UI layer on every toggle.
  */
-export function recordAssistantFeedbackLog(entry: Omit<AssistantFeedbackLogEntry, "ts">): void {
+export function recordAssistantFeedbackLog(
+  entry: Omit<AssistantFeedbackLogEntry, "ts">,
+): void {
   if (typeof window === "undefined") return;
+
   try {
-    const next: AssistantFeedbackLogEntry = { ts: new Date().toISOString(), ...entry };
+    const next: AssistantFeedbackLogEntry = {
+      ts: new Date().toISOString(),
+      ...entry,
+    };
     const merged = [...readEntries(), next].slice(-MAX_ENTRIES);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+
+    if (entry.action === "up" || entry.action === "down") {
+      import("@/lib/home-agent/agent-learning-store")
+        .then(({ recordUserPreference }) => recordUserPreference(entry))
+        .catch(() => {
+          // Learning store failures should not affect the main UI flow.
+        });
+    }
   } catch {
-    /* quota or privacy mode */
+    // Ignore quota/privacy mode issues.
   }
 }

@@ -29,7 +29,6 @@ export interface VideoProductionBundleExportResult {
 
 export function buildVideoProductionBundlePreviewMessage(project: PersistedVideoProject): string {
   const synced = synchronizeVideoProductionState(project);
-  const pendingReviewCount = synced.reviewQueue?.filter((item) => item.status !== "approved").length ?? 0;
   return [
     `当前《${synced.title || synced.id}》的生产状态包摘要如下：`,
     "",
@@ -43,9 +42,8 @@ export function buildVideoProductionBundlePreviewMessage(project: PersistedVideo
     `- 场景设定数：${synced.sceneSettings.length}`,
     `- 资产清单：${synced.assetManifest?.items.length ?? 0} 项`,
     `- 镜头指令包：${synced.shotPackets?.length ?? 0} 个`,
-    `- 待审阅项：${pendingReviewCount} 条`,
     "",
-    "导出内容会包含：overview / style-lock / world-model / asset-manifest / shot-packets / review-queue / README。",
+    "导出内容会包含：overview / style-lock / world-model / asset-manifest / shot-packets / README。",
     "这份摘要只用于首页内预览，不会改动当前项目运行态。",
   ].join("\n");
 }
@@ -99,7 +97,6 @@ export async function exportVideoProductionBundle(
           sceneSettings: synced.sceneSettings.length,
           assetManifestItems: synced.assetManifest?.items.length ?? 0,
           shotPackets: synced.shotPackets?.length ?? 0,
-          reviewQueue: synced.reviewQueue?.length ?? 0,
         },
       }),
     },
@@ -118,10 +115,6 @@ export async function exportVideoProductionBundle(
     {
       name: "shot-packets.json",
       content: stringify(synced.shotPackets ?? []),
-    },
-    {
-      name: "review-queue.json",
-      content: stringify(synced.reviewQueue ?? []),
     },
   ];
 

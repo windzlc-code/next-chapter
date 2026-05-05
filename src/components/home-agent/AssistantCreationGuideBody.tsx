@@ -1,17 +1,21 @@
 import * as React from "react";
 import type { CreationGuideDimensionId } from "@/lib/home-agent/creation-guide-presets";
 import { AnimatePresence, motion } from "framer-motion";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { ChevronDown } from "lucide-react";
 import {
   isCreationGuideAssistantMessage,
   splitCreationGuideContent,
 } from "@/lib/home-agent/creation-guide-presets";
 import { stripHiddenThoughtBlocks } from "./home-agent-protocol-utils";
-import { splitAssistantMessageSections } from "@/lib/home-agent/assistant-message-sections";
+import { splitAssistantMessageSections, splitSectionSubSections } from "@/lib/home-agent/assistant-message-sections";
 import { cn } from "@/lib/utils";
 import GuidePresetPickerModal from "./GuidePresetPickerModal";
+import {
+  StoryboardBreakdownView,
+  StoryboardBreakdownRootView,
+  isStoryboardBreakdown,
+  isStoryboardBreakdownRoot,
+} from "./StoryboardBreakdownView";
 
 const { memo, useCallback, useEffect, useRef, useState } = React;
 
@@ -25,15 +29,15 @@ const markdownComponents = {
   li: ({ children }: { children?: React.ReactNode }) => <li className="leading-[1.8]">{children}</li>,
   hr: () => <hr className="my-3.5 border-white/[0.12]" />,
   table: ({ children }: { children?: React.ReactNode }) => (
-    <div className="my-3 overflow-x-auto rounded-[12px] border border-white/[0.1]">
-      <table className="w-full border-collapse text-left text-[13px]">{children}</table>
+    <div className="my-3 overflow-x-auto rounded-[14px] border border-white/[0.1] bg-white/[0.025] shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+      <table className="w-full border-collapse text-left text-[13px] leading-[1.65]">{children}</table>
     </div>
   ),
-  thead: ({ children }: { children?: React.ReactNode }) => <thead className="bg-white/[0.04] text-white/86">{children}</thead>,
+  thead: ({ children }: { children?: React.ReactNode }) => <thead className="bg-white/[0.05] text-white/86">{children}</thead>,
   tbody: ({ children }: { children?: React.ReactNode }) => <tbody className="text-white/80">{children}</tbody>,
-  tr: ({ children }: { children?: React.ReactNode }) => <tr className="border-b border-white/[0.1] last:border-b-0">{children}</tr>,
-  th: ({ children }: { children?: React.ReactNode }) => <th className="px-3 py-2.5 font-medium">{children}</th>,
-  td: ({ children }: { children?: React.ReactNode }) => <td className="px-3 py-2.5 align-top">{children}</td>,
+  tr: ({ children }: { children?: React.ReactNode }) => <tr className="border-b border-white/[0.08] transition-colors hover:bg-white/[0.02] last:border-b-0">{children}</tr>,
+  th: ({ children }: { children?: React.ReactNode }) => <th className="px-3 py-2.5 font-medium tracking-[0.01em]">{children}</th>,
+  td: ({ children }: { children?: React.ReactNode }) => <td className="px-3 py-2.5 align-top text-white/78">{children}</td>,
   code: ({ inline, children }: { inline?: boolean; children?: React.ReactNode }) =>
     inline ? (
       <code className="rounded bg-white/[0.1] px-1.5 py-0.5 font-mono text-[0.92em] text-white/90">{children}</code>
@@ -44,12 +48,198 @@ const markdownComponents = {
     ),
 };
 
+const MARKDOWN_SYNTAX_RE =
+  /(^|\n)\s*(?:#{1,6}\s|[-*+]\s|\d+\.\s|>\s|```|~~~|\|.+\||!\[[^\]]*\]\([^)]+\)|\[[^\]]+\]\([^)]+\)|---|___)|`|(?:\*\*|__)[^]+?(?:\*\*|__)/;
+
+const LazyAssistantMarkdown = React.lazy(async () => {
+  const [{ default: ReactMarkdown }, { default: remarkGfm }] = await Promise.all([
+    import("react-markdown"),
+    import("remark-gfm"),
+  ]);
+
+  function MarkdownRenderer({ content }: { content: string }) {
+    return (
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+        {content}
+      </ReactMarkdown>
+    );
+  }
+
+  return { default: MarkdownRenderer };
+});
+
+function renderPlainTextBlocks(content: string) {
+  return content
+    .split(/\n{2,}/)
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .map((block, index) => (
+      <p key={index} className="mb-3 whitespace-pre-wrap text-white/82 last:mb-0">
+        {block}
+      </p>
+    ));
+}
+
+function shouldUseMarkdownRenderer(content: string): boolean {
+  return MARKDOWN_SYNTAX_RE.test(content);
+}
+
 function AssistantMarkdown({ content }: { content: string }) {
+  if (!shouldUseMarkdownRenderer(content)) {
+    return <>{renderPlainTextBlocks(content)}</>;
+  }
+
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-      {content}
-    </ReactMarkdown>
+    <React.Suspense fallback={<>{renderPlainTextBlocks(content)}</>}>
+      <LazyAssistantMarkdown content={content} />
+    </React.Suspense>
   );
+}
+
+// ─── 分镜 JSON 块解析 ─────────────────────────────────────────────────────────
+
+type ContentSegment =
+  | { type: "text"; text: string }
+  | { type: "storyboard-root"; data: import("./StoryboardBreakdownView").StoryboardBreakdownRoot }
+  | { type: "storyboard-episode"; data: import("./StoryboardBreakdownView").StoryboardBreakdown };
+
+function parseStoryboardSegments(content: string): ContentSegment[] {
+  const segments: ContentSegment[] = [];
+  const codeBlockRe = /```json\s*([\s\S]*?)```/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = codeBlockRe.exec(content)) !== null) {
+    const before = content.slice(lastIndex, match.index);
+    if (before) segments.push({ type: "text", text: before });
+
+    try {
+      const parsed: unknown = JSON.parse(match[1].trim());
+      if (isStoryboardBreakdownRoot(parsed)) {
+        segments.push({ type: "storyboard-root", data: parsed });
+      } else if (isStoryboardBreakdown(parsed)) {
+        segments.push({ type: "storyboard-episode", data: parsed });
+      } else {
+        segments.push({ type: "text", text: match[0] });
+      }
+    } catch {
+      segments.push({ type: "text", text: match[0] });
+    }
+
+    lastIndex = match.index + match[0].length;
+  }
+
+  const tail = content.slice(lastIndex);
+  if (tail) segments.push({ type: "text", text: tail });
+
+  return segments;
+}
+
+function hasStoryboardBlocks(content: string): boolean {
+  const re = /```json\s*([\s\S]*?)```/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(content)) !== null) {
+    try {
+      const parsed: unknown = JSON.parse(match[1].trim());
+      if (isStoryboardBreakdownRoot(parsed) || isStoryboardBreakdown(parsed)) return true;
+    } catch {
+      // not a storyboard block
+    }
+  }
+  return false;
+}
+
+function StoryboardAwareContent({ content }: { content: string }) {
+  const segments = parseStoryboardSegments(content);
+  return (
+    <>
+      {segments.map((seg, i) => {
+        if (seg.type === "storyboard-root") {
+          if (seg.data.episodes.length === 1 && seg.data.episodes[0]) {
+            return <StoryboardBreakdownView key={i} data={seg.data.episodes[0]} editing />;
+          }
+          return <StoryboardBreakdownRootView key={i} data={seg.data} allowEditing editing />;
+        }
+        if (seg.type === "storyboard-episode") {
+          return <StoryboardBreakdownView key={i} data={seg.data} editing />;
+        }
+        return seg.text ? <AssistantMarkdown key={i} content={seg.text} /> : null;
+      })}
+    </>
+  );
+}
+
+function SectionBody({
+  sectionId,
+  body,
+  collapsedSubSections,
+  onToggleSubSection,
+}: {
+  sectionId: string;
+  body: string;
+  collapsedSubSections: Record<string, boolean>;
+  onToggleSubSection: (id: string) => void;
+}) {
+  const parsed = splitSectionSubSections(body);
+
+  if (!parsed.subSections.length) {
+    return (
+      <div className="pl-[1.35rem] pr-0 pb-2 pt-0.5">
+        <AssistantMarkdown content={body} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="pl-[1.35rem] pr-0 pb-2 pt-0.5">
+      {parsed.lead ? <AssistantMarkdown content={parsed.lead} /> : null}
+      <div className="space-y-0.5">
+        {parsed.subSections.map((sub, i) => {
+          const subId = `${sectionId}-sub-${i}`;
+          const subCollapsed = collapsedSubSections[subId] !== false;
+          return (
+            <div key={subId} className="border-b border-white/[0.04] pb-0.5 last:border-b-0 last:pb-0">
+              <button
+                type="button"
+                className="group flex w-full items-center gap-1.5 px-0 py-1.5 text-left transition-colors"
+                onClick={() => onToggleSubSection(subId)}
+              >
+                <ChevronDown
+                  className={cn(
+                    "mt-[1px] h-3 w-3 shrink-0 text-white/28 transition-all duration-200 ease-out group-hover:text-white/50",
+                    subCollapsed ? "-rotate-90" : "rotate-0",
+                  )}
+                />
+                <span className="text-[13px] font-medium leading-5 text-white/80 group-hover:text-white/95">
+                  {sub.heading}
+                </span>
+              </button>
+              <AnimatePresence initial={false}>
+                {!subCollapsed ? (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0, y: -4 }}
+                    animate={{ opacity: 1, height: "auto", y: 0 }}
+                    exit={{ opacity: 0, height: 0, y: -4 }}
+                    transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+                    className="overflow-hidden"
+                  >
+                    <div className="pl-4 pb-1.5 pt-0.5">
+                      <AssistantMarkdown content={sub.body} />
+                    </div>
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function shouldCollapseAssistantSectionByDefault(heading: string): boolean {
+  const normalized = heading.trim();
+  return /^第\s*\d+\s*集$/.test(normalized) || normalized.startsWith("当前批次资产状态");
 }
 
 export interface AssistantCreationGuideBodyProps {
@@ -75,6 +265,7 @@ export const AssistantCreationGuideBody = memo(function AssistantCreationGuideBo
   const sanitizedContent = stripHiddenThoughtBlocks(content);
   const [pickerDimension, setPickerDimension] = useState<CreationGuideDimensionId | null>(null);
   const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
+  const [collapsedSubSections, setCollapsedSubSections] = useState<Record<string, boolean>>({});
   const autoOpenedIdsRef = useRef<Set<string>>(new Set());
 
   const interactive = Boolean(onCreationGuidePick) && isCreationGuideAssistantMessage(sanitizedContent) && !picksDisabled;
@@ -91,6 +282,7 @@ export const AssistantCreationGuideBody = memo(function AssistantCreationGuideBo
 
   useEffect(() => {
     setCollapsedSections({});
+    setCollapsedSubSections({});
   }, [sanitizedContent]);
 
   const openPicker = useCallback(
@@ -101,14 +293,25 @@ export const AssistantCreationGuideBody = memo(function AssistantCreationGuideBo
     [onCreationGuidePick, picksDisabled],
   );
 
-  const toggleSection = useCallback((id: string) => {
-    setCollapsedSections((prev) => ({
-      ...prev,
-      [id]: !prev[id],
-    }));
+  const toggleSection = useCallback((id: string, heading: string) => {
+    setCollapsedSections((prev) => {
+      const currentlyCollapsed = prev[id] ?? shouldCollapseAssistantSectionByDefault(heading);
+      return {
+        ...prev,
+        [id]: !currentlyCollapsed,
+      };
+    });
+  }, []);
+
+  const toggleSubSection = useCallback((id: string) => {
+    setCollapsedSubSections((prev) => {
+      const currentlyCollapsed = prev[id] !== false;
+      return { ...prev, [id]: !currentlyCollapsed };
+    });
   }, []);
 
   if (!interactive) {
+    const hasStoryboard = hasStoryboardBlocks(sanitizedContent);
     return (
       <div
         className={cn(
@@ -116,12 +319,17 @@ export const AssistantCreationGuideBody = memo(function AssistantCreationGuideBo
           className,
         )}
       >
-        {sectionedMessage && sectionedMessage.sections.length > 0 ? (
+        {hasStoryboard ? (
+          <div className="w-full md:w-[133.333%] md:max-w-none">
+            <StoryboardAwareContent content={sanitizedContent} />
+          </div>
+        ) : sectionedMessage && sectionedMessage.sections.length > 0 ? (
           <>
             {sectionedMessage.lead ? <AssistantMarkdown content={sectionedMessage.lead} /> : null}
             <div className="space-y-1.5">
               {sectionedMessage.sections.map((section) => {
-                const collapsed = Boolean(collapsedSections[section.id]);
+                const collapsed =
+                  collapsedSections[section.id] ?? shouldCollapseAssistantSectionByDefault(section.heading);
                 return (
                   <section
                     key={section.id}
@@ -132,7 +340,7 @@ export const AssistantCreationGuideBody = memo(function AssistantCreationGuideBo
                       className="group flex w-full items-center gap-2 px-0 py-2 text-left text-white/88 transition-colors hover:text-white"
                       aria-expanded={!collapsed}
                       aria-controls={`${section.id}-body`}
-                      onClick={() => toggleSection(section.id)}
+                      onClick={() => toggleSection(section.id, section.heading)}
                     >
                       <ChevronDown
                         className={cn(
@@ -152,9 +360,12 @@ export const AssistantCreationGuideBody = memo(function AssistantCreationGuideBo
                           transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
                           className="overflow-hidden"
                         >
-                          <div className="pl-[1.35rem] pr-0 pb-2 pt-0.5">
-                            <AssistantMarkdown content={section.body} />
-                          </div>
+                          <SectionBody
+                            sectionId={section.id}
+                            body={section.body}
+                            collapsedSubSections={collapsedSubSections}
+                            onToggleSubSection={toggleSubSection}
+                          />
                         </motion.div>
                       ) : null}
                     </AnimatePresence>

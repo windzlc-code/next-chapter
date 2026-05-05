@@ -13,7 +13,7 @@ const reactRoot = path.dirname(requireFromReactDom.resolve("react/package.json")
 export default defineConfig(({ mode }) => ({
   base: "./",
   server: {
-    host: "::",
+    host: "127.0.0.1",
     port: 8080,
     strictPort: true,
     hmr: {
@@ -23,7 +23,10 @@ export default defineConfig(({ mode }) => ({
   plugins: [react(), mode === "development" && componentTagger()].filter(
     Boolean,
   ),
+  esbuild: mode === "production" ? { drop: ["console", "debugger"] } : {},
   build: {
+    modulePreload: false,
+    chunkSizeWarningLimit: 1500,
     rollupOptions: {
       output: {
         manualChunks(id) {

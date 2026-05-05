@@ -3,8 +3,8 @@ import { spawn } from "node:child_process";
 import process from "node:process";
 import { chromium } from "playwright";
 
-const DEFAULT_URL = process.env.HOME_AGENT_SMOKE_URL || "http://127.0.0.1:4173";
-const DEV_SERVER_PORT = new URL(DEFAULT_URL).port || "4173";
+const DEFAULT_URL = process.env.HOME_AGENT_SMOKE_URL || "http://127.0.0.1:8080";
+const DEV_SERVER_PORT = new URL(DEFAULT_URL).port || "8080";
 
 const STUDIO_SESSION_KEY = "storyforge-home-agent-session-v1";
 const STUDIO_PROJECT_SESSIONS_KEY = "storyforge-home-agent-project-sessions-v1";

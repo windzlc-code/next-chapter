@@ -21,12 +21,13 @@ export interface Scene {
   isManualDuration?: boolean; // true when user manually set duration
   characterCostumes?: Record<string, string>; // { characterName: costumeId }
   sceneTimeVariantId?: string; // explicit time variant chosen for this shot
+  enhancedVideoPrompt?: string; // cached result from prepare_video_prompt_batch
 }
 
 export interface VideoFailureInfo {
   message: string;
   provider?: string;
-  stage?: "submit" | "status";
+  stage?: "submit" | "status" | string;
   updatedAt: string;
 }
 
@@ -95,6 +96,8 @@ export interface SceneSetting {
 
 export type ProductionAssetKind =
   | "character-reference"
+  | "character-sheet"
+  | "image"
   | "costume-reference"
   | "scene-reference"
   | "time-variant"
@@ -107,20 +110,24 @@ export interface ProductionAssetRecord {
   id: string;
   kind: ProductionAssetKind;
   label: string;
-  url: string;
-  meta: string;
-  reusable: boolean;
+  url?: string;
+  meta?: string;
+  reusable?: boolean;
   status: ProductionAssetStatus;
+  source?: string;
+  origin?: "derived" | "manual";
   sourceEntityId?: string;
   sceneId?: string;
   sceneNumber?: number;
-  version: number;
-  createdAt: string;
+  version?: number;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface ProductionAssetManifest {
-  version: string;
-  summary: string;
+  version?: string;
+  summary?: string;
+  updatedAt?: string;
   items: ProductionAssetRecord[];
 }
 
@@ -128,10 +135,14 @@ export interface VideoStyleLock {
   genre: string[];
   tone: string;
   visualStyle: string;
-  colorMood: string;
-  cinematography: string;
-  forbidden: string[];
-  referencePromptTemplate: string;
+  cameraLanguage?: string | string[];
+  performanceDirection?: string;
+  negativeRules?: string[];
+  updatedAt?: string;
+  colorMood?: string;
+  cinematography?: string;
+  forbidden?: string[];
+  referencePromptTemplate?: string;
 }
 
 export interface VideoWorldModelCharacter {
@@ -190,18 +201,7 @@ export interface VideoShotPacket {
   promptSeed: string;
   forbiddenChanges: string[];
   renderMode: "img2video" | "text2video";
-  reviewStatus: "pending" | "approved" | "redo";
-}
-
-export interface VideoReviewItem {
-  id: string;
-  title: string;
-  summary: string;
-  targetIds: string[];
-  status: "pending" | "approved" | "redo";
-  reason?: string;
-  createdAt: string;
-  updatedAt: string;
+  reviewStatus?: string;
 }
 
 export interface VideoProductionBundleMeta {
@@ -210,6 +210,61 @@ export interface VideoProductionBundleMeta {
   filePaths: string[];
   exportedCount: number;
   exportedAt: string;
+}
+
+export type VideoImageModelFamilyKey =
+  | "nano-banana-pro"
+  | "nano-banana-2"
+  | "nano-banana-2-async"
+  | "gpt-image-2";
+
+export type VideoImageResolution = "default" | "2k" | "4k";
+
+export type VideoImageAspectRatio =
+  | "16:9"
+  | "9:16"
+  | "1:1"
+  | "2:3"
+  | "3:2";
+
+export type VideoImageStyleCategory =
+  | "realistic"
+  | "animation-3d"
+  | "animation-2d"
+  | "custom";
+
+export type VideoImageStylePreset =
+  | "live-action"
+  | "hyper-cg"
+  | "3d-cartoon"
+  | "2.5d-stylized"
+  | "anime-3d"
+  | "cel-animation"
+  | "retro-comic"
+  | "custom";
+
+export interface VideoImageGenerationPrefs {
+  familyKey: VideoImageModelFamilyKey;
+  resolution: VideoImageResolution;
+  aspectRatio: VideoImageAspectRatio;
+  styleCategory: VideoImageStyleCategory;
+  stylePreset: VideoImageStylePreset;
+  viewMode?: "single" | "three";
+  customStylePrompt?: string;
+}
+
+export type VideoGenerationModelKey = "doubao-seedance-1-5-pro";
+
+export type VideoGenerationResolution = "480p" | "720p" | "1080p" | "2k" | "4k";
+
+export type VideoGenerationMode = "text-to-video" | "image-to-video";
+
+export interface VideoGenerationPrefs {
+  modelKey: VideoGenerationModelKey;
+  resolution: VideoGenerationResolution;
+  mode: VideoGenerationMode;
+  provider?: string;
+  aspectRatio?: string;
 }
 
 export interface Project {
@@ -224,9 +279,9 @@ export interface Project {
   updatedAt: string;
 }
 
-export type ArtStyle = 'live-action' | 'hyper-cg' | '3d-cartoon' | '2.5d-stylized' | 'anime-3d' | 'cel-animation' | 'retro-comic' | 'custom';
+export type ArtStyle = VideoImageStylePreset | string;
 
-export const ART_STYLE_LABELS: Record<ArtStyle, string> = {
+export const ART_STYLE_LABELS: Record<VideoImageStylePreset, string> = {
   'live-action': '真人影视',
   'hyper-cg': '超写实 CG',
   '3d-cartoon': '3D欧美卡通',
@@ -267,6 +322,26 @@ export function getSegmentsForDuration(duration: EpisodeDuration, customSeconds?
     return customSeconds ? Math.floor(customSeconds / 15) + 1 : null;
   }
   return Math.floor(Number(duration) / 15) + 1;
+}
+
+export interface SegmentVideoPrompt {
+  segmentLabel: string;
+  prompt: string;
+  duration: number;
+  targetDuration: number;
+  modelKey: string;
+  maxDurationForModel: number;
+  sceneIds: string[];
+  generatedAt: string;
+}
+
+export interface SegmentVideoStatus {
+  segmentLabel: string;
+  status: string; // queued | processing | completed | failed
+  taskId?: string;
+  provider?: string;
+  failure?: VideoFailureInfo;
+  updatedAt: string;
 }
 
 export type VideoPace = 'slow' | 'medium' | 'fast';

@@ -4,6 +4,11 @@ export interface AssistantMessageSection {
   body: string;
 }
 
+export interface AssistantMessageSubSection {
+  heading: string;
+  body: string;
+}
+
 export interface AssistantMessageSectionParseResult {
   lead: string;
   sections: AssistantMessageSection[];
@@ -81,5 +86,50 @@ export function splitAssistantMessageSections(content: string): AssistantMessage
   return {
     lead: leadLines.join("\n").trim(),
     sections: sections.filter((section) => section.heading.trim() && section.body.trim()),
+  };
+}
+
+const BOLD_SUBSECTION_RE = /^\*\*([^*]+)\*\*$/;
+
+export function splitSectionSubSections(body: string): {
+  lead: string;
+  subSections: AssistantMessageSubSection[];
+} {
+  const lines = body.split("\n");
+  const leadLines: string[] = [];
+  const subSections: AssistantMessageSubSection[] = [];
+
+  let currentHeading: string | null = null;
+  let currentLines: string[] = [];
+
+  const flush = () => {
+    if (!currentHeading) return;
+    const subBody = currentLines.join("\n").trim();
+    if (subBody) {
+      subSections.push({ heading: currentHeading, body: subBody });
+    }
+    currentHeading = null;
+    currentLines = [];
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const boldMatch = trimmed.match(BOLD_SUBSECTION_RE);
+    if (boldMatch) {
+      flush();
+      currentHeading = boldMatch[1].trim();
+      continue;
+    }
+    if (currentHeading) {
+      currentLines.push(line);
+    } else {
+      leadLines.push(line);
+    }
+  }
+  flush();
+
+  return {
+    lead: leadLines.join("\n").trim(),
+    subSections,
   };
 }

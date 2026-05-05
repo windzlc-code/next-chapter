@@ -449,4 +449,76 @@ AskUserQuestion {
       },
     });
   });
+
+  it("creates a popup request from a next-step heading plus textual options", () => {
+    const result = extractStructuredQuestion(`
+我已经整理完当前状态，下面先把选择收口成弹窗。
+
+## 下一步建议
+- 继续完善剧本导出稿：先补交付结构和语气
+- 接入视频工作流：把当前剧本桥接到视频分析与分镜阶段
+- 回头补缺口：先补写缺失集数和导出缺口
+`);
+
+    expect(result.cleanedText).toContain("我已经整理完当前状态，下面先把选择收口成弹窗。");
+    expect(result.request?.questions).toHaveLength(1);
+    expect(result.request?.questions[0]?.question).toBe("请选择下一步");
+    expect(result.request?.questions[0]?.options.map((option) => option.label)).toEqual([
+      "继续完善剧本导出稿",
+      "接入视频工作流",
+      "回头补缺口",
+    ]);
+  });
+
+  it("creates a popup request when a decision heading is separated from the options by an explanation", () => {
+    const result = extractStructuredQuestion(`
+当前剧本已经能衔接视频，但我还需要你锁定一个路径。
+
+### 关键分歧
+建议先选定方向，我再继续往下问更细的参数。
+
+1. 先锁定单集时长
+2. 直接进入视频工作流
+3. 先看导出稿再决定
+`);
+
+    expect(result.cleanedText).toContain("当前剧本已经能衔接视频，但我还需要你锁定一个路径。");
+    expect(result.request?.questions).toHaveLength(1);
+    expect(result.request?.questions[0]?.question).toBe("请选择下一步");
+    expect(result.request?.questions[0]?.options.map((option) => option.label)).toEqual([
+      "先锁定单集时长",
+      "直接进入视频工作流",
+      "先看导出稿再决定",
+    ]);
+  });
+
+  it("extracts plain line options before a freeform prompt", () => {
+    const result = extractStructuredQuestion(
+      [
+        "\u6ca1\u7406\u89e3\u4f60\u7684\u610f\u601d\u3002\u8bf7\u4ece\u4ee5\u4e0b\u9009\u9879\u4e2d\u9009\u62e9:",
+        "",
+        "\u89c6\u9891\u751f\u6210\u6a21\u5f0f:",
+        "\u6587\u751f\u89c6\u9891",
+        "\u56fe\u751f\u89c6\u9891",
+        "",
+        "\u6216\u8005\u544a\u8bc9\u6211\u4f60\u60f3\u505a\u4ec0\u4e48?",
+      ].join("\n"),
+    );
+
+    expect(result.cleanedText).toBe("\u6ca1\u7406\u89e3\u4f60\u7684\u610f\u601d\u3002\u8bf7\u4ece\u4ee5\u4e0b\u9009\u9879\u4e2d\u9009\u62e9:");
+    expect(result.request?.title).toBe("\u89c6\u9891\u751f\u6210\u6a21\u5f0f");
+    expect(result.request?.questions[0]?.question).toBe("\u6216\u8005\u544a\u8bc9\u6211\u4f60\u60f3\u505a\u4ec0\u4e48?");
+    expect(result.request?.questions[0]?.options.map((option) => option.label)).toEqual([
+      "\u6587\u751f\u89c6\u9891",
+      "\u56fe\u751f\u89c6\u9891",
+    ]);
+  });
+
+  it("does not create an empty choice request for freeform-only prompts", () => {
+    const result = extractStructuredQuestion(
+      "\u6211\u8fd8\u9700\u8981\u4e00\u4e2a\u66f4\u660e\u786e\u7684\u65b9\u5411\uff0c\u8bf7\u544a\u8bc9\u6211\u4f60\u60f3\u505a\u4ec0\u4e48?",
+    );
+
+    expect(result.request).toBeNull();
+  });
 });

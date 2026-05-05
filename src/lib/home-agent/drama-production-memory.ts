@@ -6,6 +6,7 @@ import type {
   StoryBeatPacket,
 } from "@/types/drama";
 import type { VideoStyleLock, VideoWorldModel } from "@/types/project";
+import { repairDramaDirectoryFromRaw } from "./script-artifact-helpers";
 
 function truncate(text: string, max = 180): string {
   const normalized = text.replace(/\s+/g, " ").trim();
@@ -179,12 +180,18 @@ export function synchronizeDramaProductionState(
   styleLock: VideoStyleLock | null,
   worldModel: VideoWorldModel | null,
 ): DramaProject {
-  return {
+  const repairedDirectory = repairDramaDirectoryFromRaw(project.directoryRaw, project.directory);
+  const repairedProject = {
     ...project,
+    directory: repairedDirectory,
+  };
+
+  return {
+    ...repairedProject,
     styleLock,
     worldModel,
-    characterStateCards: deriveDramaCharacterStateCards(project),
-    storyBeatPackets: deriveDramaStoryBeatPackets(project),
-    complianceRevisionPackets: deriveDramaComplianceRevisionPackets(project),
+    characterStateCards: deriveDramaCharacterStateCards(repairedProject),
+    storyBeatPackets: deriveDramaStoryBeatPackets(repairedProject),
+    complianceRevisionPackets: deriveDramaComplianceRevisionPackets(repairedProject),
   };
 }

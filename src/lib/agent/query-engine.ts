@@ -14,8 +14,10 @@ import {
   accumulateUsage,
   type AssistantMessage,
   type Message,
+  type MessageInput,
   type ProgressMessage,
   type SDKMessage,
+  type ToolUseBlock,
   type UsageStats,
   type UserMessage,
 } from './types'
@@ -74,9 +76,8 @@ export class QueryEngine {
 
   private buildToolProgressMessage(message: AssistantMessage): ProgressMessage | null {
     const content = Array.isArray(message.message.content) ? message.message.content : []
-    const toolNames = content
-      .filter((block): block is { type: 'tool_use'; name: string } => block.type === 'tool_use')
-      .map((block) => block.name)
+    const toolUseBlocks = content.filter((block): block is ToolUseBlock => block.type === 'tool_use')
+    const toolNames = toolUseBlocks.map((block) => block.name)
 
     if (toolNames.length === 0) return null
 
@@ -84,11 +85,14 @@ export class QueryEngine {
     const contentLabel =
       firstTool === 'HomeStudioWorkflow'
         ? '正在执行工作流'
-        : firstTool === 'ask-user-question'
+        : firstTool === 'AskUserQuestion'
           ? '正在整理下一步选项'
           : toolNames.length > 1
             ? '正在调用多个工具'
             : '正在调用工具'
+
+    // 将 AskUserQuestion 的参数透传给 UI，用于在聊天流中渲染兜底文本
+    const askBlock = toolUseBlocks.find(b => b.name === 'AskUserQuestion')
 
     return {
       type: 'progress',
@@ -97,12 +101,13 @@ export class QueryEngine {
       data: {
         stage: 'tool_use',
         toolNames,
+        ...(askBlock ? { askUserQuestionArgs: askBlock.input } : {}),
       },
     }
   }
 
   async *submitMessage(
-    prompt: string | Array<unknown>,
+    prompt: MessageInput,
     opts: { uuid?: string; isMeta?: boolean } = {},
   ): AsyncGenerator<SDKMessage> {
     const cfg = this.config
@@ -126,7 +131,7 @@ export class QueryEngine {
       isMeta: opts.isMeta,
       message: {
         role: 'user',
-        content: typeof prompt === 'string' ? prompt : JSON.stringify(prompt),
+        content: prompt,
       },
     }
     this.messages.push(userMsg)

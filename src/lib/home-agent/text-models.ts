@@ -119,8 +119,14 @@ function isTextProvider(
   return provider === "claude" || provider === "gemini" || provider === "gpt" || provider === "grok";
 }
 
+function isHomeAgentTextModelMapping(
+  mapping: SupportedModelMapping,
+): mapping is SupportedModelMapping & { provider: HomeAgentTextModelOption["provider"] } {
+  return mapping.category === "text" && isTextProvider(mapping.provider);
+}
+
 export function listHomeAgentTextModelOptions(): HomeAgentTextModelOption[] {
-  return SUPPORTED_MODEL_MAPPINGS.filter((mapping) => mapping.category === "text" && isTextProvider(mapping.provider))
+  return SUPPORTED_MODEL_MAPPINGS.filter(isHomeAgentTextModelMapping)
     .map((mapping) => {
       const providerMeta = PROVIDER_META[mapping.provider];
       const modelMeta = MODEL_META[mapping.key];

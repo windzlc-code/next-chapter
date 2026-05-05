@@ -12,6 +12,7 @@ vi.mock("@/lib/gemini-client", () => ({
 }));
 
 const {
+  dreaminaCliCancelVideo,
   dreaminaCliGenerateVideo,
   dreaminaCliGetStatus,
   dreaminaCliLogin,
@@ -152,6 +153,26 @@ describe("dreamina-cli", () => {
 
     expect(result.status).toBe("succeeded");
     expect(result.video_url).toBe("https://example.com/video.mp4");
+  });
+
+  it("sends cancel to the official CLI for submitted video tasks", async () => {
+    vi.mocked(getElectronApi().dreaminaCli!.exec).mockResolvedValue({
+      ok: true,
+      installed: true,
+      stdout: '{"submit_id":"task-123","gen_status":"cancelled"}',
+    });
+
+    const result = await dreaminaCliCancelVideo("task-123");
+
+    expect(result).toEqual({
+      task_id: "task-123",
+      status: "cancelled",
+      provider: "dreamina-cli",
+    });
+    expect(getElectronApi().dreaminaCli!.exec).toHaveBeenCalledWith(
+      ["cancel", "--submit_id=task-123"],
+      undefined,
+    );
   });
 
   it("exposes Seedance 2.0 variants in the local catalog", () => {

@@ -155,14 +155,12 @@ export const HomeTextModelPicker = memo(function HomeTextModelPicker({
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
         className={cn(
-          "inline-flex h-9 max-w-[min(44vw,220px)] items-center gap-2 rounded-full border px-3 text-[12px] transition sm:h-10",
-          activeTheme
-            ? "border-white/[0.06] bg-white/[0.05] text-white/82 hover:bg-white/[0.08]"
-            : "border-black/10 bg-black/[0.04] text-slate-800 hover:bg-black/[0.06]",
+          "inline-flex h-8 max-w-[min(40vw,196px)] items-center gap-1.5 rounded-full border px-2.5 text-[12px] transition sm:h-9",
+          "border-border bg-muted/50 text-foreground hover:bg-muted",
         )}
       >
         <span className="truncate">{selectedSummary}</span>
-        <ChevronDown className={cn("h-3.5 w-3.5 shrink-0 transition-transform", open && "rotate-180")} />
+        <ChevronDown className={cn("h-3 w-3 shrink-0 transition-transform", open && "rotate-180")} />
       </button>
 
       {open && typeof document !== "undefined"
@@ -172,15 +170,13 @@ export const HomeTextModelPicker = memo(function HomeTextModelPicker({
                 ref={providerPanelRef}
                 className={cn(
                   "fixed z-[70] w-[224px] overflow-hidden rounded-[24px] border p-1.5 shadow-[0_16px_48px_rgba(0,0,0,0.28)] backdrop-blur-md",
-                  activeTheme
-                    ? "border-white/[0.05] bg-[#17181bf7] text-white"
-                    : "border-[#d7cfbf] bg-[#f6f1e9f7] text-slate-950",
+                  "border-border bg-card text-foreground",
                 )}
                 style={positions.provider}
               >
-                <div className={cn("px-2.5 pb-1.5 pt-1", activeTheme ? "text-white/42" : "text-slate-500")}>
+                <div className="px-2.5 pb-1.5 pt-1 text-muted-foreground">
                   <div className="text-[10px] uppercase tracking-[0.2em]">供应商</div>
-                  <div className={cn("mt-1 text-[17px] font-medium tracking-[-0.04em]", activeTheme ? "text-white/88" : "text-slate-950")}>
+                  <div className="mt-1 text-[17px] font-medium tracking-[-0.04em] text-foreground">
                     选择模型系列
                   </div>
                 </div>
@@ -198,25 +194,19 @@ export const HomeTextModelPicker = memo(function HomeTextModelPicker({
                         onClick={() => setActiveProvider(group.provider)}
                         className={cn(
                           "flex w-full items-center justify-between gap-3 rounded-[16px] px-3 py-2.5 text-left transition",
-                          activeTheme
-                            ? selected
-                              ? "bg-white/[0.07]"
-                              : "hover:bg-white/[0.045]"
-                            : selected
-                              ? "bg-black/[0.05]"
-                              : "hover:bg-black/[0.035]",
+                          selected ? "bg-muted" : "hover:bg-muted/60",
                         )}
                       >
                         <div className="min-w-0">
-                          <div className={cn("text-[13.5px] font-medium", activeTheme ? "text-white/92" : "text-slate-950")}>
+                          <div className="text-[13.5px] font-medium text-foreground">
                             {group.familyLabel}
                           </div>
-                          <div className={cn("mt-0.5 text-[10.5px]", activeTheme ? "text-white/44" : "text-slate-600")}>
+                          <div className="mt-0.5 text-[10.5px] text-muted-foreground">
                             {group.supplierLabel}
                             {currentOption ? ` / ${currentOption.shortLabel}` : ""}
                           </div>
                         </div>
-                        <ChevronRight className={cn("h-3.5 w-3.5 shrink-0", activeTheme ? "text-white/30" : "text-slate-400")} />
+                        <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground/50" />
                       </button>
                     );
                   })}
@@ -228,15 +218,13 @@ export const HomeTextModelPicker = memo(function HomeTextModelPicker({
                   ref={modelsPanelRef}
                   className={cn(
                     "fixed z-[71] w-[282px] overflow-hidden rounded-[24px] border p-1.5 shadow-[0_16px_48px_rgba(0,0,0,0.28)] backdrop-blur-md",
-                    activeTheme
-                      ? "border-white/[0.05] bg-[#17181bf8] text-white"
-                      : "border-[#d7cfbf] bg-[#f6f1e9f8] text-slate-950",
+                    "border-border bg-card text-foreground",
                   )}
                   style={positions.models}
                 >
-                  <div className={cn("px-2.5 pb-1.5 pt-1", activeTheme ? "text-white/42" : "text-slate-500")}>
+                  <div className="px-2.5 pb-1.5 pt-1 text-muted-foreground">
                     <div className="text-[10px] uppercase tracking-[0.2em]">{activeGroup.supplierLabel}</div>
-                    <div className={cn("mt-1 text-[17px] font-medium tracking-[-0.04em]", activeTheme ? "text-white/88" : "text-slate-950")}>
+                    <div className="mt-1 text-[17px] font-medium tracking-[-0.04em] text-foreground">
                       {activeGroup.familyLabel}
                     </div>
                   </div>
@@ -254,40 +242,24 @@ export const HomeTextModelPicker = memo(function HomeTextModelPicker({
                           }}
                           className={cn(
                             "flex w-full items-start justify-between gap-3 rounded-[16px] px-3 py-2 text-left transition",
-                            activeTheme
-                              ? selected
-                                ? "bg-white/[0.07]"
-                                : "hover:bg-white/[0.045]"
-                              : selected
-                                ? "bg-black/[0.05]"
-                                : "hover:bg-black/[0.035]",
+                            selected ? "bg-muted" : "hover:bg-muted/60",
                           )}
                         >
                           <div className="min-w-0">
-                            <div className={cn("text-[14px] font-medium leading-5", activeTheme ? "text-white/90" : "text-slate-950")}>
+                            <div className="text-[14px] font-medium leading-5 text-foreground">
                               {option.shortLabel}
                             </div>
-                            <div className={cn("mt-0.5 line-clamp-2 text-[11px] leading-[1.45]", activeTheme ? "text-white/46" : "text-slate-600")}>
+                            <div className="mt-0.5 line-clamp-2 text-[11px] leading-[1.45] text-muted-foreground">
                               {option.description}
                             </div>
                           </div>
                           <div className="pt-1">
                             {selected ? (
-                              <div
-                                className={cn(
-                                  "flex h-6 w-6 items-center justify-center rounded-full",
-                                  activeTheme ? "bg-[#9cc2ff] text-slate-950" : "bg-slate-900 text-white",
-                                )}
-                              >
+                              <div className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-primary-foreground">
                                 <Check className="h-3.5 w-3.5" />
                               </div>
                             ) : (
-                              <div
-                                className={cn(
-                                  "h-6 w-6 rounded-full border",
-                                  activeTheme ? "border-white/[0.12]" : "border-black/12",
-                                )}
-                              />
+                              <div className="h-6 w-6 rounded-full border border-border" />
                             )}
                           </div>
                         </button>

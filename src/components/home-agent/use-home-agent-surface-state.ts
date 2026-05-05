@@ -1,5 +1,6 @@
 import * as React from "react";
 import { useReducedMotion } from "framer-motion";
+import { useTheme } from "next-themes";
 import type { ComposerQuestion, ConversationProjectSnapshot, HomeAgentMessage, StudioRuntimeState } from "@/lib/home-agent/types";
 import type { Task } from "@/lib/agent/tools/task-tools";
 import { collectConversationAssets } from "./home-agent-sidebar-utils";
@@ -13,6 +14,7 @@ export function useHomeAgentSurfaceState(params: {
   question: ComposerQuestion | null;
   utilityPanel: "settings" | undefined;
   desktopSidebarCollapsed: boolean;
+  mobileNavOpen: boolean;
   runtime: StudioRuntimeState;
   tasks: Task[];
   activeProjectId?: string;
@@ -39,6 +41,7 @@ export function useHomeAgentSurfaceState(params: {
     question,
     utilityPanel,
     desktopSidebarCollapsed,
+    mobileNavOpen,
     runtime,
     tasks,
     activeProjectId,
@@ -60,10 +63,12 @@ export function useHomeAgentSurfaceState(params: {
   } = params;
 
   const idle = mode === "idle" && messages.length === 0 && !currentProject;
-  const activeTheme = true;
+  const { resolvedTheme } = useTheme();
+  const activeTheme = resolvedTheme !== "light";
   const placeholder = question?.allowCustomInput ? customPlaceholder : idle ? idlePlaceholder : activePlaceholder;
   const deferredMessages = useDeferredValue(messages);
   const deferredProjectSnapshot = useDeferredValue(runtime.currentProjectSnapshot);
+  const deferredCurrentVideoProject = useDeferredValue(runtime.currentVideoProject);
   const deferredRecentProjects = useDeferredValue(runtime.recentProjects);
   const reduceMotion = useReducedMotion();
   const settingsOpen = utilityPanel === "settings";
@@ -134,13 +139,14 @@ export function useHomeAgentSurfaceState(params: {
   );
 
   const composerShellClass = idle
-    ? "overflow-hidden rounded-[30px] bg-[linear-gradient(180deg,rgba(35,36,40,0.96),rgba(24,25,28,0.98))] shadow-[0_10px_30px_rgba(0,0,0,0.14)]"
-    : "overflow-hidden rounded-[28px] bg-[linear-gradient(180deg,rgba(33,34,38,0.96),rgba(24,25,28,0.98))]";
+    ? "composer-shell-idle"
+    : "composer-shell-active";
 
-  const sidebarAssets = useMemo(
-    () => collectConversationAssets(runtime.currentVideoProject, runtime.currentProjectSnapshot).slice(0, 12),
-    [runtime.currentProjectSnapshot, runtime.currentVideoProject],
-  );
+  const shouldCollectSidebarAssets = !idle && (!desktopSidebarCollapsed || mobileNavOpen);
+  const sidebarAssets = useMemo(() => {
+    if (!shouldCollectSidebarAssets) return [];
+    return collectConversationAssets(deferredCurrentVideoProject, deferredProjectSnapshot);
+  }, [deferredCurrentVideoProject, deferredProjectSnapshot, shouldCollectSidebarAssets]);
 
   const deferredSidebarAssets = useDeferredValue(sidebarAssets);
   const visibleTasks = useMemo(
@@ -148,7 +154,6 @@ export function useHomeAgentSurfaceState(params: {
     [isTaskVisibleForSession, runtime.sessionId, tasks],
   );
   const deferredVisibleTasks = useDeferredValue(visibleTasks);
-  const deferredActiveProjectId = useDeferredValue(activeProjectId);
 
   return {
     idle,
@@ -168,6 +173,5 @@ export function useHomeAgentSurfaceState(params: {
     deferredSidebarAssets,
     visibleTasks,
     deferredVisibleTasks,
-    deferredActiveProjectId,
   };
 }

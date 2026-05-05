@@ -100,6 +100,13 @@ export const SUPPORTED_MODEL_MAPPINGS: SupportedModelMapping[] = [
     defaultModelName: "gpt-5.4-mini",
   },
   {
+    key: "gpt-image-2",
+    label: "GPT Image 2",
+    provider: "gpt",
+    category: "image",
+    defaultModelName: "gpt-image-2",
+  },
+  {
     key: "claude-sonnet-4-6",
     label: "Claude Sonnet 4.6",
     provider: "claude",
@@ -128,11 +135,109 @@ export const SUPPORTED_MODEL_MAPPINGS: SupportedModelMapping[] = [
     defaultModelName: "grok-4.1",
   },
   {
+    key: "nano-banana-pro",
+    label: "nano-banana-pro",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "nano-banana-pro",
+  },
+  {
+    key: "nano-banana-pro-2k",
+    label: "nano-banana-pro 2K",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "nano-banana-pro-2k",
+  },
+  {
+    key: "nano-banana-pro-4k",
+    label: "nano-banana-pro 4K",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "nano-banana-pro-4k",
+  },
+  {
     key: "gemini-3-pro-image-preview",
-    label: "Gemini 3 Pro Image Preview",
+    label: "nano-banana 2",
     provider: "gemini",
     category: "image",
     defaultModelName: "gemini-3-pro-image-preview",
+  },
+  {
+    key: "gemini-3-pro-image-preview-2k",
+    label: "nano-banana 2 2K",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "gemini-3-pro-image-preview-2k",
+  },
+  {
+    key: "gemini-3-pro-image-preview-4k",
+    label: "nano-banana 2 4K",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "gemini-3-pro-image-preview-4k",
+  },
+  {
+    key: "nano-banana-2",
+    label: "nano-banana 2",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "gemini-3-pro-image-preview",
+  },
+  {
+    key: "nano-banana-2-2k",
+    label: "nano-banana 2 2K",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "gemini-3-pro-image-preview-2k",
+  },
+  {
+    key: "nano-banana-2-4k",
+    label: "nano-banana 2 4K",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "gemini-3-pro-image-preview-4k",
+  },
+  {
+    key: "gemini-3-pro-image-preview-async",
+    label: "nano-banana 2-async",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "gemini-3-pro-image-preview-async",
+  },
+  {
+    key: "gemini-3-pro-image-preview-2k-async",
+    label: "nano-banana 2-async 2K",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "gemini-3-pro-image-preview-2k-async",
+  },
+  {
+    key: "gemini-3-pro-image-preview-4k-async",
+    label: "nano-banana 2-async 4K",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "gemini-3-pro-image-preview-4k-async",
+  },
+  {
+    key: "nano-banana-2-async",
+    label: "nano-banana 2-async",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "gemini-3-pro-image-preview-async",
+  },
+  {
+    key: "nano-banana-2-2k-async",
+    label: "nano-banana 2-async 2K",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "gemini-3-pro-image-preview-2k-async",
+  },
+  {
+    key: "nano-banana-2-4k-async",
+    label: "nano-banana 2-async 4K",
+    provider: "gemini",
+    category: "image",
+    defaultModelName: "gemini-3-pro-image-preview-4k-async",
   },
   {
     key: "gemini-3.1-flash-image-preview",
@@ -147,6 +252,13 @@ export const SUPPORTED_MODEL_MAPPINGS: SupportedModelMapping[] = [
     provider: "seedream",
     category: "image",
     defaultModelName: "doubao-seedream-5-0-260128",
+  },
+  {
+    key: "doubao-seedance-1-5-pro_480p",
+    label: "Seedance 1.5 Pro 480P",
+    provider: "jimeng",
+    category: "video",
+    defaultModelName: "doubao-seedance-1-5-pro_480p",
   },
   {
     key: "doubao-seedance-1-5-pro_720p",
@@ -191,6 +303,56 @@ export const SUPPORTED_MODEL_MAPPINGS: SupportedModelMapping[] = [
     defaultModelName: "sora-2-pro",
   },
 ];
+
+const STATIC_ARK_VIDEO_MODEL_MAPPING_FALLBACKS: Record<string, string> = {
+  "doubao-seedance-1-5-pro_480p": "ep-m-20260414192742-59w88",
+  "doubao-seedance-1-5-pro_720p": "ep-m-20260414192742-59w88",
+  "doubao-seedance-1-5-pro_1080p": "ep-m-20260414192742-59w88",
+};
+
+export function isArkJimengEndpoint(value: string | undefined): boolean {
+  const trimmed = String(value || "").trim().replace(/\/$/, "");
+  if (!trimmed) return false;
+  return (
+    /\/contents\/generations\/tasks$/i.test(trimmed) ||
+    /\/api\/v3$/i.test(trimmed) ||
+    /ark\.cn-beijing\.volces\.com/i.test(trimmed)
+  );
+}
+
+export function resolveJimengApiKey(config: Pick<ApiConfig, "jimengEndpoint" | "jimengKey" | "geminiKey">): string {
+  const jimengKey = String(config.jimengKey || "").trim();
+  if (jimengKey) return jimengKey;
+
+  if (isArkJimengEndpoint(config.jimengEndpoint)) {
+    return "";
+  }
+
+  return String(config.geminiKey || "").trim();
+}
+
+function resolveModelMappingWithConfig(config: Pick<ApiConfig, "jimengEndpoint" | "modelMappings">, model: string): string {
+  const trimmed = String(model || "").trim();
+  if (!trimmed) return trimmed;
+
+  const mapped = config.modelMappings[trimmed]?.trim();
+  const isArkVideoAlias = Object.prototype.hasOwnProperty.call(
+    STATIC_ARK_VIDEO_MODEL_MAPPING_FALLBACKS,
+    trimmed,
+  );
+  if (mapped) {
+    if (isArkVideoAlias && !isArkJimengEndpoint(config.jimengEndpoint)) {
+      return trimmed;
+    }
+    return mapped;
+  }
+
+  if (isArkVideoAlias && isArkJimengEndpoint(config.jimengEndpoint)) {
+    return STATIC_ARK_VIDEO_MODEL_MAPPING_FALLBACKS[trimmed] || trimmed;
+  }
+
+  return trimmed;
+}
 
 const STORAGE_KEY = "storyforge_api_config";
 const OBF_PREFIX = "obf:";
@@ -468,33 +630,55 @@ function decodeSensitiveFields(config: ApiConfig): ApiConfig {
 function applyBuiltinOverlay(config: ApiConfig): ApiConfig {
   const normalizedConfig = normalizeStoredConfig(config);
   const builtin = getBuiltinApiBundle();
-  if (!builtin) return normalizedConfig;
+  if (!builtin) {
+    return {
+      ...normalizedConfig,
+      modelMappings: {
+        ...STATIC_ARK_VIDEO_MODEL_MAPPING_FALLBACKS,
+        ...normalizedConfig.modelMappings,
+      },
+    };
+  }
   const builtinMappings = normalizeModelMappings(builtin.modelMappings);
 
   const g = (field: keyof BuiltinApiBundle) =>
     typeof builtin[field] === "string" ? (builtin[field] as string).trim() : "";
 
-  const geminiEndpoint = g("geminiEndpoint");
-  const geminiKey = g("geminiKey");
+  const pick = (
+    builtinField: keyof BuiltinApiBundle,
+    configField: keyof ApiConfig,
+  ): string => {
+    const builtinValue = g(builtinField);
+    if (builtinValue) return builtinValue;
+    const configValue = normalizedConfig[configField];
+    return typeof configValue === "string" ? configValue.trim() : "";
+  };
+
+  const geminiEndpoint = pick("geminiEndpoint", "geminiEndpoint");
+  const geminiKey = pick("geminiKey", "geminiKey");
 
   return {
     ...normalizedConfig,
     geminiEndpoint,
     geminiKey,
-    gptEndpoint: g("gptEndpoint") || geminiEndpoint,
-    gptKey: g("gptKey") || geminiKey,
-    claudeEndpoint: g("claudeEndpoint") || geminiEndpoint,
-    claudeKey: g("claudeKey") || geminiKey,
-    grokEndpoint: g("grokEndpoint") || geminiEndpoint,
-    grokKey: g("grokKey") || geminiKey,
-    seedreamEndpoint: g("seedreamEndpoint") || geminiEndpoint,
-    seedreamKey: g("seedreamKey") || geminiKey,
-    jimengEndpoint: g("jimengEndpoint") || geminiEndpoint,
-    jimengKey: g("jimengKey") || geminiKey,
+    gptEndpoint: pick("gptEndpoint", "gptEndpoint") || geminiEndpoint,
+    gptKey: pick("gptKey", "gptKey") || geminiKey,
+    claudeEndpoint: pick("claudeEndpoint", "claudeEndpoint") || geminiEndpoint,
+    claudeKey: pick("claudeKey", "claudeKey") || geminiKey,
+    grokEndpoint: pick("grokEndpoint", "grokEndpoint") || geminiEndpoint,
+    grokKey: pick("grokKey", "grokKey") || geminiKey,
+    seedreamEndpoint: pick("seedreamEndpoint", "seedreamEndpoint") || geminiEndpoint,
+    seedreamKey: pick("seedreamKey", "seedreamKey") || geminiKey,
+    jimengEndpoint: pick("jimengEndpoint", "jimengEndpoint") || geminiEndpoint,
+    jimengKey: pick("jimengKey", "jimengKey") || geminiKey,
     jimengExecutionMode: normalizedConfig.jimengExecutionMode,
-    tuziEndpoint: g("tuziEndpoint"),
-    tuziKey: g("tuziKey"),
-    modelMappings: builtinMappings,
+    tuziEndpoint: pick("tuziEndpoint", "tuziEndpoint"),
+    tuziKey: pick("tuziKey", "tuziKey"),
+    modelMappings: {
+      ...STATIC_ARK_VIDEO_MODEL_MAPPING_FALLBACKS,
+      ...normalizedConfig.modelMappings,
+      ...builtinMappings,
+    },
   };
 }
 
@@ -545,19 +729,15 @@ export function clearApiConfig(): void {
 }
 
 export function resolveConfiguredModelName(model: string): string {
-  const trimmed = String(model || "").trim();
-  if (!trimmed) return trimmed;
   const config = getApiConfig();
-  return config.modelMappings[trimmed]?.trim() || trimmed;
+  return resolveModelMappingWithConfig(config, model);
 }
 
 export function resolveConfiguredModelNameFromConfig(
   config: ApiConfig,
   model: string,
 ): string {
-  const trimmed = String(model || "").trim();
-  if (!trimmed) return trimmed;
-  return config.modelMappings[trimmed]?.trim() || trimmed;
+  return resolveModelMappingWithConfig(config, model);
 }
 
 export function prefersJimengCli(config: Pick<ApiConfig, "jimengExecutionMode">): boolean {

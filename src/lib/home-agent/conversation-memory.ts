@@ -125,7 +125,6 @@ function buildProjectRuntimeMemoryDocuments(
       const status = String(scene.videoStatus || "").toLowerCase();
       return !scene.videoUrl && status !== "queued" && status !== "processing";
     });
-    const reviewQueue = (memory.reviewQueue ?? []).filter((item) => item.status === "pending" || item.status === "redo");
 
     if (failedScenes.length) {
       runtimeDocuments.push({
@@ -167,23 +166,6 @@ function buildProjectRuntimeMemoryDocuments(
         summary: truncate(`当前有 ${runningScenes.length} 条镜头仍在后台出片。`, 150),
         updatedAt,
         tags: ["video", "scene", "running", "镜头", "生成中"],
-      });
-    }
-
-    if (reviewQueue.length) {
-      runtimeDocuments.push({
-        id: `memory:${snapshot.projectId}:runtime:review-queue`,
-        projectId: snapshot.projectId,
-        projectKind: snapshot.projectKind,
-        title: `${snapshot.title} · 待审镜头`,
-        kind: "artifact",
-        text: reviewQueue
-          .slice(0, 8)
-          .map((item) => `${item.title}\n${item.summary}\n状态：${item.status}`)
-          .join("\n\n"),
-        summary: truncate(`当前有 ${reviewQueue.length} 条待审镜头或待处理审阅项。`, 150),
-        updatedAt,
-        tags: ["video", "review", "待审", "镜头", "审阅"],
       });
     }
 

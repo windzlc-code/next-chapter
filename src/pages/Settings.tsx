@@ -6,6 +6,7 @@ import {
   FolderCog,
   FolderOpen,
   Globe,
+  History,
   Key,
   Loader2,
   Moon,
@@ -49,6 +50,9 @@ import {
   dreaminaCliRelogin,
 } from "@/lib/dreamina-cli";
 import { readHomeAgentLaunchReadiness, type HomeAgentLaunchReadiness } from "@/lib/home-agent/launch-readiness";
+import { getHistorySettings, saveHistorySettings, type HistorySettings } from "@/lib/home-agent/history-settings";
+import { readStoredAutomationMode, writeStoredAutomationMode } from "@/lib/home-agent/automation-mode";
+import type { AutomationMode } from "@/lib/home-agent/types";
 import { cn } from "@/lib/utils";
 
 type ProviderId = "gemini" | "gpt" | "claude" | "grok" | "seedream" | "jimeng" | "tuzi";
@@ -67,7 +71,7 @@ const API_ROWS: Array<{
     endpointPlaceholder: "默认：https://api.tu-zi.com/v1beta",
     endpointHint: "Gemini 模型的 API 根地址。留空使用默认值。其他模型留空时会回退到此地址。",
     keyHint: "Gemini API Key。其他模型留空时会回退到此 Key。",
-    models: "gemini-3-pro, gemini-3-pro-thinking, gemini-3-flash-preview, gemini-3-pro-image-preview",
+    models: "gemini-3-pro, gemini-3-pro-thinking, gemini-3-flash-preview, nano-banana-pro, nano-banana 2, nano-banana 2-async",
   },
   {
     id: "gpt",
@@ -75,7 +79,7 @@ const API_ROWS: Array<{
     endpointPlaceholder: "默认：https://api.tu-zi.com/v1",
     endpointHint: "GPT 模型的 API 根地址。留空时复用 Gemini API 端点。",
     keyHint: "GPT API Key。留空时复用 Gemini API Key。",
-    models: "gpt-5.4, gpt-5.4-mini",
+    models: "gpt-5.4, gpt-5.4-mini, gpt-image-2",
   },
   {
     id: "claude",
@@ -105,8 +109,8 @@ const API_ROWS: Array<{
     id: "jimeng",
     title: "Seedance API",
     endpointPlaceholder: "默认：https://api.tu-zi.com/v1beta",
-    endpointHint: "Seedance 视频生成 API 根地址。留空时复用 Gemini API 端点；实际走 API 还是 CLI，由下方运行通道开关决定。",
-    keyHint: "Seedance API Key。留空时复用 Gemini API Key；若切到 CLI，本项不会参与本轮出片。",
+    endpointHint: "Seedance 视频生成 API 根地址。留空时复用 Gemini API 端点；若填火山方舟 Ark `/contents/generations/tasks`，下方必须填写专用 Ark Key。实际走 API 还是 CLI，由下方运行通道开关决定。",
+    keyHint: "Seedance API Key。普通网关可留空复用 Gemini API Key；若切到 Ark 直连，必须填写专用 Ark Key。若切到 CLI，本项不会参与本轮出片。",
     models: "doubao-seedance-1-5-pro_720p, doubao-seedance-1-5-pro_1080p, seedance2.0, seedance2.0fast",
   },
   {
@@ -146,6 +150,7 @@ type SettingsProps = {
 };
 
 type DreaminaCliStatusState = Awaited<ReturnType<typeof dreaminaCliGetStatus>>;
+type DreaminaCliStatusViewState = Omit<DreaminaCliStatusState, "path"> & { path?: string };
 const JIMENG_EXECUTION_OPTIONS: Array<{ id: JimengExecutionMode; label: string; description: string }> = [
   {
     id: "api",
@@ -163,6 +168,8 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
   const navigate = useNavigate();
   const { theme, setTheme } = useTheme();
   const [config, setConfig] = useState<ApiConfig>(() => getStoredApiConfig());
+  const [historyCfg, setHistoryCfg] = useState<HistorySettings>(() => getHistorySettings());
+  const [automationMode, setAutomationMode] = useState<AutomationMode>(() => readStoredAutomationMode());
   const [defaultStoragePath, setDefaultStoragePath] = useState("");
   const [adminPasswordDialogOpen, setAdminPasswordDialogOpen] = useState(false);
   const [builtinEditorOpen, setBuiltinEditorOpen] = useState(false);
@@ -185,7 +192,7 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
     modelMappings: {},
   });
   const [builtinSaving, setBuiltinSaving] = useState(false);
-  const [dreaminaStatus, setDreaminaStatus] = useState<DreaminaCliStatusState | null>(null);
+  const [dreaminaStatus, setDreaminaStatus] = useState<DreaminaCliStatusViewState | null>(null);
   const [dreaminaLoading, setDreaminaLoading] = useState(false);
   const [dreaminaAction, setDreaminaAction] = useState<"login" | "relogin" | null>(null);
   const [launchReadiness, setLaunchReadiness] = useState<HomeAgentLaunchReadiness | null>(null);
@@ -258,6 +265,12 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
         checkedAt: new Date().toISOString(),
         textReady: false,
         textMessage: error instanceof Error ? error.message : "运行前检查失败",
+        image: {
+          ready: false,
+          label: "图像生成待配置",
+          detail: error instanceof Error ? error.message : "运行前检查失败",
+          tone: "warning",
+        },
         video: {
           mode: "api",
           ready: false,
@@ -318,10 +331,18 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
 
   const handleSave = () => {
     saveApiConfig(config);
+    saveHistorySettings(historyCfg);
+    writeStoredAutomationMode(automationMode);
     setConfig(getStoredApiConfig());
     void refreshLaunchReadiness();
     onSaved?.();
     toast({ title: "已保存", description: "设置已保存到本地。" });
+  };
+
+  const handleAutomationModeChange = (mode: AutomationMode) => {
+    const normalized = writeStoredAutomationMode(mode);
+    setAutomationMode(normalized);
+    onSaved?.();
   };
 
   const handleOpenBuiltinAdminDialog = async () => {
@@ -427,52 +448,55 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
   };
 
   const sectionTitleClass = embedded
-    ? "flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-900"
+    ? "flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground"
     : "text-sm font-medium flex items-center gap-2";
   const cardClass = embedded
-    ? "rounded-[24px] border border-[#d2c7b5] bg-[#fffefb] shadow-[0_10px_28px_rgba(15,23,42,0.05)]"
+    ? "rounded-[20px] border border-border bg-card shadow-none"
     : "";
   const cardContentClass = embedded ? "pt-4 space-y-3" : "pt-6 space-y-4";
   const compactInputClass = embedded
-    ? "h-9 border-[#cec2af] bg-[#fffdfa] font-mono text-[12px] text-slate-950 shadow-none placeholder:text-slate-500"
+    ? "h-9 font-mono text-[12px] shadow-none"
     : "font-mono text-sm";
   const gridClass = embedded ? "grid grid-cols-1 gap-3" : "grid grid-cols-1 md:grid-cols-2 gap-6";
   const embeddedOutlineButtonClass = embedded
-    ? "h-8.5 rounded-full border-[#d2c7b5] bg-[#fffdfa] px-3 text-[12px] font-medium text-slate-900 hover:bg-white disabled:opacity-100 disabled:border-[#ddd3c3] disabled:bg-[#f5efe4] disabled:text-slate-600"
+    ? "h-8.5 rounded-full border-border px-3 text-[12px] font-medium hover:bg-accent hover:text-accent-foreground disabled:opacity-40 disabled:cursor-not-allowed"
     : "";
   const embeddedGhostTextButtonClass = embedded
-    ? "px-0 text-xs font-medium text-slate-900 hover:bg-transparent hover:text-slate-950 disabled:opacity-100 disabled:text-slate-600"
+    ? "px-0 text-xs font-medium text-muted-foreground hover:bg-transparent hover:text-foreground disabled:opacity-40"
     : "text-xs";
-  const embeddedTitleTextClass = embedded ? "text-sm font-medium text-slate-950" : "text-sm font-medium text-foreground";
-  const embeddedLabelTextClass = embedded ? "text-sm font-medium text-slate-950" : "text-sm font-medium";
-  const embeddedMutedTextClass = embedded ? "text-xs leading-5 text-slate-700" : "text-xs leading-5 text-muted-foreground";
+  const embeddedTitleTextClass = embedded ? "text-sm font-medium text-foreground" : "text-sm font-medium text-foreground";
+  const embeddedLabelTextClass = embedded ? "text-sm font-medium text-foreground" : "text-sm font-medium";
+  const embeddedMutedTextClass = embedded ? "text-xs leading-5 text-muted-foreground" : "text-xs leading-5 text-muted-foreground";
   const embeddedMonoMutedTextClass = embedded
-    ? "mt-1.5 break-all font-mono text-[11.5px] text-slate-700"
+    ? "mt-1.5 break-all font-mono text-[11.5px] text-muted-foreground"
     : "mt-1.5 break-all font-mono text-[11.5px] text-muted-foreground";
   const resolvedJimengMode = resolveJimengExecutionMode(config, {
     dreaminaCliAccessible: !!window.electronAPI?.dreaminaCli?.exec,
   });
   const launchTextBadgeClass = launchReadiness?.textReady
-    ? "border border-emerald-300 bg-emerald-50 text-emerald-900"
-    : "border border-rose-300 bg-rose-50 text-rose-900";
+    ? "border border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
+    : "border border-rose-500/40 bg-rose-500/10 text-rose-400";
+  const launchImageBadgeClass = launchReadiness?.image.ready
+    ? "border border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
+    : "border border-amber-500/40 bg-amber-500/10 text-amber-400";
   const launchVideoBadgeClass = launchReadiness?.video.ready
-    ? "border border-sky-300 bg-sky-50 text-sky-900"
-    : "border border-amber-300 bg-amber-50 text-amber-900";
-  const uniqueModeBadgeClass = "border border-slate-300 bg-slate-100 text-slate-900";
+    ? "border border-sky-500/40 bg-sky-500/10 text-sky-400"
+    : "border border-amber-500/40 bg-amber-500/10 text-amber-400";
+  const uniqueModeBadgeClass = "border border-border bg-muted text-muted-foreground";
   const dreaminaBadgeClass = dreaminaStatus?.loggedIn
-    ? "border border-emerald-300 bg-emerald-50 text-emerald-900"
+    ? "border border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
     : dreaminaStatus?.installed
-      ? "border border-amber-300 bg-amber-50 text-amber-900"
-      : "border border-rose-300 bg-rose-50 text-rose-900";
+      ? "border border-amber-500/40 bg-amber-500/10 text-amber-400"
+      : "border border-rose-500/40 bg-rose-500/10 text-rose-400";
   const executionModeBadgeClass = resolvedJimengMode === "cli"
-    ? "border border-emerald-300 bg-emerald-50 text-emerald-900"
-    : "border border-sky-300 bg-sky-50 text-sky-900";
+    ? "border border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
+    : "border border-sky-500/40 bg-sky-500/10 text-sky-400";
 
   return (
     <div
         className={cn(
           embedded
-          ? "flex h-full min-h-0 flex-col bg-transparent text-slate-950 [&_.text-muted-foreground]:!text-slate-700 [&_.text-foreground]:!text-slate-950 [&_label]:!text-slate-950"
+          ? "flex h-full min-h-0 flex-col bg-transparent text-foreground"
           : "min-h-screen bg-background",
         )}
       >
@@ -486,16 +510,16 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
       )}
 
       {embedded && (
-        <div className="flex items-center justify-between border-b border-black/[0.055] px-4 py-3.5">
+        <div className="flex items-center justify-between border-b border-border px-4 py-3.5">
           <div>
-            <h1 className="text-[1.18rem] font-semibold tracking-[-0.035em] text-slate-900">设置</h1>
-            <p className="mt-0.5 text-[12px] text-slate-700">在首页内调整模型、路径与界面行为。</p>
+            <h1 className="text-[1.18rem] font-semibold tracking-[-0.035em] text-foreground">设置</h1>
+            <p className="mt-0.5 text-[12px] text-muted-foreground">在首页内调整模型、路径与界面行为。</p>
           </div>
           {onClose && (
             <Button
               variant="ghost"
               size="icon"
-              className="h-9 w-9 rounded-full border border-black/[0.055] bg-white/70 text-slate-700 hover:bg-white"
+              className="h-9 w-9 rounded-full border border-border text-muted-foreground hover:text-foreground"
               onClick={onClose}
             >
               <X className="h-4 w-4" />
@@ -510,6 +534,45 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
         <div className="space-y-2.5">
           <h2 className={sectionTitleClass}>
             <Sparkles className="h-4 w-4" />
+            工作模式
+          </h2>
+          <Card className={cardClass}>
+            <CardContent className={cardContentClass}>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="min-w-0">
+                  <h3 className={embeddedTitleTextClass}>首页 Agent 模式</h3>
+                  <p className={cn("mt-0.5", embeddedMutedTextClass)}>
+                    普通模式和全自动模式的入口、会话历史与项目状态会分开保存。
+                  </p>
+                </div>
+                <div className="inline-flex shrink-0 rounded-[10px] border border-border bg-muted/30 p-0.5">
+                  {([
+                    ["manual", "普通模式"],
+                    ["full-auto", "全自动模式"],
+                  ] as const).map(([mode, label]) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      onClick={() => handleAutomationModeChange(mode)}
+                      className={cn(
+                        "h-8 rounded-[8px] px-3 text-[12px] font-medium transition-colors",
+                        automationMode === mode
+                          ? "bg-background text-primary font-semibold shadow-sm"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        <div className="space-y-2.5">
+          <h2 className={sectionTitleClass}>
+            <Sparkles className="h-4 w-4" />
             首发运行前检查
           </h2>
           <Card className={cardClass}>
@@ -517,6 +580,9 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
               <div className="flex flex-wrap items-center gap-2">
                 <Badge className={launchTextBadgeClass}>
                   {launchReadiness?.textReady ? "主会话已就绪" : "主会话待配置"}
+                </Badge>
+                <Badge className={launchImageBadgeClass}>
+                  {launchReadiness?.image.ready ? "图像已就绪" : "图像待配置"}
                 </Badge>
                 <Badge className={launchVideoBadgeClass}>
                   视频通道：{launchReadiness?.video.mode === "cli" ? "CLI" : "API"}
@@ -528,7 +594,7 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
                 </p>
                 <p className={embeddedMutedTextClass}>
                   {launchReadiness?.notice?.description ||
-                    `${launchReadiness?.textMessage || "主对话模型已就绪"}；${launchReadiness?.video.label || "当前默认走 API"}：${launchReadiness?.video.detail || "可直接继续工作流"}`}
+                    `${launchReadiness?.textMessage || "主对话模型已就绪"}；${launchReadiness?.image.label || "图像生成已就绪"}：${launchReadiness?.image.detail || "可继续参考图与分镜图生成"}；${launchReadiness?.video.label || "当前默认走 API"}：${launchReadiness?.video.detail || "可直接继续工作流"}`}
                 </p>
               </div>
             </CardContent>
@@ -598,7 +664,7 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
                 <div
                   className={cn(
                     "inline-flex rounded-full border p-1",
-                    embedded ? "border-[#d6cdbc] bg-[#fffdfa]" : "border-border/60 bg-muted/30",
+                    embedded ? "border-border bg-muted/50" : "border-border/60 bg-muted/30",
                   )}
                 >
                   {JIMENG_EXECUTION_OPTIONS.map((option) => {
@@ -610,8 +676,8 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
                         className={cn(
                           "rounded-full px-3 py-1.5 text-xs font-semibold transition",
                           active
-                            ? "bg-slate-950 text-white shadow-sm"
-                            : "text-slate-700 hover:bg-black/[0.04] hover:text-slate-950",
+                            ? "bg-foreground text-background shadow-sm"
+                            : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
                         )}
                         onClick={() => setConfig((prev) => ({ ...prev, jimengExecutionMode: option.id }))}
                         aria-pressed={active}
@@ -652,8 +718,8 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
               </div>
 
               <div className={cn(
-                "rounded-[20px] border px-3.5 py-3 text-sm",
-                embedded ? "border-[#d8cfbf] bg-[#f7f1e6]" : "border-border/60 bg-muted/35",
+                "rounded-[16px] border px-3.5 py-3 text-sm",
+                embedded ? "border-border bg-muted/40" : "border-border/60 bg-muted/35",
               )}>
                 <p className={embeddedTitleTextClass}>
                   {dreaminaLoading ? "正在检查 Dreamina CLI 状态..." : dreaminaStatus?.message || "尚未检查 Dreamina CLI 状态。"}
@@ -798,6 +864,43 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
 
         <div className="space-y-2.5">
           <h2 className={sectionTitleClass}>
+            <History className="h-4 w-4" />
+            对话历史
+          </h2>
+          <Card className={cardClass}>
+            <CardContent className={cardContentClass}>
+              <div className="flex items-center justify-between gap-3">
+                <div className="space-y-0.5">
+                  <Label className={embeddedLabelTextClass}>自动删除旧项目</Label>
+                  <p className={embeddedMutedTextClass}>超出数量上限时，按时间从旧到新自动删除（置顶项目不受影响）。</p>
+                </div>
+                <Switch
+                  checked={historyCfg.autoDelete}
+                  onCheckedChange={(checked) => setHistoryCfg((prev) => ({ ...prev, autoDelete: checked }))}
+                />
+              </div>
+              <div>
+                <Label className={embeddedLabelTextClass}>最多保留项目数</Label>
+                <Input
+                  type="number"
+                  min={5}
+                  max={200}
+                  step={5}
+                  value={historyCfg.maxCount}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (v >= 5 && v <= 200) setHistoryCfg((prev) => ({ ...prev, maxCount: v }));
+                  }}
+                  className={cn(compactInputClass, "mt-1 w-28")}
+                />
+                <p className={cn("mt-1", embeddedMutedTextClass)}>范围 5 – 200，默认 50。</p>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        <div className="space-y-2.5">
+          <h2 className={sectionTitleClass}>
             {theme === "dark" ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
             外观设置
           </h2>
@@ -930,10 +1033,10 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
           </Card>
         </div>
 
-        <Card className={cn("bg-muted/50", embedded && "rounded-[22px] border border-[#d8cfbf] bg-[#f8f2e8] shadow-none")}>
+        <Card className={cn("bg-muted/50", embedded && "rounded-[20px] border border-border bg-muted/30 shadow-none")}>
           <CardContent className={embedded ? "pt-5" : "pt-6"}>
             <h3 className={cn("mb-2", embeddedTitleTextClass)}>说明</h3>
-            <ul className={cn("space-y-1.5 text-[12.5px] leading-5", embedded ? "text-slate-700" : "text-muted-foreground")}>
+            <ul className={cn("space-y-1.5 text-[12.5px] leading-5", embedded ? "text-slate-500" : "text-muted-foreground")}>
               <li>设置页已移除自定义 API 选项，程序始终使用内置 API。</li>
               <li>历史版本遗留的自定义 API 本地配置会在读取和保存时自动清理。</li>
               <li>即梦 / Seedance 默认可复用 Gemini 网关与 Key，实际走 API 还是 CLI 由上方运行通道决定。</li>
@@ -944,18 +1047,22 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
         <div
           className={cn(
             embedded
-              ? "sticky bottom-0 -mx-4 border-t border-[#ddd3c3] bg-[#f4efe6]/96 px-4 pb-4 pt-3 backdrop-blur-md"
+              ? "sticky bottom-0 -mx-4 border-t border-border bg-background/96 px-4 pb-4 pt-3 backdrop-blur-md"
               : "",
           )}
         >
           <div className={cn(embedded ? "flex flex-col gap-1.5" : "flex gap-3")}>
-          <Button onClick={handleSave} className={cn("gap-2", embedded ? "h-10 w-full rounded-full bg-slate-950 text-white shadow-none hover:bg-slate-900" : "flex-1")}>
+          <Button
+            onClick={handleSave}
+            variant={embedded ? "outline" : "default"}
+            className={cn("gap-2", embedded ? "h-10 w-full rounded-full border-border text-foreground hover:bg-muted hover:text-foreground" : "flex-1")}
+          >
             <Save className="h-4 w-4" />
             保存设置
           </Button>
           <Button
-            variant="destructive"
-            className={cn("gap-2", embedded && "h-10 w-full rounded-full shadow-none")}
+            variant="ghost"
+            className={cn("gap-2", embedded && "h-10 w-full rounded-full border border-destructive/30 text-destructive/70 hover:bg-destructive/10 hover:text-destructive hover:border-destructive/50")}
             onClick={handleClear}
           >
             <Trash2 className="h-4 w-4" />

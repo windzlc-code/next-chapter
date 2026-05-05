@@ -30,6 +30,38 @@ export interface TextBlock {
   text: string
 }
 
+export interface InputImageBlock {
+  type: 'input_image'
+  mimeType: string
+  fileName?: string
+  base64?: string
+  localPath?: string
+  previewUrl?: string
+  alt?: string
+}
+
+export interface InputVideoBlock {
+  type: 'input_video'
+  mimeType: string
+  fileName?: string
+  base64?: string
+  localPath?: string
+  previewUrl?: string
+  fallbackText?: string
+}
+
+export interface InputFileBlock {
+  type: 'input_file'
+  mimeType: string
+  fileName: string
+  size?: number
+  extension?: string
+  base64?: string
+  localPath?: string
+  extractedText?: string
+  fallbackDigest?: string
+}
+
 export interface ToolUseBlock {
   type: 'tool_use'
   id: string
@@ -49,7 +81,16 @@ export interface ThinkingBlock {
   thinking: string
 }
 
-export type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | ThinkingBlock
+export type ContentBlock =
+  | TextBlock
+  | InputImageBlock
+  | InputVideoBlock
+  | InputFileBlock
+  | ToolUseBlock
+  | ToolResultBlock
+  | ThinkingBlock
+
+export type MessageInput = string | ContentBlock[]
 
 // ---------------------------------------------------------------------------
 // API message format (sent to/from Anthropic API)

@@ -2,7 +2,7 @@
  * API Client - 使用本地配置的端点和密钥
  */
 
-import { getApiConfig } from "@/lib/api-config";
+import { getApiConfig, isArkJimengEndpoint, resolveJimengApiKey } from "@/lib/api-config";
 import { smartDirectOrProxyFetch } from "@/lib/gemini-client";
 
 const DEFAULT_TIMEOUT = 300_000;
@@ -71,11 +71,12 @@ export async function callVideoApi<T = any>(
     options.endpoint || config.jimengEndpoint || config.geminiEndpoint || "https://api.zhanhu.ai/v1";
   const timeout = options.timeout || 600_000;
 
-  if (
-    !config.jimengKey?.trim() &&
-    !config.geminiKey?.trim()
-  ) {
-    throw new Error("请先在设置中配置即梦视频或 Gemini API Key");
+  if (!resolveJimengApiKey(config)) {
+    throw new Error(
+      isArkJimengEndpoint(config.jimengEndpoint)
+        ? "请先在设置中配置即梦 / Ark 专用 API Key"
+        : "请先在设置中配置即梦视频或 Gemini API Key",
+    );
   }
 
   const controller = new AbortController();

@@ -5,16 +5,23 @@ import type {
   ProductionAssetRecord,
   Scene,
   SceneSetting,
-  VideoReviewItem,
   VideoShotPacket,
   VideoStyleLock,
   VideoWorldModel,
 } from "@/types/project";
+import {
+  appendDuplicateLabelSequence,
+  buildCharacterAssetLabel,
+  buildSceneAssetLabel,
+  buildStoryboardAssetLabel,
+  buildVideoAssetLabel,
+} from "./asset-naming";
+import { isExpiredRemoteSignedMediaUrl } from "./media-url";
 
 function truncate(text: string, max = 180): string {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (!normalized) return "";
-  return normalized.length > max ? `${normalized.slice(0, max - 1)}…` : normalized;
+  return normalized.length > max ? `${normalized.slice(0, max - 1)}...` : normalized;
 }
 
 function normalizeName(value: string | undefined): string {
@@ -25,6 +32,30 @@ function normalizeName(value: string | undefined): string {
 
 function unique<T>(items: T[]): T[] {
   return [...new Set(items)];
+}
+
+function hasUsableAssetUrl(url: string | undefined): boolean {
+  return Boolean(url?.trim()) && !isExpiredRemoteSignedMediaUrl(url);
+}
+
+function isDerivedAssetId(id: string | undefined): boolean {
+  if (!id) return false;
+  return /^(char|scene|shot):/i.test(id);
+}
+
+function collectPreservedManualAssets(
+  project: PersistedVideoProject,
+): ProductionAssetRecord[] {
+  return (project.assetManifest?.items ?? [])
+    .filter((item) => {
+      if (!hasUsableAssetUrl(item.url)) return false;
+      if (item.origin === "manual") return true;
+      return !isDerivedAssetId(item.id);
+    })
+    .map((item) => ({
+      ...item,
+      origin: "manual" as const,
+    }));
 }
 
 function inferGenres(project: PersistedVideoProject): string[] {
@@ -40,7 +71,7 @@ function inferGenres(project: PersistedVideoProject): string[] {
 
   const checks: Array<[RegExp, string]> = [
     [/都市|职场|总裁|婚姻/, "都市"],
-    [/悬疑|反转|推理|谜/, "悬疑"],
+    [/悬疑|反转|推理|调查/, "悬疑"],
     [/古装|仙侠|王朝|江湖/, "古风"],
     [/玄幻|异兽|修炼|灵兽/, "玄幻"],
     [/校园|青春|成长/, "青春"],
@@ -56,19 +87,19 @@ function inferGenres(project: PersistedVideoProject): string[] {
 
 function buildPromptTemplate(project: PersistedVideoProject): string {
   return [
-    "{镜头主体}，{角色状态}，{场景气氛}，",
-    `${project.artStyle || "live-action"} 风格，${project.shotStyle || "电影化镜头"}，`,
-    `${project.targetPlatform || "短视频"} 叙事节奏，保留角色一致性与场景连续性。`,
-  ].join("");
+    "{镜头主体}，{角色状态}，{场景氛围}",
+    `${project.artStyle || "live-action"} 风格，${project.shotStyle || "电影化镜头语言"}`,
+    `${project.targetPlatform || "短视频"} 节奏，保持角色一致性与场景连续性。`,
+  ].join(" ");
 }
 
 export function deriveVideoStyleLock(project: PersistedVideoProject): VideoStyleLock {
   return {
     genre: inferGenres(project),
-    tone: project.outputGoal?.trim() || "高信息密度、强钩子、对话推进",
+    tone: project.outputGoal?.trim() || "高信息密度、强钩子、对话推动",
     visualStyle:
       project.artStyle === "anime-3d"
-        ? "三渲二叙事质感"
+        ? "三渲二动画质感"
         : project.artStyle === "retro-comic"
           ? "复古漫画质感"
           : project.artStyle === "hyper-cg"
@@ -79,9 +110,9 @@ export function deriveVideoStyleLock(project: PersistedVideoProject): VideoStyle
       : "高对比、主体突出、镜头焦点明确",
     cinematography: project.shotStyle?.trim() || "中近景驱动、关键反应镜头优先",
     forbidden: unique([
-      "不要改变主角色脸型与服装识别点",
+      "不要改变主角脸型与服装识别点",
       "不要在相邻镜头中无故改变时间段",
-      "不要弱化用户已锁定的情绪与剧情钩子",
+      "不要弱化已锁定的情绪和剧情钩子",
     ]),
     referencePromptTemplate: buildPromptTemplate(project),
   };
@@ -100,9 +131,28 @@ function buildCharacterAssetRefs(
     .map((item) => item.id);
 }
 
+function findSceneSetting(scene: Scene, sceneSettings: SceneSetting[]): SceneSetting | undefined {
+  const sceneName = normalizeName(scene.sceneName);
+  return sceneSettings.find((sceneSetting) => {
+    const candidate = normalizeName(sceneSetting.name);
+    return candidate && (sceneName.includes(candidate) || candidate.includes(sceneName));
+  });
+}
+
+function resolveSceneVariantLabel(
+  scene: Scene,
+  sceneSettings: SceneSetting[],
+): string | undefined {
+  const matchedSetting = findSceneSetting(scene, sceneSettings);
+  return matchedSetting?.timeVariants?.find(
+    (variant) => variant.id === scene.sceneTimeVariantId || variant.id === matchedSetting.activeTimeVariantId,
+  )?.label;
+}
+
 export function deriveVideoAssetManifest(project: PersistedVideoProject): ProductionAssetManifest {
   const items: ProductionAssetRecord[] = [];
   const seen = new Set<string>();
+  const preservedManualAssets = collectPreservedManualAssets(project);
 
   const pushAsset = (
     asset: Omit<ProductionAssetRecord, "id" | "version" | "createdAt"> & {
@@ -111,7 +161,7 @@ export function deriveVideoAssetManifest(project: PersistedVideoProject): Produc
       createdAt?: string;
     },
   ) => {
-    if (!asset.url || seen.has(asset.key)) return;
+    if (!hasUsableAssetUrl(asset.url) || seen.has(asset.key)) return;
     seen.add(asset.key);
     items.push({
       id: asset.key,
@@ -121,6 +171,7 @@ export function deriveVideoAssetManifest(project: PersistedVideoProject): Produc
       meta: asset.meta,
       reusable: asset.reusable,
       status: asset.status,
+      origin: "derived",
       sourceEntityId: asset.sourceEntityId,
       sceneId: asset.sceneId,
       sceneNumber: asset.sceneNumber,
@@ -133,7 +184,7 @@ export function deriveVideoAssetManifest(project: PersistedVideoProject): Produc
     pushAsset({
       key: `char:${character.id}:primary`,
       kind: "character-reference",
-      label: `${character.name} 角色图`,
+      label: buildCharacterAssetLabel(character.name),
       url: character.imageUrl || "",
       meta: "角色主参考",
       reusable: true,
@@ -145,7 +196,7 @@ export function deriveVideoAssetManifest(project: PersistedVideoProject): Produc
       pushAsset({
         key: `char:${character.id}:view:${view}`,
         kind: "character-reference",
-        label: `${character.name} ${view}`,
+        label: buildCharacterAssetLabel(character.name, { view }),
         url: url || "",
         meta: "三视图",
         reusable: true,
@@ -159,9 +210,9 @@ export function deriveVideoAssetManifest(project: PersistedVideoProject): Produc
       pushAsset({
         key: `char:${character.id}:costume:${costume.id}`,
         kind: "costume-reference",
-        label: `${character.name} · ${costume.label}`,
+        label: buildCharacterAssetLabel(character.name, { variantLabel: costume.label }),
         url: costume.imageUrl || "",
-        meta: "服装参考",
+        meta: "角色变体",
         reusable: true,
         status: "ready",
         sourceEntityId: character.id,
@@ -174,7 +225,7 @@ export function deriveVideoAssetManifest(project: PersistedVideoProject): Produc
     pushAsset({
       key: `scene:${sceneSetting.id}:primary`,
       kind: "scene-reference",
-      label: `${sceneSetting.name} 场景图`,
+      label: buildSceneAssetLabel(sceneSetting.name),
       url: sceneSetting.imageUrl || "",
       meta: "场景主参考",
       reusable: true,
@@ -186,9 +237,9 @@ export function deriveVideoAssetManifest(project: PersistedVideoProject): Produc
       pushAsset({
         key: `scene:${sceneSetting.id}:time:${variant.id}`,
         kind: "time-variant",
-        label: `${sceneSetting.name} · ${variant.label}`,
+        label: buildSceneAssetLabel(sceneSetting.name, { variantLabel: variant.label }),
         url: variant.imageUrl || "",
-        meta: "时间变体",
+        meta: "场景变体",
         reusable: true,
         status: "ready",
         sourceEntityId: sceneSetting.id,
@@ -198,10 +249,12 @@ export function deriveVideoAssetManifest(project: PersistedVideoProject): Produc
   });
 
   project.scenes.forEach((scene) => {
+    const variantLabel = resolveSceneVariantLabel(scene, project.sceneSettings);
+
     pushAsset({
       key: `shot:${scene.id}:storyboard`,
       kind: "storyboard-frame",
-      label: `${scene.sceneName} 分镜图`,
+      label: buildStoryboardAssetLabel(scene, { variantLabel }),
       url: scene.storyboardUrl || "",
       meta: scene.segmentLabel ? `分镜 / ${scene.segmentLabel}` : "分镜",
       reusable: false,
@@ -213,7 +266,7 @@ export function deriveVideoAssetManifest(project: PersistedVideoProject): Produc
     pushAsset({
       key: `shot:${scene.id}:video`,
       kind: "video-segment",
-      label: `${scene.sceneName} 视频`,
+      label: buildVideoAssetLabel(scene, { variantLabel }),
       url: scene.videoUrl || "",
       meta: scene.videoStatus || "视频片段",
       reusable: false,
@@ -223,20 +276,19 @@ export function deriveVideoAssetManifest(project: PersistedVideoProject): Produc
     });
   });
 
-  const reusableCount = items.filter((item) => item.reusable).length;
+  preservedManualAssets.forEach((item) => {
+    if (!hasUsableAssetUrl(item.url) || seen.has(item.id)) return;
+    seen.add(item.id);
+    items.push(item);
+  });
+
+  const dedupedItems = appendDuplicateLabelSequence(items);
+  const reusableCount = dedupedItems.filter((item) => item.reusable).length;
   return {
     version: `manifest-${project.updatedAt || new Date().toISOString()}`,
-    summary: `已整理 ${items.length} 份素材资产，其中 ${reusableCount} 份可直接复用。`,
-    items,
+    summary: `已整理 ${dedupedItems.length} 份素材资产，其中 ${reusableCount} 份可直接复用。`,
+    items: dedupedItems,
   };
-}
-
-function findSceneSetting(scene: Scene, sceneSettings: SceneSetting[]): SceneSetting | undefined {
-  const sceneName = normalizeName(scene.sceneName);
-  return sceneSettings.find((sceneSetting) => {
-    const candidate = normalizeName(sceneSetting.name);
-    return candidate && (sceneName.includes(candidate) || candidate.includes(sceneName));
-  });
 }
 
 function mustPreserve(character: CharacterSetting): string[] {
@@ -316,13 +368,12 @@ export function deriveVideoShotPackets(project: PersistedVideoProject): VideoSho
         .filter(Boolean)
         .join("\n"),
       forbiddenChanges: unique([
-        "不要改变主角色的识别特征和服装连续性",
+        "不要改变主角的识别特征和服装连续性",
         scene.sceneTimeVariantId ? "不要无故修改当前镜头时间氛围" : "",
       ]).filter(Boolean),
       renderMode: scene.storyboardUrl || backgroundAssetIds.length || characterRefs.some((item) => item.assetIds.length)
         ? "img2video"
         : "text2video",
-      reviewStatus: scene.videoStatus === "failed" ? "redo" : "pending",
     };
   });
 }
@@ -372,35 +423,49 @@ export function deriveVideoWorldModel(project: PersistedVideoProject): VideoWorl
   };
 }
 
-export function deriveVideoReviewQueue(project: PersistedVideoProject): VideoReviewItem[] {
-  const packets = project.shotPackets || deriveVideoShotPackets(project);
-  const manifest = project.assetManifest || deriveVideoAssetManifest(project);
-  const existingById = new Map((project.reviewQueue || []).map((item) => [item.id, item]));
+function deriveVideoReviewQueue(
+  project: PersistedVideoProject,
+): NonNullable<PersistedVideoProject["reviewQueue"]> {
+  const existingById = new Map((project.reviewQueue ?? []).map((item) => [item.id, item]));
+  const existingByTarget = new Map<string, NonNullable<PersistedVideoProject["reviewQueue"]>[number]>();
+  for (const item of project.reviewQueue ?? []) {
+    for (const targetId of item.targetIds) {
+      existingByTarget.set(targetId, item);
+    }
+  }
+
   const now = project.updatedAt || new Date().toISOString();
+  const generated = (project.shotPackets ?? [])
+    .map((packet) => {
+      const scene = project.scenes.find((item) => item.id === packet.sceneId);
+      const hasReviewableOutput = Boolean(scene?.videoUrl?.trim()) || Boolean(packet.reviewStatus?.trim());
+      if (!hasReviewableOutput) return null;
 
-  return packets.slice(0, 12).map((packet) => {
-    const scene = project.scenes.find((item) => item.id === packet.sceneId);
-    const packetAssets = manifest.items.filter(
-      (item) => item.sceneId === scene?.id || packet.sourceAssetIds.includes(item.id),
-    );
-    const failed = scene?.videoStatus === "failed";
-    const previous = existingById.get(`review:${packet.id}`);
+      const id = `review:${packet.id}`;
+      const existing = existingById.get(id) || existingByTarget.get(packet.id);
+      return {
+        id,
+        title: existing?.title || packet.title || scene?.sceneName || `镜头 ${packet.sceneNumber}`,
+        summary:
+          existing?.summary ||
+          (scene?.videoUrl?.trim()
+            ? "镜头已有可审阅素材，确认是否通过或需要重做。"
+            : "镜头已进入审阅队列。"),
+        targetIds: existing?.targetIds?.length ? existing.targetIds : [packet.id],
+        status: existing?.status || packet.reviewStatus || "pending",
+        createdAt: existing?.createdAt || now,
+        updatedAt: existing?.updatedAt || now,
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => Boolean(item));
 
-    return {
-      id: `review:${packet.id}`,
-      title: `审阅镜头 ${packet.sceneNumber} · ${packet.title}`,
-      summary: failed
-        ? `当前镜头生成失败${scene?.videoFailure?.message ? `：${scene.videoFailure.message}` : ""}`
-        : packetAssets.some((item) => item.kind === "video-segment")
-          ? "镜头已有可审阅素材，确认是否通过或需要重做。"
-          : "镜头资产已齐备，后续生成后可直接进入审阅。",
-      targetIds: unique([packet.id, ...packetAssets.map((item) => item.id)]),
-      status: previous?.status || (failed ? "redo" : "pending"),
-      reason: previous?.reason || scene?.videoFailure?.message,
-      createdAt: previous?.createdAt || now,
-      updatedAt: now,
-    };
-  });
+  const generatedIds = new Set(generated.map((item) => item.id));
+  const generatedTargets = new Set(generated.flatMap((item) => item.targetIds));
+  const preserved = (project.reviewQueue ?? []).filter(
+    (item) => !generatedIds.has(item.id) && !item.targetIds.some((targetId) => generatedTargets.has(targetId)),
+  );
+
+  return [...generated, ...preserved];
 }
 
 export function synchronizeVideoProductionState(
@@ -419,15 +484,6 @@ export function synchronizeVideoProductionState(
     styleLock,
     worldModel,
     shotPackets: project.shotPackets || [],
-    reviewQueue:
-      project.reviewQueue?.length
-        ? project.reviewQueue
-        : deriveVideoReviewQueue({
-            ...project,
-            assetManifest,
-            styleLock,
-            worldModel,
-            shotPackets: project.shotPackets || [],
-          }),
+    reviewQueue: deriveVideoReviewQueue(project),
   };
 }

@@ -29,3 +29,14 @@ release/win-unpacked/locales/et.pak
 release/win-unpacked/locales/fa.pak
 release/win-unpacked/locales/fi.pak
 /release
+.gstack/
+
+# 运行时生成的项目数据（AI 图片、视频等）
+files/projects/
+
+# 调试/临时产物
+tmp-*
+temp-*
+output/
+artifacts/
+vendor/ffmpeg/

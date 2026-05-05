@@ -7,7 +7,8 @@
  */
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
-import { Send, Square, Trash2 } from 'lucide-react'
+import { Paperclip, Send, Square, Trash2 } from 'lucide-react'
+import { DraftAttachmentList } from '@/components/chat/attachment-ui'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -19,8 +20,13 @@ import { registerBuiltinCommands } from '@/lib/agent/commands/built-in'
 import { QueryEngine } from '@/lib/agent/query-engine'
 import { createDefaultTools } from '@/lib/agent/tools/index'
 import { MCPTool, ListMcpResourcesTool, ReadMcpResourceTool } from '@/lib/agent/mcp/mcp-tool'
+import {
+  buildMessageInputFromAttachments,
+  inferModelInputCapabilities,
+  prepareChatAttachments,
+} from '@/lib/agent/chat-attachments'
 import type {
-  AssistantMessage, UserMessage, ToolResultBlock, SDKResultMessage,
+  AssistantMessage, MessageInput, UserMessage, ToolResultBlock, SDKResultMessage,
 } from '@/lib/agent/types'
 import type { Todo } from '@/lib/agent/tools/todo-write'
 
@@ -61,6 +67,9 @@ export function AgentChat({
   const [pendingToolUseIds, setPendingToolUseIds] = useState<Set<string>>(new Set())
   const scrollRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [attachedFiles, setAttachedFiles] = useState<File[]>([])
+  const [filesCollapsed, setFilesCollapsed] = useState(false)
 
   // ── QueryEngine instance (renderer process, recreated on config change) ──
   const engine = useMemo(() => {
@@ -101,13 +110,19 @@ export function AgentChat({
 
   // ── Core send logic ──────────────────────────────────────────────────────
   const sendMessage = useCallback(async (text: string) => {
-    if (!text.trim() || isStreaming) return
+    if ((!text.trim() && attachedFiles.length === 0) || isStreaming) return
+
+    const currentFiles = [...attachedFiles]
+    let effectiveText = text.trim() || `Please analyze these attachments: ${currentFiles.map(file => file.name).join(', ')}`
+    let promptInput: MessageInput = effectiveText
+
     setInput('')
+    setAttachedFiles([])
     setSuggestions([])
 
     // Slash command handling
     const parsed = parseSlashCommand(text.trim())
-    if (parsed) {
+    if (parsed && currentFiles.length === 0) {
       const cmd = findCommand(parsed.name)
       if (cmd) {
         if (cmd.type === 'local' && cmd.handler) {
@@ -127,23 +142,38 @@ export function AgentChat({
         }
         if (cmd.type === 'prompt' && cmd.promptTemplate) {
           text = cmd.promptTemplate.replace('{{args}}', parsed.args).trim()
+          effectiveText = text
+          promptInput = effectiveText
         }
       }
+    }
+
+    try {
+      if (currentFiles.length > 0) {
+        const preparedAttachments = await prepareChatAttachments(currentFiles)
+        promptInput = await buildMessageInputFromAttachments({
+          prompt: effectiveText,
+          attachments: preparedAttachments,
+          capabilities: inferModelInputCapabilities({ model }),
+        })
+      }
+    } catch {
+      promptInput = `${effectiveText}\n\nAttached files:\n${currentFiles.map(file => `- ${file.name} (${file.type || 'application/octet-stream'}, ${file.size} bytes)`).join('\n')}`
     }
 
     // Optimistic user message
     const userMsg: UserMessage = {
       type: 'user',
       uuid: crypto.randomUUID(),
-      message: { role: 'user', content: text },
+      message: { role: 'user', content: promptInput },
     }
     setMessages(prev => [...prev, userMsg])
     setIsStreaming(true)
     autoScroll()
 
     try {
-      // Run QueryEngine directly in renderer — tools call IPC as needed
-      for await (const sdkMsg of engine.submitMessage(text)) {
+      // Run QueryEngine directly in renderer – tools call IPC as needed
+      for await (const sdkMsg of engine.submitMessage(promptInput)) {
         const type = sdkMsg.type
 
         if (type === 'assistant') {
@@ -189,7 +219,7 @@ export function AgentChat({
       console.error('[AgentChat] engine error:', err)
       setIsStreaming(false)
     }
-  }, [isStreaming, engine, model, totalCost, messages, autoScroll])
+  }, [attachedFiles, autoScroll, engine, isStreaming, messages, model, totalCost])
 
   const interrupt = useCallback(() => {
     engine.interrupt()
@@ -311,7 +341,39 @@ export function AgentChat({
 
       {/* Input */}
       <div className="px-4 pb-4 shrink-0">
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept="*/*"
+          className="hidden"
+          onChange={event => {
+            const nextFiles = Array.from(event.target.files ?? [])
+            if (nextFiles.length > 0) {
+              setAttachedFiles(prev => [...prev, ...nextFiles])
+            }
+            if (fileInputRef.current) {
+              fileInputRef.current.value = ''
+            }
+          }}
+        />
+        <DraftAttachmentList
+          files={attachedFiles}
+          activeTheme={false}
+          collapsed={filesCollapsed}
+          onToggleCollapsed={() => setFilesCollapsed(value => !value)}
+          onRemove={index => setAttachedFiles(prev => prev.filter((_, fileIndex) => fileIndex !== index))}
+        />
         <div className="flex gap-2 items-end">
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            onClick={() => fileInputRef.current?.click()}
+            title={attachedFiles.length > 0 ? `Attached ${attachedFiles.length} files` : 'Attach files'}
+          >
+            <Paperclip className="w-4 h-4" />
+          </Button>
           <Textarea
             ref={textareaRef}
             value={input}
@@ -326,7 +388,7 @@ export function AgentChat({
               <Square className="w-4 h-4" />
             </Button>
           ) : (
-            <Button size="icon" onClick={() => sendMessage(input)} disabled={!input.trim()}>
+            <Button size="icon" onClick={() => sendMessage(input)} disabled={!input.trim() && attachedFiles.length === 0}>
               <Send className="w-4 h-4" />
             </Button>
           )}

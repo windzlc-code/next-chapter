@@ -6,9 +6,9 @@ import { cn } from "@/lib/utils";
 const { Suspense, lazy, memo, useEffect, useRef } = React;
 
 const SETTINGS_PANEL_CLASS =
-  "rounded-[28px] border border-[#e2dbcf] bg-[#f4efe6] text-slate-900 shadow-[0_28px_70px_rgba(0,0,0,0.28)]";
+  "rounded-[28px] border border-border bg-background text-foreground shadow-[0_28px_70px_rgba(0,0,0,0.55)]";
 const MOBILE_SETTINGS_SHEET =
-  "w-full border-r border-[#e2dbcf] bg-[#f4efe6] p-0 text-slate-900 shadow-[18px_0_48px_rgba(0,0,0,0.24)] overscroll-contain sm:max-w-[440px]";
+  "w-full border-r border-border bg-background p-0 text-foreground shadow-[18px_0_48px_rgba(0,0,0,0.4)] overscroll-contain sm:max-w-[440px]";
 const SettingsPage = lazy(() => import("@/pages/Settings"));
 
 export const DesktopSettingsPanel = memo(function DesktopSettingsPanel({
@@ -64,7 +64,7 @@ export const DesktopSettingsPanel = memo(function DesktopSettingsPanel({
       <div className={cn("flex h-full min-h-0 flex-col overflow-hidden", SETTINGS_PANEL_CLASS)}>
         <Suspense
           fallback={
-            <div className="flex h-full items-center justify-center text-sm text-slate-500">
+            <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
               正在加载设置面板…
             </div>
           }
@@ -102,7 +102,7 @@ export const MobileSettingsSheet = memo(function MobileSettingsSheet({
         </SheetHeader>
         <Suspense
           fallback={
-            <div className="flex min-h-[220px] items-center justify-center px-6 py-10 text-sm text-slate-500">
+            <div className="flex min-h-[220px] items-center justify-center px-6 py-10 text-sm text-muted-foreground">
               正在加载设置面板…
             </div>
           }

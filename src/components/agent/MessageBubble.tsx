@@ -3,8 +3,10 @@
  */
 
 import { Bot, User } from 'lucide-react'
+import { MessageAttachmentList } from '@/components/chat/attachment-ui'
 import { ToolCallBlock } from './ToolCallBlock'
-import type { AssistantMessage, UserMessage, ToolUseBlock, ToolResultBlock } from '@/lib/agent/types'
+import type { AssistantMessage, ContentBlock, UserMessage, ToolUseBlock, ToolResultBlock } from '@/lib/agent/types'
+import type { ChatAttachment } from '@/lib/agent/chat-attachments'
 
 type Props = {
   message: AssistantMessage | UserMessage
@@ -30,11 +32,14 @@ export function MessageBubble({ message, pendingToolUseIds, toolResults }: Props
   const displayBlocks = Array.isArray(content)
     ? content.filter(b => b.type !== 'tool_result' || !isAssistant)
     : []
+  const attachmentBlocks = displayBlocks
+    .map((block, index) => toAttachment(block, `${message.uuid}-${index}`))
+    .filter((attachment): attachment is ChatAttachment => Boolean(attachment))
 
   const hasVisibleContent = displayBlocks.some(
     b => b.type === 'text' || b.type === 'tool_use',
   )
-  if (!hasVisibleContent) return null
+  if (!hasVisibleContent && attachmentBlocks.length === 0) return null
 
   return (
     <BubbleWrapper isAssistant={isAssistant}>
@@ -60,8 +65,61 @@ export function MessageBubble({ message, pendingToolUseIds, toolResults }: Props
 
         return null
       })}
+      {attachmentBlocks.length > 0 ? (
+        <MessageAttachmentList
+          attachments={attachmentBlocks}
+          activeTheme
+        />
+      ) : null}
     </BubbleWrapper>
   )
+}
+
+function toAttachment(
+  block: ContentBlock,
+  id: string,
+): ChatAttachment | null {
+  if (block.type === 'input_image') {
+    return {
+      id,
+      fileName: block.fileName || 'image',
+      mimeType: block.mimeType,
+      size: 0,
+      kind: 'image',
+      localPath: block.localPath,
+      previewUrl: block.previewUrl || (block.base64 ? `data:${block.mimeType};base64,${block.base64}` : undefined),
+    }
+  }
+
+  if (block.type === 'input_video') {
+    return {
+      id,
+      fileName: block.fileName || 'video',
+      mimeType: block.mimeType,
+      size: 0,
+      kind: 'video',
+      localPath: block.localPath,
+      previewUrl: block.previewUrl,
+      fallbackDigest: block.fallbackText,
+    }
+  }
+
+  if (block.type === 'input_file') {
+    return {
+      id,
+      fileName: block.fileName,
+      mimeType: block.mimeType,
+      size: typeof block.size === 'number' ? block.size : 0,
+      kind: block.extractedText
+        ? (block.mimeType.startsWith('text/') ? 'text' : 'document')
+        : 'binary',
+      localPath: block.localPath,
+      extractedText: block.extractedText,
+      fallbackDigest: block.fallbackDigest,
+    }
+  }
+
+  return null
 }
 
 function BubbleWrapper({ isAssistant, children }: {

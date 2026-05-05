@@ -26,6 +26,13 @@ export interface AskUserQuestionRequest {
       value?: string
       description?: string
       rationale?: string
+      confirmDialog?: {
+        title: string
+        description: string
+        confirmLabel?: string
+        cancelLabel?: string
+        summaryRows?: string[]
+      }
     }>
   }>
 }
@@ -52,7 +59,7 @@ export function resolveAskUserQuestion(id: string, answer: string): boolean {
   return true
 }
 
-export function rejectAskUserQuestion(id: string, reason = 'Cancelled'): boolean {
+export function rejectAskUserQuestion(id: string, reason = '已取消'): boolean {
   const pending = pendingRequests.get(id)
   if (!pending) {
     return false
@@ -123,7 +130,7 @@ export class AskUserQuestionTool extends ToolBase {
 
   async call(
     args: Record<string, unknown>,
-    _context: ToolUseContext,
+    context: ToolUseContext,
     _canUseTool: CanUseToolFn,
     _parentMessage: AssistantMessage,
   ): Promise<ToolResult> {
@@ -144,6 +151,26 @@ export class AskUserQuestionTool extends ToolBase {
 
     const answer = await new Promise<string>((resolve, reject) => {
       pendingRequests.set(id, { resolve, reject })
+
+      // 当引擎被中断时（interrupt() → abortController.abort()），同步取消等待
+      if (context.abortSignal) {
+        if (context.abortSignal.aborted) {
+          pendingRequests.delete(id)
+          reject(new Error('Aborted'))
+          return
+        }
+        context.abortSignal.addEventListener(
+          'abort',
+          () => {
+            if (pendingRequests.has(id)) {
+              pendingRequests.delete(id)
+              reject(new Error('Aborted'))
+            }
+          },
+          { once: true },
+        )
+      }
+
       // Timeout after 10 minutes
       setTimeout(() => {
         if (pendingRequests.has(id)) {

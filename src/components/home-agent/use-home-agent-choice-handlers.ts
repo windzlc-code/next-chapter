@@ -7,27 +7,45 @@ import type {
   HomeAgentMessage,
   StudioRuntimeState,
 } from "@/lib/home-agent/types";
-import { createScriptProjectChoiceHandler } from "./home-agent-script-choice-handlers";
+import type { HomeAgentImageStyleRecognitionResult } from "@/lib/home-agent/image-style-analysis";
+import type { VideoGenerationPrefs, VideoImageGenerationPrefs } from "@/types/project";
+import { createScriptProjectChoiceHandler, type ExportLocalAction } from "./home-agent-script-choice-handlers";
 import {
   createVideoAssetChoiceHandler,
   createVideoProjectChoiceHandler,
-  createVideoReviewChoiceHandler,
 } from "./home-agent-video-choice-handlers";
 import { showChoiceNoticeMessage, showChoicePopoverMessage } from "./home-agent-workflow-ui";
 
 type PushMessage = (role: HomeAgentMessage["role"], content: string) => void;
-type ChoiceHandler = (snapshot: ConversationProjectSnapshot, value: string, label: string) => boolean;
+type ChoiceHandler = (
+  snapshot: ConversationProjectSnapshot,
+  value: string,
+  label: string,
+  input?: Record<string, unknown>,
+) => boolean;
 type WorkflowShortcutRunner = (
   action: string,
   input: Record<string, unknown>,
   userBubble: string,
+  options?: {
+    restoreQuestionOnInterrupt?: ComposerQuestion | null;
+    restoreQuestionOnCancel?: ComposerQuestion | null;
+  },
 ) => void | Promise<void>;
 type WorkflowShortcutChainRunner = (
   steps: Array<{ action: string; input: Record<string, unknown> }>,
   userBubble: string,
+  options?: {
+    restoreQuestionOnInterrupt?: ComposerQuestion | null;
+    restoreQuestionOnCancel?: ComposerQuestion | null;
+  },
 ) => void | Promise<void>;
+type BackgroundVideoBridgeResearchRunner = (
+  userBubble: string,
+  mode?: "all" | "targetPlatform" | "shotStyle" | "outputGoal",
+) => void | Promise<void>;
+type MediaPrefsCommitter<TPrefs> = (prefs: Partial<TPrefs>) => void | Promise<void>;
 type SceneLike = { id: string };
-type ReviewItem = { id: string; title: string; targetIds: string[] };
 type CharacterCard = {
   id: string;
   name: string;
@@ -52,44 +70,38 @@ type BeatPacket = {
 
 export function useHomeAgentChoiceHandlers(params: {
   runtimeRef: React.MutableRefObject<StudioRuntimeState>;
+  getCurrentQuestion: () => ComposerQuestion | null;
+  rememberInterruptRestoreQuestion: (question: ComposerQuestion | null) => void;
   push: PushMessage;
   setPopoverOverride: React.Dispatch<React.SetStateAction<ComposerQuestion | null>>;
   setSuggested: React.Dispatch<React.SetStateAction<ComposerQuestion | null>>;
   setMode: React.Dispatch<React.SetStateAction<AgentConversationMode>>;
   resetComposerDraft: (value?: string) => void;
   send: (prompt: string, shown?: string) => Promise<void>;
+  runBackgroundVideoBridgeResearch: BackgroundVideoBridgeResearchRunner;
+  commitImageGenerationPrefs?: MediaPrefsCommitter<VideoImageGenerationPrefs>;
+  commitVideoGenerationPrefs?: MediaPrefsCommitter<VideoGenerationPrefs>;
+  getImageGenerationPrefs?: () => VideoImageGenerationPrefs;
+  getVideoGenerationPrefs?: () => VideoGenerationPrefs;
+  getAttachedImageCount?: () => number;
+  recognizeImageStyle?: () => Promise<HomeAgentImageStyleRecognitionResult | null>;
+  onAwaitVideoKickoffStyleReferenceUpload?: (label: string) => void;
+  onClearVideoKickoffStyleReferenceUploadWait?: () => void;
   runWorkflowActionShortcut: WorkflowShortcutRunner;
   runWorkflowActionShortcutChain: WorkflowShortcutChainRunner;
+  interruptWorkflowShortcut: () => void;
+  switchVideoStep: (projectId: string, targetStep: number, statusText: string) => void;
   buildVideoGenerationQuestion: (
     snapshot: ConversationProjectSnapshot,
     project: PersistedVideoProject | null | undefined,
   ) => ComposerQuestion | null;
-  buildVideoRefreshQuestion: (
-    snapshot: ConversationProjectSnapshot,
-    project: PersistedVideoProject | null | undefined,
-  ) => ComposerQuestion | null;
-  buildReviewQuestion: (snapshot: ConversationProjectSnapshot) => ComposerQuestion | null;
-  buildReviewListQuestion: (snapshot: ConversationProjectSnapshot) => ComposerQuestion | null;
-  buildVideoRepairQuestion: (snapshot: ConversationProjectSnapshot) => ComposerQuestion | null;
   buildVideoGenerationSceneListQuestion: (
     snapshot: ConversationProjectSnapshot,
     project: PersistedVideoProject | null | undefined,
   ) => ComposerQuestion | null;
-  buildVideoRefreshSceneListQuestion: (
-    snapshot: ConversationProjectSnapshot,
-    project: PersistedVideoProject | null | undefined,
-  ) => ComposerQuestion | null;
-  buildVideoRepairListQuestion: (snapshot: ConversationProjectSnapshot) => ComposerQuestion | null;
   listGeneratableVideoScenes: (project: PersistedVideoProject | null | undefined) => SceneLike[];
   listFailedVideoScenes: (project: PersistedVideoProject | null | undefined) => SceneLike[];
   listRunningVideoScenes: (project: PersistedVideoProject | null | undefined) => SceneLike[];
-  listRedoReviewItems: (snapshot: ConversationProjectSnapshot) => ReviewItem[];
-  collectReviewTargetIds: (snapshot: ConversationProjectSnapshot, mode: "stable" | "risk") => string[];
-  findReviewItem: (snapshot: ConversationProjectSnapshot, reviewId: string) => ReviewItem | undefined;
-  buildReviewDecisionQuestion: (
-    snapshot: ConversationProjectSnapshot,
-    reviewId: string,
-  ) => ComposerQuestion | null;
   listUnlockedCharacterCards: (snapshot: ConversationProjectSnapshot) => CharacterCard[];
   buildCharacterCardListQuestion: (snapshot: ConversationProjectSnapshot) => ComposerQuestion | null;
   findCharacterCard: (snapshot: ConversationProjectSnapshot, cardId: string) => CharacterCard | undefined;
@@ -111,32 +123,42 @@ export function useHomeAgentChoiceHandlers(params: {
     snapshot: ConversationProjectSnapshot,
     packetId: string,
   ) => ComposerQuestion | null;
+  buildOutlinesWorkflowQuestion: (snapshot: ConversationProjectSnapshot) => ComposerQuestion | null;
+  buildEpisodeDurationGateQuestion: (snapshot: ConversationProjectSnapshot) => ComposerQuestion | null;
+  buildEpisodeWorkflowQuestion: (snapshot: ConversationProjectSnapshot) => ComposerQuestion | null;
+  onExportLocalAction?: (action: ExportLocalAction) => void;
+  onDirectBatchReview?: () => void;
+  onDirectSingleReview?: (episodeNumber: number) => void;
+  onVideoKickoff?: () => void;
 }) {
   const {
     runtimeRef,
+    getCurrentQuestion,
+    rememberInterruptRestoreQuestion,
     push,
     setPopoverOverride,
     setSuggested,
     setMode,
     resetComposerDraft,
     send,
+    runBackgroundVideoBridgeResearch,
+    commitImageGenerationPrefs,
+    commitVideoGenerationPrefs,
+    getImageGenerationPrefs,
+    getVideoGenerationPrefs,
+    getAttachedImageCount,
+    recognizeImageStyle,
+    onAwaitVideoKickoffStyleReferenceUpload,
+    onClearVideoKickoffStyleReferenceUploadWait,
     runWorkflowActionShortcut,
     runWorkflowActionShortcutChain,
+    interruptWorkflowShortcut,
+    switchVideoStep,
     buildVideoGenerationQuestion,
-    buildVideoRefreshQuestion,
-    buildReviewQuestion,
-    buildReviewListQuestion,
-    buildVideoRepairQuestion,
     buildVideoGenerationSceneListQuestion,
-    buildVideoRefreshSceneListQuestion,
-    buildVideoRepairListQuestion,
     listGeneratableVideoScenes,
     listFailedVideoScenes,
     listRunningVideoScenes,
-    listRedoReviewItems,
-    collectReviewTargetIds,
-    findReviewItem,
-    buildReviewDecisionQuestion,
     listUnlockedCharacterCards,
     buildCharacterCardListQuestion,
     findCharacterCard,
@@ -149,6 +171,13 @@ export function useHomeAgentChoiceHandlers(params: {
     buildBeatPacketListQuestion,
     findBeatPacket,
     buildBeatPacketDecisionQuestion,
+    buildOutlinesWorkflowQuestion,
+    buildEpisodeDurationGateQuestion,
+    buildEpisodeWorkflowQuestion,
+    onExportLocalAction,
+    onDirectBatchReview,
+    onDirectSingleReview,
+    onVideoKickoff,
   } = params;
 
   const showChoicePopover = useCallback(
@@ -183,56 +212,97 @@ export function useHomeAgentChoiceHandlers(params: {
     [push, resetComposerDraft, setMode, setPopoverOverride, setSuggested],
   );
 
+  const runWorkflowActionShortcutWithRestore = useCallback<WorkflowShortcutRunner>(
+    (action, input, userBubble, options) => {
+      const currentQuestion = getCurrentQuestion();
+      rememberInterruptRestoreQuestion(options?.restoreQuestionOnInterrupt ?? currentQuestion);
+      return runWorkflowActionShortcut(action, input, userBubble, {
+        ...options,
+        ...(action === "export_video_asset_bundle"
+          ? {
+              restoreQuestionOnCancel:
+                options?.restoreQuestionOnCancel ?? currentQuestion,
+            }
+          : {}),
+      });
+    },
+    [getCurrentQuestion, rememberInterruptRestoreQuestion, runWorkflowActionShortcut],
+  );
+
+  const runWorkflowActionShortcutChainWithRestore = useCallback<WorkflowShortcutChainRunner>(
+    (steps, userBubble) => {
+      const restoreQuestion = getCurrentQuestion();
+      rememberInterruptRestoreQuestion(restoreQuestion);
+      return runWorkflowActionShortcutChain(steps, userBubble, {
+        restoreQuestionOnInterrupt: restoreQuestion,
+      });
+    },
+    [getCurrentQuestion, rememberInterruptRestoreQuestion, runWorkflowActionShortcutChain],
+  );
+
+  const sendWithRestore = useCallback(
+    (prompt: string, shown?: string) => {
+      rememberInterruptRestoreQuestion(getCurrentQuestion());
+      return send(prompt, shown);
+    },
+    [getCurrentQuestion, rememberInterruptRestoreQuestion, send],
+  );
+
+  const awaitVideoKickoffStyleReferenceUpload = useCallback(
+    (label: string) => {
+      onAwaitVideoKickoffStyleReferenceUpload?.(label);
+      showChoiceNotice(
+        label,
+        "请先上传一张参考图。发送后我会先识别画面风格并给出摘要，然后自动继续补平台与镜头偏好。",
+      );
+    },
+    [onAwaitVideoKickoffStyleReferenceUpload, showChoiceNotice],
+  );
+
+  const clearAwaitVideoKickoffStyleReferenceUpload = useCallback(() => {
+    onClearVideoKickoffStyleReferenceUploadWait?.();
+  }, [onClearVideoKickoffStyleReferenceUploadWait]);
+
   const videoProjectChoiceHandler = useMemo<ChoiceHandler>(
     () =>
       createVideoProjectChoiceHandler({
         getCurrentVideoProject: () => runtimeRef.current.currentVideoProject,
-        runWorkflowActionShortcut,
-        send,
+        runBackgroundVideoBridgeResearch,
+        commitImageGenerationPrefs,
+        commitVideoGenerationPrefs,
+        getImageGenerationPrefs,
+        getVideoGenerationPrefs,
+        getAttachedImageCount,
+        recognizeImageStyle,
+        awaitImageStyleReferenceUpload: awaitVideoKickoffStyleReferenceUpload,
+        clearAwaitImageStyleReferenceUpload: clearAwaitVideoKickoffStyleReferenceUpload,
+        runWorkflowActionShortcut: runWorkflowActionShortcutWithRestore,
+        switchVideoStep,
+        send: sendWithRestore,
         showChoicePopover,
         showChoiceNotice,
         buildVideoGenerationQuestion,
-        buildVideoRefreshQuestion,
-        buildReviewQuestion,
-        buildReviewListQuestion,
-        buildVideoRepairQuestion,
         listGeneratableVideoScenes,
         listRunningVideoScenes,
       }),
     [
-      buildReviewListQuestion,
-      buildReviewQuestion,
       buildVideoGenerationQuestion,
-      buildVideoRefreshQuestion,
-      buildVideoRepairQuestion,
       listGeneratableVideoScenes,
       listRunningVideoScenes,
-      runWorkflowActionShortcut,
+      commitImageGenerationPrefs,
+      commitVideoGenerationPrefs,
+      getAttachedImageCount,
+      getImageGenerationPrefs,
+      getVideoGenerationPrefs,
+      awaitVideoKickoffStyleReferenceUpload,
+      clearAwaitVideoKickoffStyleReferenceUpload,
+      recognizeImageStyle,
+      runBackgroundVideoBridgeResearch,
+      runWorkflowActionShortcutWithRestore,
+      switchVideoStep,
       runtimeRef,
-      send,
+      sendWithRestore,
       showChoiceNotice,
-      showChoicePopover,
-    ],
-  );
-
-  const videoReviewChoiceHandler = useMemo<ChoiceHandler>(
-    () =>
-      createVideoReviewChoiceHandler({
-        runWorkflowActionShortcut,
-        runWorkflowActionShortcutChain,
-        showChoicePopover,
-        collectReviewTargetIds,
-        buildReviewListQuestion,
-        findReviewItem,
-        buildReviewDecisionQuestion,
-      }),
-    [
-      buildReviewDecisionQuestion,
-      buildReviewListQuestion,
-      collectReviewTargetIds,
-      findReviewItem,
-      runWorkflowActionShortcut,
-      runWorkflowActionShortcutChain,
       showChoicePopover,
     ],
   );
@@ -241,27 +311,19 @@ export function useHomeAgentChoiceHandlers(params: {
     () =>
       createVideoAssetChoiceHandler({
         getCurrentVideoProject: () => runtimeRef.current.currentVideoProject,
-        runWorkflowActionShortcut,
-        runWorkflowActionShortcutChain,
+        runWorkflowActionShortcut: runWorkflowActionShortcutWithRestore,
+        runWorkflowActionShortcutChain: runWorkflowActionShortcutChainWithRestore,
         showChoicePopover,
         buildVideoGenerationSceneListQuestion,
-        buildVideoRefreshSceneListQuestion,
-        buildVideoRepairListQuestion,
         listFailedVideoScenes,
         listGeneratableVideoScenes,
-        listRedoReviewItems,
-        findReviewItem,
       }),
     [
       buildVideoGenerationSceneListQuestion,
-      buildVideoRefreshSceneListQuestion,
-      buildVideoRepairListQuestion,
-      findReviewItem,
       listFailedVideoScenes,
       listGeneratableVideoScenes,
-      listRedoReviewItems,
-      runWorkflowActionShortcut,
-      runWorkflowActionShortcutChain,
+      runWorkflowActionShortcutChainWithRestore,
+      runWorkflowActionShortcutWithRestore,
       runtimeRef,
       showChoicePopover,
     ],
@@ -270,9 +332,14 @@ export function useHomeAgentChoiceHandlers(params: {
   const scriptProjectChoiceHandler = useMemo<ChoiceHandler>(
     () =>
       createScriptProjectChoiceHandler({
-        runWorkflowActionShortcut,
-        send,
+        runWorkflowActionShortcut: runWorkflowActionShortcutWithRestore,
+        interruptWorkflowShortcut,
+        send: sendWithRestore,
         showChoicePopover,
+        setPopoverOverride,
+        buildOutlinesWorkflowQuestion,
+        buildEpisodeDurationGateQuestion,
+        buildEpisodeWorkflowQuestion,
         listUnlockedCharacterCards,
         buildCharacterCardListQuestion,
         findCharacterCard,
@@ -285,6 +352,10 @@ export function useHomeAgentChoiceHandlers(params: {
         buildBeatPacketListQuestion,
         findBeatPacket,
         buildBeatPacketDecisionQuestion,
+        onExportLocalAction,
+        onDirectBatchReview,
+        onDirectSingleReview,
+        onVideoKickoff,
       }),
     [
       buildBeatPacketDecisionQuestion,
@@ -293,21 +364,28 @@ export function useHomeAgentChoiceHandlers(params: {
       buildCharacterCardListQuestion,
       buildComplianceDecisionQuestion,
       buildComplianceListQuestion,
+      buildEpisodeWorkflowQuestion,
+      buildEpisodeDurationGateQuestion,
+      buildOutlinesWorkflowQuestion,
       findBeatPacket,
       findCharacterCard,
       findCompliancePacket,
+      interruptWorkflowShortcut,
       listPendingCompliancePackets,
       listUnlockedBeatPackets,
       listUnlockedCharacterCards,
-      runWorkflowActionShortcut,
-      send,
+      onDirectBatchReview,
+      onDirectSingleReview,
+      onExportLocalAction,
+      onVideoKickoff,
+      runWorkflowActionShortcutWithRestore,
+      sendWithRestore,
       showChoicePopover,
     ],
   );
 
   return {
     videoProjectChoiceHandler,
-    videoReviewChoiceHandler,
     videoAssetChoiceHandler,
     scriptProjectChoiceHandler,
   };

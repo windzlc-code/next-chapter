@@ -1,8 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
+const { exportScenesToXlsx } = vi.hoisted(() => ({
+  exportScenesToXlsx: vi.fn(async () => undefined),
+}));
+vi.mock("@/lib/export-xlsx", () => ({
+  exportScenesToXlsx,
+}));
 import { runWorkflowAction } from "./workflow-actions";
 import type { StudioRuntimeState } from "./types";
 import type { PersistedVideoProject } from "@/hooks/use-local-persistence";
-import type { DramaProject } from "@/types/drama";
+import { createEmptyDramaProject, type DramaProject } from "@/types/drama";
 
 const SKILL_DRAFTS_KEY = "storyforge-skill-drafts-v1";
 
@@ -78,6 +84,23 @@ function createRuntime(): StudioRuntimeState {
 }
 
 describe("workflow-actions get_context", () => {
+  it("creates an untitled adaptation project from minimal setup input", async () => {
+    const result = await runWorkflowAction(
+      "save_setup",
+      {
+        projectKind: "adaptation",
+        forceNewProject: true,
+      },
+      createRuntime(),
+    );
+
+    expect(result.projectSnapshot?.projectKind).toBe("adaptation");
+    expect(result.projectSnapshot?.title).toBe("未命名改编项目");
+    expect(result.data?.dramaProject?.mode).toBe("adaptation");
+    expect(result.data?.dramaProject?.setup?.customTopic).toBe("");
+    expect(result.data?.dramaProject?.setup?.creativeInput).toBe("");
+  });
+
   it("writes structured original-script setup data and lands the project in the characters stage", async () => {
     const result = await runWorkflowAction(
       "save_setup",
@@ -109,7 +132,7 @@ describe("workflow-actions get_context", () => {
     });
     expect(result.data?.dramaProject?.currentStep).toBe("creative-plan");
     expect(result.projectSnapshot?.derivedStage).toBe("创意方案");
-    expect(result.projectSnapshot?.currentObjective).toContain("角色弧光");
+    expect(result.projectSnapshot?.currentObjective).toContain("角色开发");
   });
 
   it("returns an agent-readable structured summary instead of raw JSON", async () => {
@@ -206,6 +229,175 @@ describe("workflow-actions get_context", () => {
 
     expect(reviewed.projectSnapshot?.memory?.reviewQueue?.some((item) => item.status === "redo")).toBe(true);
     expect(reviewed.summary).toContain("重做");
+  });
+
+  it("routes storyboard xlsx export through the workflow registry", async () => {
+    const videoProject: PersistedVideoProject = {
+      id: "video-export-1",
+      title: "Storyboard Export",
+      script: "A heroine walks into the corridor.",
+      targetPlatform: "抖音",
+      shotStyle: "cinematic",
+      outputGoal: "trailer",
+      productionNotes: "",
+      scenes: [
+        {
+          id: "scene-1",
+          sceneNumber: 1,
+          sceneName: "Opening",
+          description: "A heroine walks into the corridor.",
+          characters: ["Hero"],
+          dialogue: "",
+          cameraDirection: "medium shot",
+          duration: 5,
+        },
+      ],
+      characters: [],
+      sceneSettings: [],
+      artStyle: "live-action",
+      currentStep: 1,
+      systemPrompt: "",
+      analysisSummary: "",
+      storyboardPlan: "",
+      videoPromptBatch: "",
+      sourceProjectId: "drama-1",
+      createdAt: "2026-04-03T00:00:00.000Z",
+      updatedAt: "2026-04-03T00:30:00.000Z",
+      styleLock: null,
+      worldModel: null,
+      assetManifest: null,
+      shotPackets: [],
+      reviewQueue: [],
+    };
+
+    const result = await runWorkflowAction(
+      "export_storyboard_xlsx",
+      {},
+      {
+        ...createRuntime(),
+        currentProjectSnapshot: null,
+        currentVideoProject: videoProject,
+      },
+    );
+
+    expect(exportScenesToXlsx).toHaveBeenCalledWith(
+      videoProject.scenes,
+      "Storyboard Export",
+      videoProject.characters,
+      videoProject.sceneSettings,
+    );
+    expect(result.projectSnapshot?.projectKind).toBe("video");
+  });
+
+  it("persists bridge platform fields onto the video project when creating the bridge artifact", async () => {
+    const videoProject: PersistedVideoProject = {
+      id: "video-bridge-fields-1",
+      title: "Bridge Fields",
+      script: "A heroine walks into the corridor.",
+      targetPlatform: "",
+      shotStyle: "",
+      outputGoal: "",
+      productionNotes: "",
+      scenes: [
+        {
+          id: "scene-1",
+          sceneNumber: 1,
+          sceneName: "Opening",
+          description: "A heroine walks into the corridor.",
+          characters: ["Hero"],
+          dialogue: "",
+          cameraDirection: "medium shot",
+          duration: 5,
+        },
+      ],
+      characters: [],
+      sceneSettings: [],
+      artStyle: "live-action",
+      currentStep: 1,
+      systemPrompt: "",
+      analysisSummary: "",
+      storyboardPlan: "",
+      videoPromptBatch: "",
+      sourceProjectId: "drama-1",
+      createdAt: "2026-04-03T00:00:00.000Z",
+      updatedAt: "2026-04-03T00:30:00.000Z",
+      styleLock: null,
+      worldModel: null,
+      assetManifest: null,
+      shotPackets: [],
+      reviewQueue: [],
+    };
+
+    const result = await runWorkflowAction(
+      "create_video_bridge_artifact",
+      {
+        projectId: videoProject.id,
+        targetPlatform: "抖音",
+        shotStyle: "电影感近景",
+        outputGoal: "预告片",
+        productionNotes: "保留夜雨与追逐节奏",
+      },
+      {
+        ...createRuntime(),
+        currentProjectSnapshot: null,
+        currentVideoProject: videoProject,
+      },
+    );
+
+    expect(result.data?.videoProject).toMatchObject({
+      targetPlatform: "抖音",
+      shotStyle: "电影感近景",
+      outputGoal: "预告片",
+    });
+    expect(result.projectSnapshot?.currentObjective).toContain("镜头拆解");
+  });
+
+  it("preserves existing bridge fields when only one field is written", async () => {
+    const videoProject: PersistedVideoProject = {
+      id: "video-bridge-fields-2",
+      title: "Bridge Fields Partial",
+      script: "A heroine walks into the corridor.",
+      targetPlatform: "",
+      shotStyle: "电影感近景",
+      outputGoal: "预告片",
+      productionNotes: "",
+      scenes: [],
+      characters: [],
+      sceneSettings: [],
+      artStyle: "live-action",
+      currentStep: 1,
+      systemPrompt: "",
+      analysisSummary: "",
+      storyboardPlan: "",
+      videoPromptBatch: "",
+      sourceProjectId: "drama-1",
+      createdAt: "2026-04-03T00:00:00.000Z",
+      updatedAt: "2026-04-03T00:30:00.000Z",
+      styleLock: null,
+      worldModel: null,
+      assetManifest: null,
+      shotPackets: [],
+      reviewQueue: [],
+    };
+
+    const result = await runWorkflowAction(
+      "create_video_bridge_artifact",
+      {
+        projectId: videoProject.id,
+        targetPlatform: "抖音",
+      },
+      {
+        ...createRuntime(),
+        currentProjectSnapshot: null,
+        currentVideoProject: videoProject,
+      },
+    );
+
+    expect(result.data?.videoProject).toMatchObject({
+      targetPlatform: "抖音",
+      shotStyle: "电影感近景",
+      outputGoal: "预告片",
+    });
   });
 
   it("locks script beat packets and resolves compliance revision packets", async () => {
@@ -363,8 +555,39 @@ describe("workflow-actions get_context", () => {
     expect(reports[0]?.summary).toContain("驳回");
   });
 
+  it("exposes skip-compliance-review through the workflow action registry", async () => {
+    const dramaProject = {
+      ...createEmptyDramaProject("traditional"),
+      id: "drama-skip-review",
+      dramaTitle: "跳过审核项目",
+      currentStep: "episodes",
+      setup: {
+        genres: ["都市言情"],
+        audience: "女频",
+        tone: "甜虐",
+        ending: "HE",
+        totalEpisodes: 1,
+        targetMarket: "cn",
+        customTopic: "",
+      },
+      creativePlan: "Creative plan",
+      characters: "Characters",
+      directoryRaw: "目录原文",
+      episodes: [{ number: 1, title: "Episode 1", content: "body 1", wordCount: 1000 }],
+    };
+
+    const result = await runWorkflowAction("skip_compliance_review", {}, {
+      ...createRuntime(),
+      currentDramaProject: dramaProject,
+      currentProjectSnapshot: null,
+    });
+
+    expect(result.data?.dramaProject?.currentStep).toBe("export");
+    expect(result.projectSnapshot?.derivedStage).toBe("导出与出片");
+  });
+
   it("exports approved skill drafts into the local candidate directory", async () => {
-    const writeText = vi.fn(async () => ({ ok: true }));
+    const writeText = vi.fn(async (_filePath: string, _content: string) => ({ ok: true }));
     window.electronAPI = {
       dreaminaCli: {
         exec: vi.fn(),
@@ -418,7 +641,7 @@ describe("workflow-actions get_context", () => {
   });
 
   it("exports an approved skill bundle preview into the local candidate directory", async () => {
-    const writeText = vi.fn(async () => ({ ok: true }));
+    const writeText = vi.fn(async (_filePath: string, _content: string) => ({ ok: true }));
     window.electronAPI = {
       dreaminaCli: {
         exec: vi.fn(),
@@ -471,7 +694,7 @@ describe("workflow-actions get_context", () => {
   });
 
   it("packages approved skill drafts into controlled install candidates without auto-enabling them", async () => {
-    const writeText = vi.fn(async () => ({ ok: true }));
+    const writeText = vi.fn(async (_filePath: string, _content: string) => ({ ok: true }));
     window.electronAPI = {
       dreaminaCli: {
         exec: vi.fn(),
@@ -529,7 +752,7 @@ describe("workflow-actions get_context", () => {
   });
 
   it("exports the current video production state bundle into a local audit directory", async () => {
-    const writeText = vi.fn(async () => ({ ok: true }));
+    const writeText = vi.fn(async (_filePath: string, _content: string) => ({ ok: true }));
     window.electronAPI = {
       dreaminaCli: {
         exec: vi.fn(),
@@ -653,8 +876,141 @@ describe("workflow-actions get_context", () => {
     });
   });
 
+  it("exports the current asset manifest into a local media archive", async () => {
+    const copyFile = vi.fn(async () => ({ ok: true }));
+    const selectFolder = vi.fn(async () => "E:/Exports");
+    const readBase64 = vi.fn(async () => ({ ok: true, exists: true, base64: "", mimeType: "image/jpeg" }));
+    window.electronAPI = {
+      dreaminaCli: {
+        exec: vi.fn(),
+      },
+      jimeng: {
+        writeFile: vi.fn(async () => ({ ok: true })),
+      },
+      storage: {
+        getDefaultPath: vi.fn(async () => ({ files: "D:/StoryForgeFiles", db: "D:/StoryForgeDb" })),
+        selectFolder,
+        openFolder: vi.fn(async () => undefined),
+        writeText: vi.fn(async () => ({ ok: true })),
+        copyFile,
+        readText: vi.fn(async () => ({ ok: true, exists: false, content: "" })),
+        readBase64,
+      },
+      runtime: {
+        builtinApiBundle: null,
+        builtinApiBundlePath: "",
+        verifyBuiltinApiAdminPassword: vi.fn(async () => true),
+      },
+    } as unknown as Window["electronAPI"];
+
+    const videoProject: PersistedVideoProject = {
+      id: "video-project-export",
+      title: "雨夜追击预告片",
+      script: "script",
+      targetPlatform: "抖音",
+      shotStyle: "电影感近景",
+      outputGoal: "预告片",
+      productionNotes: "",
+      scenes: [
+        {
+          id: "scene-1",
+          sceneNumber: 3,
+          sceneName: "天台追逐",
+          description: "",
+          characters: [],
+          dialogue: "",
+          cameraDirection: "",
+          duration: 5,
+          segmentLabel: "1-2",
+        },
+      ],
+      characters: [],
+      sceneSettings: [],
+      artStyle: "live-action",
+      currentStep: 5,
+      systemPrompt: "",
+      analysisSummary: "",
+      storyboardPlan: "",
+      videoPromptBatch: "",
+      sourceProjectId: "drama-1",
+      createdAt: "2026-04-03T00:00:00.000Z",
+      updatedAt: "2026-04-03T00:30:00.000Z",
+      styleLock: null,
+      worldModel: null,
+      assetManifest: {
+        version: "manifest-1",
+        summary: "summary",
+        items: [
+          {
+            id: "image-1",
+            kind: "character-reference",
+            label: "主角参考01",
+            url: "C:/assets/hero.jpg",
+            meta: "角色主参考",
+            reusable: true,
+            status: "ready",
+            version: 1,
+            createdAt: "2026-04-03T00:00:00.000Z",
+          },
+          {
+            id: "video-1",
+            kind: "video-segment",
+            label: "镜头03片段1-2成片01",
+            url: "C:/assets/shot-1.mp4",
+            meta: "completed",
+            reusable: false,
+            status: "needs-review",
+            sceneId: "scene-1",
+            sceneNumber: 3,
+            version: 1,
+            createdAt: "2026-04-03T00:00:00.000Z",
+          },
+        ],
+      },
+      shotPackets: [],
+      reviewQueue: [],
+    };
+
+    const result = await runWorkflowAction("export_video_asset_bundle", {}, {
+      ...createRuntime(),
+      currentProjectSnapshot: {
+        projectId: "video-project-export",
+        projectKind: "video",
+        title: "雨夜追击预告片",
+        currentObjective: "整理素材并导出",
+        derivedStage: "预览与导出",
+        agentSummary: "当前可直接导出素材库。",
+        recommendedActions: ["导出生产状态包"],
+        artifacts: [],
+        memory: {
+          styleLock: null,
+          worldModel: null,
+          assetManifest: videoProject.assetManifest,
+          shotPackets: [],
+          reviewQueue: [],
+        },
+      },
+      currentVideoProject: videoProject,
+    });
+
+    expect(selectFolder).toHaveBeenCalledTimes(1);
+    expect(copyFile).toHaveBeenNthCalledWith(
+      1,
+      "C:/assets/hero.jpg",
+      "E:/Exports/雨夜追击预告片/图片/角色/主角参考01.jpg",
+    );
+    expect(copyFile).toHaveBeenNthCalledWith(
+      2,
+      "C:/assets/shot-1.mp4",
+      "E:/Exports/雨夜追击预告片/视频/第01集/片段1_2/镜头03片段1_2成片01.mp4",
+    );
+    expect(result.summary).toContain("已导出《雨夜追击预告片》的素材库归档");
+    expect(result.summary).toContain("图片：1 项");
+    expect(result.summary).toContain("视频：1 项");
+  });
+
   it("previews the current video production state bundle without writing files", async () => {
-    const writeText = vi.fn(async () => ({ ok: true }));
+    const writeText = vi.fn(async (_filePath: string, _content: string) => ({ ok: true }));
     window.electronAPI = {
       dreaminaCli: {
         exec: vi.fn(),

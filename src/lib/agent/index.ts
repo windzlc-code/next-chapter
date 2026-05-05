@@ -15,6 +15,15 @@ export type { RetryOptions } from './retry'
 
 export { callModelAPI, toAPIMessages } from './api-client'
 export type { CallModelOptions } from './api-client'
+export {
+  buildAttachmentFallbackDigest,
+  buildMessageInputFromAttachments,
+  inferModelInputCapabilities,
+  prepareChatAttachment,
+  prepareChatAttachments,
+  stripAttachmentPayloadForHistory,
+} from './chat-attachments'
+export type { ChatAttachment, ChatAttachmentKind, ModelInputCapabilities } from './chat-attachments'
 
 export { queryLoop } from './query-loop'
 export type { QueryParams } from './query-loop'
@@ -25,7 +34,8 @@ export type {
   SDKAssistantMessage, SDKUserMessage, SDKProgressMessage,
   Message, UserMessage, AssistantMessage, SystemMessage, ProgressMessage,
   ToolResult, PermissionResult,
-  ContentBlock, TextBlock, ToolUseBlock, ToolResultBlock, ThinkingBlock,
+  ContentBlock, MessageInput, TextBlock, InputImageBlock, InputVideoBlock, InputFileBlock,
+  ToolUseBlock, ToolResultBlock, ThinkingBlock,
   UsageStats,
 } from './types'
 export { EMPTY_USAGE, accumulateUsage } from './types'

@@ -107,8 +107,8 @@ export interface Tool {
 export abstract class ToolBase implements Tool {
   abstract readonly name: string
   readonly aliases: string[] = []
-  readonly maxResultSizeChars = 100_000
-  readonly searchHint = ''
+  readonly maxResultSizeChars: number = 100_000
+  readonly searchHint: string = ''
 
   abstract call(
     args: Record<string, unknown>,

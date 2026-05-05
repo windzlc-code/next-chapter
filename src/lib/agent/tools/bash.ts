@@ -43,7 +43,7 @@ export class BashTool extends ToolBase {
         command: args.command,
         timeout,
         runInBackground: args.run_in_background ?? false,
-        cwd: (context.options as Record<string, unknown>).cwd as string | undefined,
+        cwd: (context.options as unknown as Record<string, unknown>).cwd as string | undefined,
       },
     })
 

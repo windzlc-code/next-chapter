@@ -54,9 +54,23 @@ export interface StorageAPI {
   selectFolder: () => Promise<string | null>;
   openFolder: (folderPath: string) => Promise<void>;
   openPath: (targetPath: string) => Promise<string>;
+  exists: (filePath: string) => boolean;
   writeText: (
     filePath: string,
     content: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  saveBinaryFile: (params: {
+    defaultFileName: string;
+    filters?: { name: string; extensions: string[] }[];
+    base64: string;
+  }) => Promise<
+    | { ok: true; cancelled: false; filePath: string }
+    | { ok: true; cancelled: true; filePath: null }
+    | { ok: false; cancelled: false; filePath: null; error?: string }
+  >;
+  copyFile: (
+    sourcePath: string,
+    destPath: string,
   ) => Promise<{ ok: boolean; error?: string }>;
   readText: (filePath: string) => Promise<{
     ok: boolean;
@@ -71,6 +85,59 @@ export interface StorageAPI {
     mimeType?: string;
     error?: string;
   }>;
+  listDir: (dirPath: string) => Promise<{
+    ok: boolean;
+    entries: Array<{ name: string; isDirectory: boolean }>;
+    error?: string;
+  }>;
+  deleteFile: (filePath: string) => Promise<{ ok: boolean; error?: string }>;
+  deleteDir: (dirPath: string) => Promise<{ ok: boolean; error?: string }>;
+  selectFile: (params: { filters?: { name: string; extensions: string[] }[] }) => Promise<string | null>;
+  exportChatHistory: (params: { sourceDir: string; destDir: string; sessionJson: string; fileName: string }) => Promise<
+    | { ok: true; destDir: string; chatHistoryFilePath: string }
+    | { ok: false; reason?: "write-failed" | "unknown"; destDir: string; chatHistoryFilePath: string; error?: string }
+  >;
+  importChatHistory: (params: { filePath: string; targetProjectDir?: string }) => Promise<
+    | { ok: true; content?: string; importedMediaDir?: string }
+    | {
+        ok: false;
+        reason?: "chat-history-missing" | "import-copy-failed" | "unknown";
+        content?: string;
+        importedMediaDir?: string;
+        error?: string;
+      }
+  >;
+}
+
+export interface MediaAPI {
+  extractVideoFrames: (params: {
+    filePath: string;
+    framePercents?: number[];
+  }) => Promise<{
+    ok: boolean;
+    framePaths?: string[];
+    error?: string;
+  }>;
+}
+
+export interface FfmpegAPI {
+  concatSegments: (params: {
+    inputPaths: string[];
+    outputPath: string;
+  }) => Promise<{ ok: boolean; outputPath?: string; error?: string }>;
+  burnSubtitles: (params: {
+    inputPath: string;
+    outputPath: string;
+    subtitleEntries: Array<{ startMs: number; endMs: number; text: string }>;
+  }) => Promise<{ ok: boolean; outputPath?: string; error?: string }>;
+  smartConcat: (params: {
+    inputPaths: string[];
+    outputPath: string;
+    transitions: Array<{ type: string; duration: number }>;
+    addSubtitles: boolean;
+    whisperModelPath?: string;
+    language?: string;
+  }) => Promise<{ ok: boolean; outputPath?: string; error?: string; subtitleWarning?: string }>;
 }
 
 export interface RuntimeAPI {
@@ -145,13 +212,61 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke("storage:openFolder", folderPath),
     openPath: (targetPath: string) =>
       ipcRenderer.invoke("storage:openPath", targetPath),
+    exists: (filePath: string) => {
+      try {
+        return fs.existsSync(path.normalize(filePath));
+      } catch {
+        return false;
+      }
+    },
     writeText: (filePath: string, content: string) =>
       ipcRenderer.invoke("storage:writeText", { filePath, content }),
+    saveBinaryFile: (params: {
+      defaultFileName: string;
+      filters?: { name: string; extensions: string[] }[];
+      base64: string;
+    }) => ipcRenderer.invoke("storage:saveBinaryFile", params),
+    copyFile: (sourcePath: string, destPath: string) =>
+      ipcRenderer.invoke("storage:copyFile", { sourcePath, destPath }),
     readText: (filePath: string) =>
       ipcRenderer.invoke("storage:readText", { filePath }),
     readBase64: (filePath: string) =>
       ipcRenderer.invoke("storage:readBase64", { filePath }),
+    listDir: (dirPath: string) =>
+      ipcRenderer.invoke("storage:listDir", dirPath),
+    deleteFile: (filePath: string) =>
+      ipcRenderer.invoke("storage:deleteFile", filePath),
+    deleteDir: (dirPath: string) =>
+      ipcRenderer.invoke("storage:deleteDir", dirPath),
+    selectFile: (params: { filters?: { name: string; extensions: string[] }[] }) =>
+      ipcRenderer.invoke("storage:selectFile", params),
+    exportChatHistory: (params: { sourceDir: string; destDir: string; sessionJson: string; fileName: string }) =>
+      ipcRenderer.invoke("storage:exportChatHistory", params),
+    importChatHistory: (params: { filePath: string; targetProjectDir?: string }) =>
+      ipcRenderer.invoke("storage:importChatHistory", params),
   } as StorageAPI,
+  media: {
+    extractVideoFrames: (params: { filePath: string; framePercents?: number[] }) =>
+      ipcRenderer.invoke("media:extractVideoFrames", params),
+  } as MediaAPI,
+  ffmpeg: {
+    concatSegments: (params: { inputPaths: string[]; outputPath: string }) =>
+      ipcRenderer.invoke("ffmpeg:concatSegments", params),
+    burnSubtitles: (params: {
+      inputPath: string;
+      outputPath: string;
+      subtitleEntries: Array<{ startMs: number; endMs: number; text: string }>;
+    }) => ipcRenderer.invoke("ffmpeg:burnSubtitles", params),
+    smartConcat: (params: {
+      inputPaths: string[];
+      outputPath: string;
+      transitions: Array<{ type: string; duration: number }>;
+      addSubtitles: boolean;
+      subtitleEntries?: Array<{ startMs: number; endMs: number; text: string }>;
+      whisperModelPath?: string;
+      language?: string;
+    }) => ipcRenderer.invoke("ffmpeg:smartConcat", params),
+  } as FfmpegAPI,
   invoke: (channel: string, ...args: unknown[]) => ipcRenderer.invoke(channel, ...args),
   on: (channel: string, listener: (...args: unknown[]) => void) => {
     ipcRenderer.on(channel, (_event, ...args) => listener(...args));

@@ -364,6 +364,13 @@ function buildKickoffQuestionRequest(
                 label: "暂不补充",
                 value: "无",
                 rationale: "先按上面的立项信息继续推进，后面也可以随时补充。",
+                confirmDialog: {
+                  title: "确认开始创作？",
+                  description: "以下是你的立项配置，确认后将直接进入创作方案。",
+                  confirmLabel: "确认，开始创作",
+                  cancelLabel: "返回补充",
+                  summaryRows: buildKickoffSummaryDisplay(displayAnswers),
+                },
               },
             ],
           },
@@ -372,7 +379,7 @@ function buildKickoffQuestionRequest(
   }
 }
 
-function buildKickoffSummaryDisplay(answers: KickoffDisplayAnswers): string[] {
+export function buildKickoffSummaryDisplay(answers: KickoffDisplayAnswers): string[] {
   const setupModeLabel = getDisplayValue(
     answers,
     "setupMode",
@@ -696,7 +703,7 @@ export function buildOriginalScriptKickoffPrompt(answer: string): string {
     "我要启动一个原创剧本项目。",
     "下面是我刚按传统创作面板确认的立项信息：",
     cleaned,
-    "请立即调用 HomeStudioWorkflow 把立项信息写入项目，然后直接推进到下一步（创作方案），不要询问我下一步做什么。",
+    "立项信息已经写入项目，创作方案也已经同步生成完毕。请直接向我展示创作方案的核心内容（核心冲突、故事方向、主要看点），然后等待我选择下一步，不要再调用任何工作流工具。",
   ].join("\n\n");
 }
 

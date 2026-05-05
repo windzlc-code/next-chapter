@@ -160,7 +160,7 @@ export async function* queryLoop(
           assistantMsg,
         )
 
-        const resultBlock = tool.mapToolResultToBlock(result.data, toolUseId) as ToolResultBlock
+        const resultBlock = tool.mapToolResultToBlock(result.data, toolUseId) as unknown as ToolResultBlock
         toolResultBlocks.push(resultBlock)
 
         // Apply context modifier

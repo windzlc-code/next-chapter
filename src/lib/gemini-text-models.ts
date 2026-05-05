@@ -19,8 +19,8 @@ export type ComplianceModel =
   | "claude-sonnet-4-6-thinking"
   | "claude-opus-4-6";
 
-export const DEFAULT_DECOMPOSE_MODEL: DecomposeModel = "gemini-3-pro-preview";
-export const DEFAULT_COMPLIANCE_MODEL: ComplianceModel = "gemini-3-pro-preview";
+export const DEFAULT_DECOMPOSE_MODEL: DecomposeModel = "gemini-3-flash-preview";
+export const DEFAULT_COMPLIANCE_MODEL: ComplianceModel = "gemini-3-flash-preview";
 
 export const DECOMPOSE_MODEL_OPTIONS: Array<{
   value: DecomposeModel;

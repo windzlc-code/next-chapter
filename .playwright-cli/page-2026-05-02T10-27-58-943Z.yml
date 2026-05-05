@@ -1,0 +1,46 @@
+- generic [ref=e2]:
+  - region "Notifications (F8)":
+    - list
+  - region "Notifications alt+T"
+  - generic [ref=e4]:
+    - banner [ref=e5]:
+      - generic [ref=e6]:
+        - img "InFinio-一站式智能体自动化平台" [ref=e7]
+        - generic [ref=e8]:
+          - generic [ref=e9]: InFinio
+          - generic [ref=e10]: 首页主控会话
+      - button [ref=e11] [cursor=pointer]:
+        - img
+    - main [ref=e12]:
+      - generic [ref=e14]:
+        - generic [ref=e15]:
+          - heading "InFinio-一站式智能体自动化平台" [level=1] [ref=e16]
+          - paragraph [ref=e17]: 直接开始说目标。会话启动后，同一个输入框会在这一页自然沉到底部，继续推进完整工作流。
+        - generic [ref=e21]:
+          - generic [ref=e22]:
+            - generic [ref=e23]:
+              - generic [ref=e24]: 主对话模型尚未就绪
+              - generic [ref=e25]: 当前首页还没有可用的文本模型 Key，先去设置补齐内置 API 配置，再开始真实会话最稳妥。
+              - button "去设置补齐" [ref=e27] [cursor=pointer]
+            - generic [ref=e28]:
+              - textbox "和 Agent 说出你的目标，例如：我想做一部面向女性市场的都市反转短剧，请一步一步带我完成。" [ref=e29]
+              - generic [ref=e30]:
+                - generic [ref=e31]:
+                  - button "上传文件" [ref=e32] [cursor=pointer]:
+                    - img
+                  - button "Anthropic / Sonnet 4.6" [ref=e34] [cursor=pointer]:
+                    - generic [ref=e35]: Anthropic / Sonnet 4.6
+                    - img [ref=e36]
+                  - button "nano-banana-pro · 2K" [ref=e39] [cursor=pointer]:
+                    - generic [ref=e40]: nano-banana-pro · 2K
+                    - img [ref=e41]
+                  - button "seedance-1-5-pro · 720p" [ref=e44] [cursor=pointer]:
+                    - generic [ref=e45]: seedance-1-5-pro · 720p
+                    - img [ref=e46]
+                  - button "2K · 16:9" [ref=e49] [cursor=pointer]:
+                    - generic [ref=e50]: 2K · 16:9
+                    - img [ref=e51]
+                - generic [ref=e53]:
+                  - button [disabled]:
+                    - img
+          - button "DEV" [ref=e55] [cursor=pointer]

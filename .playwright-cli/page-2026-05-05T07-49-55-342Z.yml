@@ -1,0 +1,154 @@
+- generic [ref=e1]:
+  - link "跳转至主内容" [ref=e2] [cursor=pointer]:
+    - /url: "#theia-app-shell"
+  - generic [ref=e3]:
+    - generic [ref=e4]:
+      - generic [ref=e5]:
+        - generic [ref=e6]:
+          - generic [ref=e7]:
+            - generic:
+              - generic "logo"
+            - generic [ref=e9] [cursor=pointer]: 
+          - tablist [ref=e13] [cursor=pointer]:
+            - listitem [ref=e14]:
+              - generic [ref=e16]: 
+            - listitem [ref=e17]:
+              - generic [ref=e19]: 
+            - listitem [ref=e20]:
+              - generic [ref=e22]: 
+            - listitem [ref=e23]:
+              - generic [ref=e25]: 
+          - generic [ref=e27]:
+            - generic "切换主题" [ref=e29] [cursor=pointer]: 
+            - generic [ref=e31]: 
+            - generic [ref=e33] [cursor=pointer]: 
+          - generic:
+            - generic: 
+        - generic [ref=e34]:
+          - generic [ref=e35]:
+            - generic "当前连接" [ref=e36]
+            - generic [ref=e37]:
+              - generic [ref=e38] [cursor=pointer]: 
+              - generic [ref=e39] [cursor=pointer]: 
+          - generic [ref=e40]:
+            - text:    
+            - tabpanel " 当前连接" [ref=e41]:
+              - generic [ref=e43]:
+                - button " 新建连接" [ref=e211] [cursor=pointer]:
+                  - generic [ref=e212]: 
+                  - generic [ref=e213]: 新建连接
+                - generic [ref=e214] [cursor=pointer]:
+                  - generic [ref=e215]:
+                    - generic [ref=e218]: iZj6c9rlopwbbcolimeg8iZ
+                    - generic [ref=e222]: 
+                  - generic [ref=e223]:
+                    - generic [ref=e225]: i-j6c9rlopwbbcolimeg8i
+                    - generic [ref=e227]: ssh
+                  - generic [ref=e228]:
+                    - generic [ref=e230]: root@47.243.99.2
+                    - generic [ref=e232]: 23小时
+                  - generic [ref=e235]: 香港
+            - text:          
+      - generic [ref=e52]:
+        - generic [ref=e54]:
+          - tablist [ref=e56] [cursor=pointer]:
+            - listitem "root@iZj6c9rlopwbbcolimeg8iZ" [ref=e236]:
+              - generic [ref=e237]:
+                - generic [ref=e238]: 
+                - generic [ref=e239]: root@iZj6c9rlopwbbcolimeg8iZ
+              - generic "关闭" [ref=e240]: 
+          - generic [ref=e57]:
+            - generic [ref=e59] [cursor=pointer]: 返回旧版
+            - generic "终端助手" [ref=e62] [cursor=pointer]: 
+        - tabpanel [ref=e241]:
+          - text:       
+          - generic [ref=e247]:
+            - generic [ref=e248]:
+              - generic [ref=e250]:
+                - generic [ref=e251]:
+                  - generic [ref=e254] [cursor=pointer]: 
+                  - generic [ref=e258] [cursor=pointer]: 
+                  - generic [ref=e263] [cursor=pointer]: 
+                  - generic [ref=e376]:
+                    - generic [ref=e377] [cursor=pointer]:
+                      - radio " Shell" [checked]
+                      - generic [ref=e380]:
+                        - generic [ref=e381]: 
+                        - text: Shell
+                    - generic [ref=e382] [cursor=pointer]:
+                      - radio " Agent Ctrl+Shift+I"
+                      - generic [ref=e384]:
+                        - generic [ref=e385]:
+                          - generic [ref=e386]: 
+                          - text: Agent
+                        - generic [ref=e388]: Ctrl+Shift+I
+                  - generic [ref=e285] [cursor=pointer]: 
+                  - generic [ref=e351] [cursor=pointer]:
+                    - text: 一键管理 OpenClaw
+                    - generic [ref=e352]: 
+                - generic [ref=e289]:
+                  - generic [ref=e290] [cursor=pointer]: 
+                  - generic [ref=e353]: 59 ms
+              - generic [ref=e291]:
+                - generic [ref=e295]:
+                  - textbox "Terminal input" [active] [ref=e354]
+                  - generic [ref=e296]:
+                    - generic [ref=e543]: Welcome to Alibaba Cloud Elastic Compute Service !
+                    - generic [ref=e544]: "Updates Information Summary: available"
+                    - generic [ref=e545]: 19 Security notice(s)
+                    - generic [ref=e546]: 10 Important Security notice(s)
+                    - generic [ref=e547]: 9 Moderate Security notice(s)
+                    - generic [ref=e548]: "Run \"dnf upgrade-minimal --security\" to apply all updates.More details please refer to:"
+                    - generic [ref=e549]: https://help.aliyun.com/document_detail/416274.html
+                    - generic [ref=e550]: "Last login: Tue May 5 15:45:04 2026 from 100.104.189.22"
+                    - generic [ref=e551]: "[root@iZj6c9rlopwbbcolimeg8iZ ~]# un"
+                    - generic [ref=e552]: "-bash: un: command not found"
+                    - generic [ref=e553]: ame [root@iZj6c9rlopwbbcolimeg8iZ ~]# ame -a && cat /etc/os-release && which git || true && which no
+                    - generic [ref=e554]: "| true && which npm || true && which nginx || true && pwd^C"
+                    - generic [ref=e555]: "[root@iZj6c9rlopwbbcolimeg8iZ ~]#"
+                    - generic [ref=e556]: p[root@iZj6c9rlopwbbcolimeg8iZ ~]# pwd
+                    - generic [ref=e557]: /root
+                    - generic [ref=e558]: "[root@iZj6c9rlopwbbcolimeg8iZ ~]# uname -a"
+                    - generic [ref=e559]: "Linux iZj6c9rlopwbbcolimeg8iZ 5.10.134-19.2.al8.x86_64 #1 SMP Wed Oct 29 22:47:09 CST 2025 x86_64 x8"
+                    - generic [ref=e560]: 6_64 x86_64 GNU/Linux
+                    - generic [ref=e561]: "[root@iZj6c9rlopwbbcolimeg8iZ ~]#"
+                    - generic [ref=e562]: "[root@iZj6c9rlopwbbcolimeg8iZ ~]# which git"
+                    - generic [ref=e563]: "/usr/bin/which: no git in (/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/root/bin)"
+                    - generic [ref=e564]: "[root@iZj6c9rlopwbbcolimeg8iZ ~]#"
+                  - generic:
+                    - generic [ref=e567] [cursor=pointer]: 
+                    - generic [ref=e569] [cursor=pointer]: 
+                    - generic [ref=e572] [cursor=pointer]: 
+                    - generic [ref=e574]:
+                      - generic [ref=e576]: Ctrl+Shift+I切换AI终端模式，Ctrl+Shift+Y唤出
+                      - text: 命令助手
+                - generic: 
+            - text:  
+    - generic [ref=e94]:
+      - generic [ref=e95]:
+        - generic "$(ignore-default-codicons workbench-icon workbench-icon-a-QuickCommand)快捷命令," [ref=e333]:
+          - generic [ref=e334]: 
+          - generic [ref=e335]: 快捷命令
+        - generic "已连接," [ref=e368]:
+          - generic [ref=e337]: 已连接
+        - generic "6ec70hgvau, 终端会话Token ：6ec70hgvau" [ref=e369]:
+          - generic [ref=e370]: 6ec70hgvau
+      - generic [ref=e96]:
+        - 'generic "24,35 , 当前光标位置: 24, 35" [ref=e577]':
+          - generic [ref=e342]: 24,35
+        - generic "35 Rows, 终端行数：35" [ref=e343]:
+          - generic [ref=e344]: 35 Rows
+        - generic "100 Cols, 终端列数：100" [ref=e345]:
+          - generic [ref=e346]: 100 Cols
+        - generic "$(language)en_US.UTF-8, [object HTMLDivElement]" [ref=e372]:
+          - generic [ref=e373]: en_US.UTF-8
+        - generic "没有通知" [ref=e97]:
+          - generic [ref=e98]: 
+  - generic [ref=e99]:
+    - generic "关闭" [ref=e100]: ✖
+    - generic [ref=e101] [cursor=pointer]: 反馈
+  - generic:
+    - generic:  
+  - iframe [ref=e209]:
+    
+  - generic [ref=e347]: NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN

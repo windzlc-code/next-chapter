@@ -1,11 +1,19 @@
+import type { ChatAttachment } from "@/lib/agent/chat-attachments";
 import type {
   ComposerQuestion,
+  ConversationArtifact,
   ConversationProjectSnapshot,
   HomeAgentMessage,
   StudioRuntimeState,
 } from "@/lib/home-agent/types";
 
-type PushMessage = (role: HomeAgentMessage["role"], content: string) => void;
+type PushMessage = (
+  role: HomeAgentMessage["role"],
+  content: string,
+  artifactIds?: string[],
+  attachments?: ChatAttachment[],
+  artifactSnapshots?: ConversationArtifact[],
+) => void;
 
 export function createWorkflowShortcutUiBridge(params: {
   activateConversation: () => void;
@@ -17,7 +25,10 @@ export function createWorkflowShortcutUiBridge(params: {
   ) => ComposerQuestion | null;
   push: PushMessage;
   resetComposerDraft: (value?: string) => void;
-  setPopoverQuestion: (question: ComposerQuestion | null) => void;
+  setPopoverQuestion: (
+    question: ComposerQuestion | null,
+    snapshot?: ConversationProjectSnapshot | null,
+  ) => void;
   setStreaming: (streaming: boolean) => void;
   setSuggested: (question: ComposerQuestion | null) => void;
 }) {
@@ -38,7 +49,8 @@ export function createWorkflowShortcutUiBridge(params: {
     clearChoiceUi,
     commitRuntime,
     getSuggestedQuestion,
-    pushAssistant: (content: string) => push("assistant", content),
+    pushAssistant: (content: string, artifactIds?: string[], artifactSnapshots?: ConversationArtifact[]) =>
+      push("assistant", content, artifactIds, undefined, artifactSnapshots),
     pushUser: (content: string) => push("user", content),
     resetComposerDraft: () => resetComposerDraft(""),
     setPopoverQuestion,

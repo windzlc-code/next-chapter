@@ -1,5 +1,14 @@
 import type { Task as RuntimeTask } from "@/lib/agent/tools/task-tools";
 
+export type BackgroundResearchGroup = {
+  id: string;
+  kind: "video-bridge-platform";
+  projectId?: string;
+  taskIds: string[];
+  status: "pending" | "forwarding" | "cancelled";
+  onFinish?: (result: "completed" | "cancelled") => void;
+};
+
 export function truncateCopy(value: string, max = 120): string {
   const normalized = value.replace(/\s+/g, " ").trim();
   if (!normalized) return "";
@@ -11,6 +20,10 @@ export function parseTaskHeading(prompt: string): string | null {
     prompt.match(/^并行研究\s+([^:：]+)[:：]/) ??
     prompt.match(/^并行研究[:：]\s*(.+)$/);
   return matched?.[1]?.trim() ?? null;
+}
+
+export function isBackgroundResearchTask(task: Pick<RuntimeTask, "prompt">): boolean {
+  return Boolean(parseTaskHeading(task.prompt));
 }
 
 export function parseTaskPreview(prompt: string): string {
@@ -41,15 +54,15 @@ export function taskStatusLabel(status: RuntimeTask["status"]): string {
 export function taskStatusClass(status: RuntimeTask["status"]): string {
   switch (status) {
     case "running":
-      return "border-[#8aa0ff]/24 bg-[#8aa0ff]/10 text-[#dfe5ff]";
+      return "border-primary/24 bg-primary/10 text-primary";
     case "completed":
-      return "border-emerald-400/18 bg-emerald-400/10 text-emerald-100";
+      return "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400";
     case "failed":
-      return "border-rose-400/18 bg-rose-400/10 text-rose-100";
+      return "border-rose-500/30 bg-rose-500/10 text-rose-600 dark:text-rose-400";
     case "cancelled":
-      return "border-white/[0.08] bg-white/[0.05] text-white/58";
+      return "border-border bg-muted/50 text-muted-foreground";
     default:
-      return "border-white/[0.08] bg-white/[0.05] text-white/72";
+      return "border-border bg-muted/50 text-foreground/70";
   }
 }
 

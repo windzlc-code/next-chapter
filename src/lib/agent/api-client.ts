@@ -33,7 +33,7 @@ function buildSystemBlocks(
 function buildToolsParam(tools: Tool[]): Anthropic.Tool[] {
   return tools.map(t => ({
     name: t.name,
-    description: t.searchHint ?? t.name,
+    description: t.searchHint || t.name,
     input_schema: t.inputSchema() as Anthropic.Tool.InputSchema,
   }))
 }
@@ -54,7 +54,7 @@ async function invokeElectronModelBridge(payload: ModelApiBridgePayload): Promis
     | { ok: false; error: string }
 
   if (!response?.ok) {
-    throw new Error(response?.error || 'Electron model bridge failed')
+    throw new Error((response as { error?: string } | undefined)?.error || 'Electron model bridge failed')
   }
 
   return response.data
@@ -149,7 +149,7 @@ function buildGeminiToolsParam(tools: Tool[]): Array<{ functionDeclarations: Arr
   return [{
     functionDeclarations: tools.map(tool => ({
       name: tool.name,
-      description: tool.searchHint ?? tool.name,
+      description: tool.searchHint || tool.name,
       parameters: tool.inputSchema(),
     })),
   }]
@@ -171,7 +171,7 @@ function buildChatCompletionsToolsParam(tools: Tool[]):
     type: 'function' as const,
     function: {
       name: tool.name,
-      description: tool.searchHint ?? tool.name,
+      description: tool.searchHint || tool.name,
       parameters: tool.inputSchema(),
     },
   }))
@@ -182,6 +182,127 @@ function normalizeGeminiFunctionArgs(input: unknown): Record<string, unknown> {
     return input as Record<string, unknown>
   }
   return {}
+}
+
+function buildFileFallbackText(block: Extract<ContentBlock, { type: 'input_file' }>): string {
+  const summaryParts = [
+    `文件: ${block.fileName}`,
+    `MIME: ${block.mimeType}`,
+    ...(typeof block.size === 'number' ? [`大小: ${block.size} bytes`] : []),
+    ...(block.extension ? [`扩展名: ${block.extension}`] : []),
+  ]
+
+  if (typeof block.extractedText === 'string' && block.extractedText.trim()) {
+    summaryParts.push(`提取文本:\n${block.extractedText}`)
+  } else if (typeof block.fallbackDigest === 'string' && block.fallbackDigest.trim()) {
+    summaryParts.push(`元信息摘要:\n${block.fallbackDigest}`)
+  }
+
+  return summaryParts.join('\n')
+}
+
+function buildMediaFallbackText(
+  block: Extract<ContentBlock, { type: 'input_image' | 'input_video' }>,
+): string {
+  const label = block.type === 'input_video' ? '视频' : '图片'
+  return [
+    `${label}: ${block.fileName || '未命名附件'}`,
+    `MIME: ${block.mimeType}`,
+    ...(block.type === 'input_video' && block.fallbackText ? [block.fallbackText] : []),
+  ].join('\n')
+}
+
+function mapAnthropicContentBlock(block: ContentBlock): Anthropic.ContentBlockParam | null {
+  if (block.type === 'text') {
+    return { type: 'text', text: block.text } as Anthropic.ContentBlockParam
+  }
+
+  if (block.type === 'tool_use') {
+    return {
+      type: 'tool_use',
+      id: block.id,
+      name: block.name,
+      input: block.input,
+    } as Anthropic.ContentBlockParam
+  }
+
+  if (block.type === 'tool_result') {
+    return {
+      type: 'tool_result',
+      tool_use_id: block.tool_use_id,
+      content: block.content,
+      is_error: block.is_error,
+    } as Anthropic.ContentBlockParam
+  }
+
+  if (block.type === 'thinking') {
+    return {
+      type: 'thinking',
+      thinking: block.thinking,
+    } as Anthropic.ContentBlockParam
+  }
+
+  if (block.type === 'input_image' && block.base64) {
+    return {
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: block.mimeType,
+        data: block.base64,
+      },
+    } as Anthropic.ContentBlockParam
+  }
+
+  if (block.type === 'input_file' && block.base64) {
+    return {
+      type: 'document',
+      source: {
+        type: 'base64',
+        media_type: block.mimeType,
+        data: block.base64,
+      },
+      title: block.fileName,
+      context: block.extractedText || block.fallbackDigest || '',
+    } as Anthropic.ContentBlockParam
+  }
+
+  if (block.type === 'input_video') {
+    return {
+      type: 'text',
+      text: buildMediaFallbackText(block),
+    } as Anthropic.ContentBlockParam
+  }
+
+  if (block.type === 'input_file') {
+    return {
+      type: 'text',
+      text: buildFileFallbackText(block),
+    } as Anthropic.ContentBlockParam
+  }
+
+  if (block.type === 'input_image') {
+    return {
+      type: 'text',
+      text: buildMediaFallbackText(block),
+    } as Anthropic.ContentBlockParam
+  }
+
+  return null
+}
+
+function buildAnthropicMessages(messages: Anthropic.MessageParam[]): Anthropic.MessageParam[] {
+  return messages.map(message => {
+    if (typeof message.content === 'string') return message
+
+    const mappedBlocks = message.content
+      .map(block => mapAnthropicContentBlock(block as ContentBlock))
+      .filter((block): block is Anthropic.ContentBlockParam => Boolean(block))
+
+    return {
+      ...message,
+      content: mappedBlocks,
+    }
+  })
 }
 
 function buildGeminiContents(messages: Anthropic.MessageParam[]): Array<Record<string, unknown>> {
@@ -196,30 +317,73 @@ function buildGeminiContents(messages: Anthropic.MessageParam[]): Array<Record<s
       if (message.content.trim()) parts.push({ text: message.content })
     } else if (Array.isArray(message.content)) {
       for (const block of message.content) {
-        if (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
-          parts.push({ text: block.text })
+        const normalizedBlock = block as ContentBlock
+        if (normalizedBlock.type === 'text' && typeof normalizedBlock.text === 'string' && normalizedBlock.text.trim()) {
+          parts.push({ text: normalizedBlock.text })
           continue
         }
 
-        if (block.type === 'tool_use' && message.role === 'assistant') {
-          toolNamesById.set(block.id, block.name)
+        if (normalizedBlock.type === 'input_image') {
+          if (normalizedBlock.base64) {
+            parts.push({
+              inlineData: {
+                mimeType: normalizedBlock.mimeType,
+                data: normalizedBlock.base64,
+              },
+            })
+          } else {
+            parts.push({ text: buildMediaFallbackText(normalizedBlock) })
+          }
+          continue
+        }
+
+        if (normalizedBlock.type === 'input_video') {
+          if (normalizedBlock.base64) {
+            parts.push({
+              inlineData: {
+                mimeType: normalizedBlock.mimeType,
+                data: normalizedBlock.base64,
+              },
+            })
+          }
+          if (!normalizedBlock.base64 || normalizedBlock.fallbackText) {
+            parts.push({ text: buildMediaFallbackText(normalizedBlock) })
+          }
+          continue
+        }
+
+        if (normalizedBlock.type === 'input_file') {
+          if (normalizedBlock.base64) {
+            parts.push({
+              inlineData: {
+                mimeType: normalizedBlock.mimeType,
+                data: normalizedBlock.base64,
+              },
+            })
+          }
+          parts.push({ text: buildFileFallbackText(normalizedBlock) })
+          continue
+        }
+
+        if (normalizedBlock.type === 'tool_use' && message.role === 'assistant') {
+          toolNamesById.set(normalizedBlock.id, normalizedBlock.name)
           parts.push({
             functionCall: {
-              name: block.name,
-              args: normalizeGeminiFunctionArgs(block.input),
+              name: normalizedBlock.name,
+              args: normalizeGeminiFunctionArgs(normalizedBlock.input),
             },
           })
           continue
         }
 
-        if (block.type === 'tool_result' && message.role === 'user') {
-          const name = toolNamesById.get(block.tool_use_id) || 'ToolResult'
+        if (normalizedBlock.type === 'tool_result' && message.role === 'user') {
+          const name = toolNamesById.get(normalizedBlock.tool_use_id) || 'ToolResult'
           parts.push({
             functionResponse: {
               name,
               response: {
-                result: typeof block.content === 'string' ? block.content : JSON.stringify(block.content ?? ''),
-                is_error: Boolean(block.is_error),
+                result: typeof normalizedBlock.content === 'string' ? normalizedBlock.content : JSON.stringify(normalizedBlock.content ?? ''),
+                is_error: Boolean(normalizedBlock.is_error),
               },
             },
           })
@@ -265,28 +429,39 @@ function buildChatCompletionsMessages(
     const toolCalls: Array<Record<string, unknown>> = []
 
     for (const block of message.content) {
-      if (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
-        textParts.push(block.text)
+      const normalizedBlock = block as ContentBlock
+      if (normalizedBlock.type === 'text' && typeof normalizedBlock.text === 'string' && normalizedBlock.text.trim()) {
+        textParts.push(normalizedBlock.text)
         continue
       }
 
-      if (block.type === 'tool_use' && message.role === 'assistant') {
+      if (normalizedBlock.type === 'input_image' || normalizedBlock.type === 'input_video') {
+        textParts.push(buildMediaFallbackText(normalizedBlock))
+        continue
+      }
+
+      if (normalizedBlock.type === 'input_file') {
+        textParts.push(buildFileFallbackText(normalizedBlock))
+        continue
+      }
+
+      if (normalizedBlock.type === 'tool_use' && message.role === 'assistant') {
         toolCalls.push({
-          id: block.id,
+          id: normalizedBlock.id,
           type: 'function',
           function: {
-            name: block.name,
-            arguments: JSON.stringify(normalizeGeminiFunctionArgs(block.input)),
+            name: normalizedBlock.name,
+            arguments: JSON.stringify(normalizeGeminiFunctionArgs(normalizedBlock.input)),
           },
         })
         continue
       }
 
-      if (block.type === 'tool_result' && message.role === 'user') {
+      if (normalizedBlock.type === 'tool_result' && message.role === 'user') {
         result.push({
           role: 'tool',
-          tool_call_id: block.tool_use_id,
-          content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content ?? ''),
+          tool_call_id: normalizedBlock.tool_use_id,
+          content: typeof normalizedBlock.content === 'string' ? normalizedBlock.content : JSON.stringify(normalizedBlock.content ?? ''),
         })
       }
     }
@@ -781,10 +956,10 @@ export async function callModelAPI(opts: CallModelOptions): Promise<AssistantMes
   const requestParams = {
     model,
     max_tokens: effectiveMaxTokens,
-    messages,
+    messages: buildAnthropicMessages(messages),
     ...(systemBlock ? { system: systemBlock } : {}),
     ...(toolsParam ? { tools: toolsParam } : {}),
-    ...(thinkingConfig ? { thinking: thinkingConfig as Anthropic.ThinkingConfigParam } : {}),
+    ...(thinkingConfig ? { thinking: thinkingConfig as unknown as Anthropic.ThinkingConfigParam } : {}),
   }
 
   const requestUrl = buildMessagesApiUrl(baseUrl)
@@ -833,8 +1008,8 @@ export async function callModelAPI(opts: CallModelOptions): Promise<AssistantMes
   const usage: UsageStats = {
     inputTokens: parsed.usage.input_tokens,
     outputTokens: parsed.usage.output_tokens,
-    cacheCreationInputTokens: (parsed.usage as Record<string, number>).cache_creation_input_tokens ?? 0,
-    cacheReadInputTokens: (parsed.usage as Record<string, number>).cache_read_input_tokens ?? 0,
+    cacheCreationInputTokens: (parsed.usage as unknown as Record<string, number>).cache_creation_input_tokens ?? 0,
+    cacheReadInputTokens: (parsed.usage as unknown as Record<string, number>).cache_read_input_tokens ?? 0,
   }
 
   return {
@@ -877,10 +1052,10 @@ export async function* callModelAPIStream(opts: CallModelOptions): AsyncGenerato
     model,
     max_tokens: effectiveMaxTokens,
     stream: true,
-    messages,
+    messages: buildAnthropicMessages(messages),
     ...(systemBlock ? { system: systemBlock } : {}),
     ...(toolsParam ? { tools: toolsParam } : {}),
-    ...(thinkingConfig ? { thinking: thinkingConfig as Anthropic.ThinkingConfigParam } : {}),
+    ...(thinkingConfig ? { thinking: thinkingConfig as unknown as Anthropic.ThinkingConfigParam } : {}),
   }
 
   const requestUrl = buildMessagesApiUrl(baseUrl)
@@ -888,7 +1063,7 @@ export async function* callModelAPIStream(opts: CallModelOptions): AsyncGenerato
   // Electron bridge: use streaming IPC handler
   if (canUseElectronModelBridge()) {
     const streamId = Math.random().toString(36).slice(2)
-    const electronAPI = window.electronAPI as Record<string, unknown>
+    const electronAPI = window.electronAPI as unknown as Record<string, unknown>
     const onFn = electronAPI.on as ((channel: string, listener: (...args: unknown[]) => void) => void) | undefined
     const offFn = electronAPI.off as ((channel: string, listener: (...args: unknown[]) => void) => void) | undefined
 
@@ -970,7 +1145,7 @@ export async function* callModelAPIStream(opts: CallModelOptions): AsyncGenerato
 
     // Fallback: no on/off support, use non-streaming
     const msg = await callModelAPI(opts)
-    const text = msg.message.content
+    const text = (Array.isArray(msg.message.content) ? msg.message.content : [])
       .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
       .map((b) => b.text)
       .join('')

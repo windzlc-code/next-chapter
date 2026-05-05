@@ -112,7 +112,7 @@ export class AgentTool extends ToolBase {
 
       registerTaskStopHandler(taskId, () => {
         subEngine.interrupt()
-        updateTask(taskId, { status: 'cancelled', output: 'Task cancelled by user.' })
+        updateTask(taskId, { status: 'cancelled', output: '任务已取消。' })
       })
 
       const promise = runTask()

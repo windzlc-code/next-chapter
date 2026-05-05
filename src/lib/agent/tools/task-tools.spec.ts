@@ -70,4 +70,19 @@ describe("task-tools persistence", () => {
     expect(mod.getAllTasks()).toHaveLength(0);
     expect(JSON.parse(localStorage.getItem(TASK_STORAGE_KEY) || "[]")).toHaveLength(0);
   });
+
+  it("uses a localized default message when a task is cancelled", async () => {
+    const mod = await import("./task-tools");
+
+    mod.writeTask({
+      id: "task-cancel-1",
+      prompt: "并行研究: 取消默认文案",
+      status: "running",
+      createdAt: 4,
+      updatedAt: 4,
+    });
+
+    expect(mod.stopTask("task-cancel-1")).toBe(true);
+    expect(mod.getTask("task-cancel-1")?.output).toBe("任务已取消。");
+  });
 });

@@ -80,9 +80,32 @@ import_electron.contextBridge.exposeInMainWorld("electronAPI", {
     selectFolder: () => import_electron.ipcRenderer.invoke("storage:selectFolder"),
     openFolder: (folderPath) => import_electron.ipcRenderer.invoke("storage:openFolder", folderPath),
     openPath: (targetPath) => import_electron.ipcRenderer.invoke("storage:openPath", targetPath),
+    exists: (filePath) => {
+      try {
+        return import_node_fs.default.existsSync(import_node_path.default.normalize(filePath));
+      } catch {
+        return false;
+      }
+    },
     writeText: (filePath, content) => import_electron.ipcRenderer.invoke("storage:writeText", { filePath, content }),
+    saveBinaryFile: (params) => import_electron.ipcRenderer.invoke("storage:saveBinaryFile", params),
+    copyFile: (sourcePath, destPath) => import_electron.ipcRenderer.invoke("storage:copyFile", { sourcePath, destPath }),
     readText: (filePath) => import_electron.ipcRenderer.invoke("storage:readText", { filePath }),
-    readBase64: (filePath) => import_electron.ipcRenderer.invoke("storage:readBase64", { filePath })
+    readBase64: (filePath) => import_electron.ipcRenderer.invoke("storage:readBase64", { filePath }),
+    listDir: (dirPath) => import_electron.ipcRenderer.invoke("storage:listDir", dirPath),
+    deleteFile: (filePath) => import_electron.ipcRenderer.invoke("storage:deleteFile", filePath),
+    deleteDir: (dirPath) => import_electron.ipcRenderer.invoke("storage:deleteDir", dirPath),
+    selectFile: (params) => import_electron.ipcRenderer.invoke("storage:selectFile", params),
+    exportChatHistory: (params) => import_electron.ipcRenderer.invoke("storage:exportChatHistory", params),
+    importChatHistory: (params) => import_electron.ipcRenderer.invoke("storage:importChatHistory", params)
+  },
+  media: {
+    extractVideoFrames: (params) => import_electron.ipcRenderer.invoke("media:extractVideoFrames", params)
+  },
+  ffmpeg: {
+    concatSegments: (params) => import_electron.ipcRenderer.invoke("ffmpeg:concatSegments", params),
+    burnSubtitles: (params) => import_electron.ipcRenderer.invoke("ffmpeg:burnSubtitles", params),
+    smartConcat: (params) => import_electron.ipcRenderer.invoke("ffmpeg:smartConcat", params)
   },
   invoke: (channel, ...args) => import_electron.ipcRenderer.invoke(channel, ...args),
   on: (channel, listener) => {

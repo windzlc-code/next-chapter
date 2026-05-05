@@ -315,6 +315,7 @@ export interface EpisodeVersion {
 export interface EpisodeScript {
   number: number;
   title: string;
+  summary?: string;
   content: string;
   wordCount: number;
   history?: EpisodeVersion[]; // previous versions
@@ -348,8 +349,221 @@ export interface ComplianceRevisionPacket {
   issueTitle: string;
   riskLevel: "high" | "medium" | "low";
   recommendation: string;
+  affectedEpisodeNumbers?: number[];
   sourceQuote?: string;
   status: "pending" | "resolved";
+  workspaceRiskId?: string;
+  replacement?: string;
+  segmentIndex?: number;
+  originalSnippet?: string;
+}
+
+export type ComplianceReviewMode = "text" | "script";
+export type ComplianceStrictness = "standard" | "strict" | "extreme";
+export type ComplianceRiskLevel = "red" | "high" | "info";
+export type ComplianceWorkspaceModel =
+  | "gemini-3.1-pro-preview"
+  | "gemini-3-pro-preview"
+  | "gemini-3-flash-preview";
+
+export interface ComplianceWorkspaceTableSnapshot {
+  headers: string[];
+  rows: (string | number | null)[][];
+  fileName: string;
+  sheetName?: string;
+  originalData: (string | number | null)[][];
+}
+
+export interface ComplianceWorkspaceRiskPhrase {
+  id: string;
+  level: ComplianceRiskLevel;
+  text: string;
+  reason: string;
+  segmentIndex: number;
+  replacement?: string;
+  status: "pending" | "resolved";
+}
+
+export interface ComplianceWorkspaceRiskSpan {
+  start: number;
+  end: number;
+  level: ComplianceRiskLevel;
+}
+
+export interface ComplianceWorkspaceSegment {
+  index: number;
+  content: string;
+  report: string;
+  status: "pending" | "processing" | "done" | "failed";
+  reviewedAt?: string | null;
+  riskCount?: number;
+}
+
+export interface ComplianceWorkspaceProgress {
+  current: number;
+  total: number;
+  completed: number;
+  failed: number;
+  status: "idle" | "processing" | "done" | "failed";
+  updatedAt?: string | null;
+}
+
+export interface ComplianceWorkspaceReviewMeta {
+  reviewedAt: string;
+  segmentCount: number;
+  sourceLength: number;
+  reportLength: number;
+  skippedAt?: string | null;
+}
+
+export interface ComplianceWorkspaceExportMeta {
+  lastExportedAt?: string | null;
+  lastExportFormat?: "xlsx" | "docx" | null;
+  lastExportFileName?: string | null;
+}
+
+export interface ComplianceWorkspace {
+  sourceText: string;
+  paletteText: string;
+  reviewMode: ComplianceReviewMode;
+  strictness: ComplianceStrictness;
+  model: ComplianceWorkspaceModel;
+  tableSnapshot: ComplianceWorkspaceTableSnapshot | null;
+  riskPhrases: ComplianceWorkspaceRiskPhrase[];
+  riskSpans: ComplianceWorkspaceRiskSpan[];
+  phraseReplacements: Record<string, string>;
+  segments: ComplianceWorkspaceSegment[];
+  progress: ComplianceWorkspaceProgress | null;
+  latestReview: ComplianceWorkspaceReviewMeta | null;
+  exportMeta: ComplianceWorkspaceExportMeta | null;
+  history: string[];
+  historyIndex: number;
+  dialogueReviewEnabled: boolean;
+  dialogueOverLimitLineIndexes: number[];
+  lastImportedFileName?: string | null;
+  lastImportedAt?: string | null;
+}
+
+export interface OutlineBatchStatus {
+  index: number;
+  label: string;
+  startEp: number;
+  endEp: number;
+  status: "pending" | "processing" | "done" | "failed";
+  error?: string;
+}
+
+export interface EpisodeGenerationStatus {
+  episodeNumber: number;
+  title: string;
+  status: "pending" | "processing" | "done" | "failed";
+  error?: string;
+}
+
+export interface EpisodeQualityReviewScore {
+  score: number;
+  comment: string;
+}
+
+export interface EpisodeQualityReviewIssue {
+  level: string;
+  description: string;
+}
+
+export interface EpisodeQualityReviewResult {
+  scores: {
+    rhythm: EpisodeQualityReviewScore;
+    satisfaction: EpisodeQualityReviewScore;
+    dialogue: EpisodeQualityReviewScore;
+    format: EpisodeQualityReviewScore;
+    continuity: EpisodeQualityReviewScore;
+  };
+  total: number;
+  grade: string;
+  highlights: string[];
+  issues: EpisodeQualityReviewIssue[];
+  suggestions: string[];
+}
+
+export interface EpisodeQualityReviewPacket {
+  id: string;
+  episodeNumber: number;
+  title: string;
+  reviewedAt: string;
+  rewriteInstruction: string;
+  result: EpisodeQualityReviewResult;
+}
+
+export type EpisodeQualityReviewBatchMode = "default-count" | "custom-count" | "episodes";
+
+export interface EpisodeQualityReviewBatch {
+  mode: EpisodeQualityReviewBatchMode;
+  episodeNumbers: number[];
+  reviewedAt: string;
+  requestedCount?: number | null;
+}
+
+export interface ExportPatchPlanAction {
+  label: string;
+  value: string;
+}
+
+export interface ExportPatchPlanEntry {
+  id: string;
+  kind:
+    | "missing-outline"
+    | "missing-episode"
+    | "episode-review"
+    | "compliance"
+    | "export-refresh";
+  title: string;
+  priority: "high" | "medium" | "low";
+  summary: string;
+  episodeNumbers?: number[];
+  action?: ExportPatchPlanAction;
+}
+
+export interface ExportPatchPlan {
+  generatedAt: string;
+  signature: string;
+  readyForExport: boolean;
+  summary: string;
+  counts: {
+    high: number;
+    medium: number;
+    low: number;
+  };
+  recommendedAction?: ExportPatchPlanAction;
+  entries: ExportPatchPlanEntry[];
+}
+
+export interface DramaProjectArtifactPreferences {
+  relationshipDiagramCollapsed?: boolean;
+  diagramMode?: "simple" | "detailed";
+}
+
+export function createEmptyComplianceWorkspace(): ComplianceWorkspace {
+  return {
+    sourceText: "",
+    paletteText: "",
+    reviewMode: "text",
+    strictness: "standard",
+    model: "gemini-3.1-pro-preview",
+    tableSnapshot: null,
+    riskPhrases: [],
+    riskSpans: [],
+    phraseReplacements: {},
+    segments: [],
+    progress: null,
+    latestReview: null,
+    exportMeta: null,
+    history: [],
+    historyIndex: -1,
+    dialogueReviewEnabled: false,
+    dialogueOverLimitLineIndexes: [],
+    lastImportedFileName: null,
+    lastImportedAt: null,
+  };
 }
 
 export interface DramaProject {
@@ -362,7 +576,7 @@ export interface DramaProject {
   directoryRaw: string;
   episodes: EpisodeScript[];
   complianceReport: string;
-  currentStep: DramaStep;
+  currentStep: DramaStep | string;
   dramaTitle: string;
   createdAt: string;
   updatedAt: string;
@@ -372,12 +586,25 @@ export interface DramaProject {
   frameworkStyle?: string;
   structureTransform?: string;
   characterTransform?: string;
+  adaptationEpisodeCountConfirmed?: boolean;
+  adaptationTargetMarketConfirmed?: boolean;
+  adaptationGenresConfirmed?: boolean;
   exportDocument?: string;
   styleLock?: VideoStyleLock | null;
   worldModel?: VideoWorldModel | null;
   characterStateCards?: CharacterStateCard[];
   storyBeatPackets?: StoryBeatPacket[];
   complianceRevisionPackets?: ComplianceRevisionPacket[];
+  outlineBatchStatuses?: OutlineBatchStatus[];
+  episodeGenerationStatuses?: EpisodeGenerationStatus[];
+  preferredEpisodeDurationSeconds?: number | null;
+  complianceReviewMode?: ComplianceReviewMode;
+  complianceWorkspace?: ComplianceWorkspace;
+  complianceSkippedAt?: string | null;
+  episodeQualityReviewPackets?: EpisodeQualityReviewPacket[];
+  lastEpisodeQualityReviewBatch?: EpisodeQualityReviewBatch | null;
+  exportPatchPlan?: ExportPatchPlan | null;
+  artifactPreferences?: DramaProjectArtifactPreferences;
 }
 
 export function createEmptyDramaProject(mode: DramaMode = "traditional"): DramaProject {
@@ -400,11 +627,26 @@ export function createEmptyDramaProject(mode: DramaMode = "traditional"): DramaP
     frameworkStyle: "",
     structureTransform: "",
     characterTransform: "",
+    adaptationEpisodeCountConfirmed: false,
+    adaptationTargetMarketConfirmed: false,
+    adaptationGenresConfirmed: false,
     exportDocument: "",
     styleLock: null,
     worldModel: null,
     characterStateCards: [],
     storyBeatPackets: [],
     complianceRevisionPackets: [],
+    outlineBatchStatuses: [],
+    episodeGenerationStatuses: [],
+    preferredEpisodeDurationSeconds: null,
+    complianceReviewMode: "text",
+    complianceWorkspace: createEmptyComplianceWorkspace(),
+    complianceSkippedAt: null,
+    episodeQualityReviewPackets: [],
+    lastEpisodeQualityReviewBatch: null,
+    exportPatchPlan: null,
+    artifactPreferences: {
+      relationshipDiagramCollapsed: false,
+    },
   };
 }

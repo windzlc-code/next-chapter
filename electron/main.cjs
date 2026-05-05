@@ -223,29 +223,47 @@ function decodeSensitiveFields(config) {
 function applyBuiltinOverlay(config) {
   const normalizedConfig = normalizeStoredConfig(config);
   const builtin = getBuiltinApiBundle();
-  if (!builtin) return normalizedConfig;
+  if (!builtin) {
+    return {
+      ...normalizedConfig,
+      modelMappings: {
+        ...STATIC_ARK_VIDEO_MODEL_MAPPING_FALLBACKS,
+        ...normalizedConfig.modelMappings
+      }
+    };
+  }
   const builtinMappings = normalizeModelMappings(builtin.modelMappings);
   const g = (field) => typeof builtin[field] === "string" ? builtin[field].trim() : "";
-  const geminiEndpoint = g("geminiEndpoint");
-  const geminiKey = g("geminiKey");
+  const pick = (builtinField, configField) => {
+    const builtinValue = g(builtinField);
+    if (builtinValue) return builtinValue;
+    const configValue = normalizedConfig[configField];
+    return typeof configValue === "string" ? configValue.trim() : "";
+  };
+  const geminiEndpoint = pick("geminiEndpoint", "geminiEndpoint");
+  const geminiKey = pick("geminiKey", "geminiKey");
   return {
     ...normalizedConfig,
     geminiEndpoint,
     geminiKey,
-    gptEndpoint: g("gptEndpoint") || geminiEndpoint,
-    gptKey: g("gptKey") || geminiKey,
-    claudeEndpoint: g("claudeEndpoint") || geminiEndpoint,
-    claudeKey: g("claudeKey") || geminiKey,
-    grokEndpoint: g("grokEndpoint") || geminiEndpoint,
-    grokKey: g("grokKey") || geminiKey,
-    seedreamEndpoint: g("seedreamEndpoint") || geminiEndpoint,
-    seedreamKey: g("seedreamKey") || geminiKey,
-    jimengEndpoint: g("jimengEndpoint") || geminiEndpoint,
-    jimengKey: g("jimengKey") || geminiKey,
+    gptEndpoint: pick("gptEndpoint", "gptEndpoint") || geminiEndpoint,
+    gptKey: pick("gptKey", "gptKey") || geminiKey,
+    claudeEndpoint: pick("claudeEndpoint", "claudeEndpoint") || geminiEndpoint,
+    claudeKey: pick("claudeKey", "claudeKey") || geminiKey,
+    grokEndpoint: pick("grokEndpoint", "grokEndpoint") || geminiEndpoint,
+    grokKey: pick("grokKey", "grokKey") || geminiKey,
+    seedreamEndpoint: pick("seedreamEndpoint", "seedreamEndpoint") || geminiEndpoint,
+    seedreamKey: pick("seedreamKey", "seedreamKey") || geminiKey,
+    jimengEndpoint: pick("jimengEndpoint", "jimengEndpoint") || geminiEndpoint,
+    jimengKey: pick("jimengKey", "jimengKey") || geminiKey,
     jimengExecutionMode: normalizedConfig.jimengExecutionMode,
-    tuziEndpoint: g("tuziEndpoint"),
-    tuziKey: g("tuziKey"),
-    modelMappings: builtinMappings
+    tuziEndpoint: pick("tuziEndpoint", "tuziEndpoint"),
+    tuziKey: pick("tuziKey", "tuziKey"),
+    modelMappings: {
+      ...STATIC_ARK_VIDEO_MODEL_MAPPING_FALLBACKS,
+      ...normalizedConfig.modelMappings,
+      ...builtinMappings
+    }
   };
 }
 function resolveApiConfigForRuntime(config) {
@@ -258,12 +276,17 @@ function getApiConfig() {
     return applyBuiltinOverlay(DEFAULT_API_CONFIG);
   }
 }
-var import_meta, DEFAULT_NETWORK_RETRY_COUNT, DEFAULT_NETWORK_RETRY_DELAY_MS, STORAGE_KEY, OBF_PREFIX, builtinApiBundleCache, SENSITIVE_KEYS, DEFAULT_API_CONFIG;
+var import_meta, DEFAULT_NETWORK_RETRY_COUNT, DEFAULT_NETWORK_RETRY_DELAY_MS, STATIC_ARK_VIDEO_MODEL_MAPPING_FALLBACKS, STORAGE_KEY, OBF_PREFIX, builtinApiBundleCache, SENSITIVE_KEYS, DEFAULT_API_CONFIG;
 var init_api_config = __esm({
   "src/lib/api-config.ts"() {
     import_meta = {};
     DEFAULT_NETWORK_RETRY_COUNT = 1;
     DEFAULT_NETWORK_RETRY_DELAY_MS = 800;
+    STATIC_ARK_VIDEO_MODEL_MAPPING_FALLBACKS = {
+      "doubao-seedance-1-5-pro_480p": "ep-m-20260414192742-59w88",
+      "doubao-seedance-1-5-pro_720p": "ep-m-20260414192742-59w88",
+      "doubao-seedance-1-5-pro_1080p": "ep-m-20260414192742-59w88"
+    };
     STORAGE_KEY = "storyforge_api_config";
     OBF_PREFIX = "obf:";
     SENSITIVE_KEYS = [
@@ -329,7 +352,7 @@ function buildSystemBlocks(systemPrompt) {
 function buildToolsParam(tools) {
   return tools.map((t) => ({
     name: t.name,
-    description: t.searchHint ?? t.name,
+    description: t.searchHint || t.name,
     input_schema: t.inputSchema()
   }));
 }
@@ -392,7 +415,7 @@ function buildGeminiToolsParam(tools) {
   return [{
     functionDeclarations: tools.map((tool) => ({
       name: tool.name,
-      description: tool.searchHint ?? tool.name,
+      description: tool.searchHint || tool.name,
       parameters: tool.inputSchema()
     }))
   }];
@@ -403,7 +426,7 @@ function buildChatCompletionsToolsParam(tools) {
     type: "function",
     function: {
       name: tool.name,
-      description: tool.searchHint ?? tool.name,
+      description: tool.searchHint || tool.name,
       parameters: tool.inputSchema()
     }
   }));
@@ -413,6 +436,108 @@ function normalizeGeminiFunctionArgs(input) {
     return input;
   }
   return {};
+}
+function buildFileFallbackText(block) {
+  const summaryParts = [
+    `\u6587\u4EF6: ${block.fileName}`,
+    `MIME: ${block.mimeType}`,
+    ...typeof block.size === "number" ? [`\u5927\u5C0F: ${block.size} bytes`] : [],
+    ...block.extension ? [`\u6269\u5C55\u540D: ${block.extension}`] : []
+  ];
+  if (typeof block.extractedText === "string" && block.extractedText.trim()) {
+    summaryParts.push(`\u63D0\u53D6\u6587\u672C:
+${block.extractedText}`);
+  } else if (typeof block.fallbackDigest === "string" && block.fallbackDigest.trim()) {
+    summaryParts.push(`\u5143\u4FE1\u606F\u6458\u8981:
+${block.fallbackDigest}`);
+  }
+  return summaryParts.join("\n");
+}
+function buildMediaFallbackText(block) {
+  const label = block.type === "input_video" ? "\u89C6\u9891" : "\u56FE\u7247";
+  return [
+    `${label}: ${block.fileName || "\u672A\u547D\u540D\u9644\u4EF6"}`,
+    `MIME: ${block.mimeType}`,
+    ...block.type === "input_video" && block.fallbackText ? [block.fallbackText] : []
+  ].join("\n");
+}
+function mapAnthropicContentBlock(block) {
+  if (block.type === "text") {
+    return { type: "text", text: block.text };
+  }
+  if (block.type === "tool_use") {
+    return {
+      type: "tool_use",
+      id: block.id,
+      name: block.name,
+      input: block.input
+    };
+  }
+  if (block.type === "tool_result") {
+    return {
+      type: "tool_result",
+      tool_use_id: block.tool_use_id,
+      content: block.content,
+      is_error: block.is_error
+    };
+  }
+  if (block.type === "thinking") {
+    return {
+      type: "thinking",
+      thinking: block.thinking
+    };
+  }
+  if (block.type === "input_image" && block.base64) {
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: block.mimeType,
+        data: block.base64
+      }
+    };
+  }
+  if (block.type === "input_file" && block.base64) {
+    return {
+      type: "document",
+      source: {
+        type: "base64",
+        media_type: block.mimeType,
+        data: block.base64
+      },
+      title: block.fileName,
+      context: block.extractedText || block.fallbackDigest || ""
+    };
+  }
+  if (block.type === "input_video") {
+    return {
+      type: "text",
+      text: buildMediaFallbackText(block)
+    };
+  }
+  if (block.type === "input_file") {
+    return {
+      type: "text",
+      text: buildFileFallbackText(block)
+    };
+  }
+  if (block.type === "input_image") {
+    return {
+      type: "text",
+      text: buildMediaFallbackText(block)
+    };
+  }
+  return null;
+}
+function buildAnthropicMessages(messages) {
+  return messages.map((message) => {
+    if (typeof message.content === "string") return message;
+    const mappedBlocks = message.content.map((block) => mapAnthropicContentBlock(block)).filter((block) => Boolean(block));
+    return {
+      ...message,
+      content: mappedBlocks
+    };
+  });
 }
 function buildGeminiContents(messages) {
   const contents = [];
@@ -424,28 +549,68 @@ function buildGeminiContents(messages) {
       if (message.content.trim()) parts.push({ text: message.content });
     } else if (Array.isArray(message.content)) {
       for (const block of message.content) {
-        if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
-          parts.push({ text: block.text });
+        const normalizedBlock = block;
+        if (normalizedBlock.type === "text" && typeof normalizedBlock.text === "string" && normalizedBlock.text.trim()) {
+          parts.push({ text: normalizedBlock.text });
           continue;
         }
-        if (block.type === "tool_use" && message.role === "assistant") {
-          toolNamesById.set(block.id, block.name);
+        if (normalizedBlock.type === "input_image") {
+          if (normalizedBlock.base64) {
+            parts.push({
+              inlineData: {
+                mimeType: normalizedBlock.mimeType,
+                data: normalizedBlock.base64
+              }
+            });
+          } else {
+            parts.push({ text: buildMediaFallbackText(normalizedBlock) });
+          }
+          continue;
+        }
+        if (normalizedBlock.type === "input_video") {
+          if (normalizedBlock.base64) {
+            parts.push({
+              inlineData: {
+                mimeType: normalizedBlock.mimeType,
+                data: normalizedBlock.base64
+              }
+            });
+          }
+          if (!normalizedBlock.base64 || normalizedBlock.fallbackText) {
+            parts.push({ text: buildMediaFallbackText(normalizedBlock) });
+          }
+          continue;
+        }
+        if (normalizedBlock.type === "input_file") {
+          if (normalizedBlock.base64) {
+            parts.push({
+              inlineData: {
+                mimeType: normalizedBlock.mimeType,
+                data: normalizedBlock.base64
+              }
+            });
+          }
+          parts.push({ text: buildFileFallbackText(normalizedBlock) });
+          continue;
+        }
+        if (normalizedBlock.type === "tool_use" && message.role === "assistant") {
+          toolNamesById.set(normalizedBlock.id, normalizedBlock.name);
           parts.push({
             functionCall: {
-              name: block.name,
-              args: normalizeGeminiFunctionArgs(block.input)
+              name: normalizedBlock.name,
+              args: normalizeGeminiFunctionArgs(normalizedBlock.input)
             }
           });
           continue;
         }
-        if (block.type === "tool_result" && message.role === "user") {
-          const name = toolNamesById.get(block.tool_use_id) || "ToolResult";
+        if (normalizedBlock.type === "tool_result" && message.role === "user") {
+          const name = toolNamesById.get(normalizedBlock.tool_use_id) || "ToolResult";
           parts.push({
             functionResponse: {
               name,
               response: {
-                result: typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? ""),
-                is_error: Boolean(block.is_error)
+                result: typeof normalizedBlock.content === "string" ? normalizedBlock.content : JSON.stringify(normalizedBlock.content ?? ""),
+                is_error: Boolean(normalizedBlock.is_error)
               }
             }
           });
@@ -477,26 +642,35 @@ function buildChatCompletionsMessages(messages, systemPrompt) {
     const textParts = [];
     const toolCalls = [];
     for (const block of message.content) {
-      if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
-        textParts.push(block.text);
+      const normalizedBlock = block;
+      if (normalizedBlock.type === "text" && typeof normalizedBlock.text === "string" && normalizedBlock.text.trim()) {
+        textParts.push(normalizedBlock.text);
         continue;
       }
-      if (block.type === "tool_use" && message.role === "assistant") {
+      if (normalizedBlock.type === "input_image" || normalizedBlock.type === "input_video") {
+        textParts.push(buildMediaFallbackText(normalizedBlock));
+        continue;
+      }
+      if (normalizedBlock.type === "input_file") {
+        textParts.push(buildFileFallbackText(normalizedBlock));
+        continue;
+      }
+      if (normalizedBlock.type === "tool_use" && message.role === "assistant") {
         toolCalls.push({
-          id: block.id,
+          id: normalizedBlock.id,
           type: "function",
           function: {
-            name: block.name,
-            arguments: JSON.stringify(normalizeGeminiFunctionArgs(block.input))
+            name: normalizedBlock.name,
+            arguments: JSON.stringify(normalizeGeminiFunctionArgs(normalizedBlock.input))
           }
         });
         continue;
       }
-      if (block.type === "tool_result" && message.role === "user") {
+      if (normalizedBlock.type === "tool_result" && message.role === "user") {
         result.push({
           role: "tool",
-          tool_call_id: block.tool_use_id,
-          content: typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "")
+          tool_call_id: normalizedBlock.tool_use_id,
+          content: typeof normalizedBlock.content === "string" ? normalizedBlock.content : JSON.stringify(normalizedBlock.content ?? "")
         });
       }
     }
@@ -881,7 +1055,7 @@ async function callModelAPI(opts) {
   const requestParams = {
     model,
     max_tokens: effectiveMaxTokens,
-    messages,
+    messages: buildAnthropicMessages(messages),
     ...systemBlock ? { system: systemBlock } : {},
     ...toolsParam ? { tools: toolsParam } : {},
     ...thinkingConfig ? { thinking: thinkingConfig } : {}
@@ -963,7 +1137,7 @@ async function* callModelAPIStream(opts) {
     model,
     max_tokens: effectiveMaxTokens,
     stream: true,
-    messages,
+    messages: buildAnthropicMessages(messages),
     ...systemBlock ? { system: systemBlock } : {},
     ...toolsParam ? { tools: toolsParam } : {},
     ...thinkingConfig ? { thinking: thinkingConfig } : {}
@@ -1042,7 +1216,7 @@ async function* callModelAPIStream(opts) {
       return;
     }
     const msg = await callModelAPI(opts);
-    const text = msg.message.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+    const text = (Array.isArray(msg.message.content) ? msg.message.content : []).filter((b) => b.type === "text").map((b) => b.text).join("");
     if (text) yield { type: "delta", text };
     yield { type: "message", message: msg };
     return;
@@ -1390,17 +1564,20 @@ var init_query_engine = __esm({
       }
       buildToolProgressMessage(message) {
         const content = Array.isArray(message.message.content) ? message.message.content : [];
-        const toolNames = content.filter((block) => block.type === "tool_use").map((block) => block.name);
+        const toolUseBlocks = content.filter((block) => block.type === "tool_use");
+        const toolNames = toolUseBlocks.map((block) => block.name);
         if (toolNames.length === 0) return null;
         const firstTool = toolNames[0];
-        const contentLabel = firstTool === "HomeStudioWorkflow" ? "\u6B63\u5728\u6267\u884C\u5DE5\u4F5C\u6D41" : firstTool === "ask-user-question" ? "\u6B63\u5728\u6574\u7406\u4E0B\u4E00\u6B65\u9009\u9879" : toolNames.length > 1 ? "\u6B63\u5728\u8C03\u7528\u591A\u4E2A\u5DE5\u5177" : "\u6B63\u5728\u8C03\u7528\u5DE5\u5177";
+        const contentLabel = firstTool === "HomeStudioWorkflow" ? "\u6B63\u5728\u6267\u884C\u5DE5\u4F5C\u6D41" : firstTool === "AskUserQuestion" ? "\u6B63\u5728\u6574\u7406\u4E0B\u4E00\u6B65\u9009\u9879" : toolNames.length > 1 ? "\u6B63\u5728\u8C03\u7528\u591A\u4E2A\u5DE5\u5177" : "\u6B63\u5728\u8C03\u7528\u5DE5\u5177";
+        const askBlock = toolUseBlocks.find((b) => b.name === "AskUserQuestion");
         return {
           type: "progress",
           uuid: v4_default(),
           content: contentLabel,
           data: {
             stage: "tool_use",
-            toolNames
+            toolNames,
+            ...askBlock ? { askUserQuestionArgs: askBlock.input } : {}
           }
         };
       }
@@ -1420,7 +1597,7 @@ var init_query_engine = __esm({
           isMeta: opts.isMeta,
           message: {
             role: "user",
-            content: typeof prompt === "string" ? prompt : JSON.stringify(prompt)
+            content: prompt
           }
         };
         this.messages.push(userMsg);
@@ -7069,15 +7246,78 @@ var STARTUP_LOG_PATH = path.join(
 );
 var mainWindow = null;
 var tray = null;
+var INFINIO_USER_DATA = (() => {
+  const p = path.join(os.homedir(), "AppData", "Roaming", "InFinio");
+  try {
+    fs.mkdirSync(p, { recursive: true });
+    app.setPath("userData", p);
+  } catch {
+  }
+  return p;
+})();
+var GPU_DISABLE_FLAG = path.join(INFINIO_USER_DATA, ".disable-gpu");
+var GPU_DISABLED = fs.existsSync(GPU_DISABLE_FLAG);
 app.commandLine.appendSwitch("disable-http-cache");
+app.commandLine.appendSwitch("disable-gpu-shader-disk-cache");
+app.commandLine.appendSwitch("no-first-run");
+app.commandLine.appendSwitch("disable-background-networking");
+app.commandLine.appendSwitch("disable-sync");
+app.commandLine.appendSwitch("safebrowsing-disable-auto-update");
+if (GPU_DISABLED) {
+  app.commandLine.appendSwitch("disable-gpu");
+  app.commandLine.appendSwitch("use-gl", "swiftshader");
+  app.commandLine.appendSwitch("disable-gpu-compositing");
+  console.warn("[main] GPU \u5DF2\u7981\u7528\uFF0C\u4F7F\u7528\u8F6F\u4EF6\u6E32\u67D3\u6A21\u5F0F");
+}
 function getUserDataPath() {
   return app.getPath("userData");
 }
 function getDefaultFilesDir() {
+  const portableDir = process.env.PORTABLE_EXECUTABLE_DIR;
+  if (app.isPackaged && portableDir) {
+    return path.join(portableDir, "files");
+  }
   if (app.isPackaged) {
-    return path.join(path.dirname(process.execPath), "files");
+    return path.join(app.getPath("userData"), "files");
   }
   return path.join(__dirname, "..", "files");
+}
+function getBundledFilesDir() {
+  if (!app.isPackaged) return null;
+  return path.join(process.resourcesPath, "files");
+}
+function copyMissingFiles(sourceDir, targetDir) {
+  if (!fs.existsSync(sourceDir)) return;
+  const stat = fs.statSync(sourceDir);
+  if (!stat.isDirectory()) return;
+  fs.mkdirSync(targetDir, { recursive: true });
+  for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
+    const sourcePath = path.join(sourceDir, entry.name);
+    const targetPath = path.join(targetDir, entry.name);
+    if (entry.isDirectory()) {
+      copyMissingFiles(sourcePath, targetPath);
+      continue;
+    }
+    if (!entry.isFile() || fs.existsSync(targetPath)) continue;
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.copyFileSync(sourcePath, targetPath);
+  }
+}
+function seedRuntimeFilesDirFromBundle(filesDir) {
+  const bundledFilesDir = getBundledFilesDir();
+  if (!bundledFilesDir) return;
+  const markerPath = path.join(filesDir, ".seeded-from-bundle-v1");
+  if (fs.existsSync(markerPath)) return;
+  try {
+    const source = path.resolve(bundledFilesDir);
+    const target = path.resolve(filesDir);
+    if (source === target || !fs.existsSync(source)) return;
+    copyMissingFiles(source, target);
+    fs.writeFileSync(markerPath, (/* @__PURE__ */ new Date()).toISOString(), "utf8");
+    log("info", `seeded runtime files from bundled resources: ${source} -> ${target}`);
+  } catch (error) {
+    log("warn", `failed to seed bundled files: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 function log(level, msg) {
   const ts = (/* @__PURE__ */ new Date()).toISOString().slice(11, 23);
@@ -7129,6 +7369,18 @@ function setupIPC() {
     "runtime:verifyBuiltinApiAdminPassword",
     (_event, password) => verifyBuiltinApiAdminPassword(password)
   );
+  ipcMain.handle("runtime:getGpuMode", () => ({
+    softwareRendering: GPU_DISABLED,
+    flagPath: GPU_DISABLE_FLAG
+  }));
+  ipcMain.handle("runtime:resetGpuFlag", () => {
+    try {
+      if (fs.existsSync(GPU_DISABLE_FLAG)) fs.unlinkSync(GPU_DISABLE_FLAG);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
   ipcMain.handle("crash:getLogs", () => {
     const crashLogPath = path.join(getUserDataPath(), "crash-log.json");
     try {
@@ -7213,6 +7465,7 @@ function setupIPC() {
     const filesDir = getDefaultFilesDir();
     try {
       fs.mkdirSync(filesDir, { recursive: true });
+      seedRuntimeFilesDirFromBundle(filesDir);
     } catch {
     }
     const userData = app.getPath("userData");
@@ -7231,17 +7484,72 @@ function setupIPC() {
     return result.filePaths[0];
   });
   ipcMain.handle("storage:openFolder", (_event, folderPath) => {
-    shell.openPath(folderPath);
+    const normalizedPath = path.normalize(folderPath);
+    return shell.openPath(normalizedPath);
   });
   ipcMain.handle("storage:openPath", (_event, targetPath) => {
-    return shell.openPath(targetPath);
+    const normalizedPath = path.normalize(targetPath);
+    try {
+      const stat = fs.statSync(normalizedPath);
+      if (stat.isFile()) {
+        shell.showItemInFolder(normalizedPath);
+        return Promise.resolve("");
+      }
+    } catch {
+    }
+    return shell.openPath(normalizedPath);
   });
   ipcMain.handle(
     "storage:writeText",
     async (_event, { filePath, content }) => {
       try {
-        fs.mkdirSync(path.dirname(filePath), { recursive: true });
-        fs.writeFileSync(filePath, content, "utf8");
+        const normalizedPath = path.normalize(filePath);
+        fs.mkdirSync(path.dirname(normalizedPath), { recursive: true });
+        fs.writeFileSync(normalizedPath, content, "utf8");
+        return { ok: true };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error)
+        };
+      }
+    }
+  );
+  ipcMain.handle(
+    "storage:saveBinaryFile",
+    async (_event, params) => {
+      try {
+        const { dialog } = require("electron");
+        const result = await dialog.showSaveDialog(mainWindow, {
+          title: "\u4FDD\u5B58\u6587\u4EF6",
+          defaultPath: params.defaultFileName,
+          filters: Array.isArray(params.filters) ? params.filters : void 0
+        });
+        if (result.canceled || !result.filePath) {
+          return { ok: true, cancelled: true, filePath: null };
+        }
+        const normalizedPath = path.normalize(result.filePath);
+        fs.mkdirSync(path.dirname(normalizedPath), { recursive: true });
+        fs.writeFileSync(normalizedPath, Buffer.from(params.base64, "base64"));
+        return { ok: true, cancelled: false, filePath: normalizedPath };
+      } catch (error) {
+        return {
+          ok: false,
+          cancelled: false,
+          filePath: null,
+          error: error instanceof Error ? error.message : String(error)
+        };
+      }
+    }
+  );
+  ipcMain.handle(
+    "storage:copyFile",
+    async (_event, { sourcePath, destPath }) => {
+      try {
+        const normalizedSource = path.normalize(sourcePath);
+        const normalizedDest = path.normalize(destPath);
+        fs.mkdirSync(path.dirname(normalizedDest), { recursive: true });
+        fs.copyFileSync(normalizedSource, normalizedDest);
         return { ok: true };
       } catch (error) {
         return {
@@ -7255,13 +7563,14 @@ function setupIPC() {
     "storage:readText",
     async (_event, { filePath }) => {
       try {
-        if (!fs.existsSync(filePath)) {
+        const normalizedPath = path.normalize(filePath);
+        if (!fs.existsSync(normalizedPath)) {
           return { ok: true, exists: false, content: "" };
         }
         return {
           ok: true,
           exists: true,
-          content: fs.readFileSync(filePath, "utf8")
+          content: fs.readFileSync(normalizedPath, "utf8")
         };
       } catch (error) {
         return {
@@ -7292,6 +7601,108 @@ function setupIPC() {
           ok: false,
           error: error instanceof Error ? error.message : String(error)
         };
+      }
+    }
+  );
+  ipcMain.handle("storage:listDir", (_event, dirPath) => {
+    try {
+      const normalizedPath = path.normalize(dirPath);
+      if (!fs.existsSync(normalizedPath)) return { ok: true, entries: [] };
+      const entries = fs.readdirSync(normalizedPath, { withFileTypes: true }).map((e) => ({
+        name: e.name,
+        isDirectory: e.isDirectory()
+      }));
+      return { ok: true, entries };
+    } catch (error) {
+      return { ok: false, entries: [], error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+  ipcMain.handle("storage:deleteFile", (_event, filePath) => {
+    try {
+      const normalizedPath = path.normalize(filePath);
+      if (!fs.existsSync(normalizedPath)) return { ok: true };
+      fs.unlinkSync(normalizedPath);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+  ipcMain.handle("storage:deleteDir", (_event, dirPath) => {
+    try {
+      const normalizedPath = path.normalize(dirPath);
+      if (!fs.existsSync(normalizedPath)) return { ok: true };
+      fs.rmSync(normalizedPath, { recursive: true, force: true });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+  ipcMain.handle(
+    "storage:selectFile",
+    async (_event, { filters }) => {
+      const { dialog } = require("electron");
+      const result = await dialog.showOpenDialog(mainWindow, {
+        properties: ["openFile"],
+        filters: filters ?? []
+      });
+      if (result.canceled || result.filePaths.length === 0) return null;
+      return result.filePaths[0];
+    }
+  );
+  ipcMain.handle(
+    "storage:exportChatHistory",
+    async (_event, { sourceDir, destDir, sessionJson, fileName }) => {
+      try {
+        const normalizedDest = path.normalize(destDir);
+        const chatHistoryFilePath = path.join(normalizedDest, `${fileName}.json`);
+        fs.mkdirSync(normalizedDest, { recursive: true });
+        fs.writeFileSync(chatHistoryFilePath, sessionJson, "utf8");
+        const normalizedSource = typeof sourceDir === "string" && sourceDir.trim().length > 0 ? path.normalize(sourceDir) : "";
+        if (normalizedSource && fs.existsSync(normalizedSource)) {
+          const mediaDir = path.join(normalizedDest, "media");
+          fs.cpSync(normalizedSource, mediaDir, { recursive: true });
+        }
+        return { ok: true, destDir: normalizedDest, chatHistoryFilePath };
+      } catch (error) {
+        return {
+          ok: false,
+          reason: "write-failed",
+          destDir: "",
+          chatHistoryFilePath: "",
+          error: error instanceof Error ? error.message : String(error)
+        };
+      }
+    }
+  );
+  ipcMain.handle(
+    "storage:importChatHistory",
+    async (_event, { filePath, targetProjectDir }) => {
+      try {
+        const normalizedFilePath = path.normalize(filePath);
+        if (!fs.existsSync(normalizedFilePath)) {
+          return { ok: false, reason: "chat-history-missing", error: "chat-history.json \u6587\u4EF6\u4E0D\u5B58\u5728" };
+        }
+        const content = fs.readFileSync(normalizedFilePath, "utf8");
+        const normalizedDir = path.dirname(normalizedFilePath);
+        let importedMediaDir;
+        const mediaDir = path.join(normalizedDir, "media");
+        const normalizedTargetProjectDir = typeof targetProjectDir === "string" && targetProjectDir.trim() ? path.normalize(targetProjectDir) : "";
+        if (normalizedTargetProjectDir && fs.existsSync(mediaDir)) {
+          try {
+            fs.mkdirSync(normalizedTargetProjectDir, { recursive: true });
+            fs.cpSync(mediaDir, normalizedTargetProjectDir, { recursive: true, force: true });
+            importedMediaDir = normalizedTargetProjectDir;
+          } catch (error) {
+            return {
+              ok: false,
+              reason: "import-copy-failed",
+              error: error instanceof Error ? error.message : String(error)
+            };
+          }
+        }
+        return { ok: true, content, importedMediaDir };
+      } catch (error) {
+        return { ok: false, reason: "unknown", error: error instanceof Error ? error.message : String(error) };
       }
     }
   );
@@ -7493,6 +7904,24 @@ function setupIPC() {
   const { promisify } = require("node:util");
   const execAsync = promisify(exec);
   const execFileAsync = promisify(execFile);
+  async function resolveBinaryExecutable(binaryName) {
+    const executableName = process.platform === "win32" && !binaryName.toLowerCase().endsWith(".exe") ? `${binaryName}.exe` : binaryName;
+    const resourcesDir = app.isPackaged ? process.resourcesPath : path.resolve(__dirname, "..");
+    const vendorCandidate = path.join(resourcesDir, "vendor", "ffmpeg", executableName);
+    if (fs.existsSync(vendorCandidate)) return vendorCandidate;
+    const bundledDir = "C:\\Program Files\\ffmpeg\\bin";
+    const directCandidate = path.join(bundledDir, executableName);
+    if (fs.existsSync(directCandidate)) return directCandidate;
+    try {
+      const lookupCommand = process.platform === "win32" ? "where.exe" : "which";
+      const { stdout } = await execFileAsync(lookupCommand, [binaryName], {
+        windowsHide: true
+      });
+      return String(stdout).split(/\r?\n/).map((line) => line.trim()).find((line) => !!line && fs.existsSync(line)) || null;
+    } catch {
+      return null;
+    }
+  }
   async function resolveDreaminaExecutable() {
     for (const candidate of getDreaminaCandidatePaths()) {
       if (fs.existsSync(candidate)) return candidate;
@@ -7509,6 +7938,503 @@ function setupIPC() {
       return null;
     }
   }
+  ipcMain.handle(
+    "media:extractVideoFrames",
+    async (_event, {
+      filePath,
+      framePercents
+    }) => {
+      try {
+        const normalizedPath = path.normalize(String(filePath || ""));
+        if (!normalizedPath || !fs.existsSync(normalizedPath)) {
+          return { ok: false, error: `Video file not found: ${normalizedPath}` };
+        }
+        const ffmpegPath = await resolveBinaryExecutable("ffmpeg");
+        const ffprobePath = await resolveBinaryExecutable("ffprobe");
+        if (!ffmpegPath || !ffprobePath) {
+          return { ok: false, error: "ffmpeg or ffprobe is not available" };
+        }
+        const probe = await execFileAsync(
+          ffprobePath,
+          [
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            normalizedPath
+          ],
+          {
+            windowsHide: true
+          }
+        );
+        const duration = Number.parseFloat(String(probe.stdout || "").trim());
+        if (!Number.isFinite(duration) || duration <= 0) {
+          return { ok: false, error: "Failed to read video duration" };
+        }
+        const percents = Array.isArray(framePercents) && framePercents.length ? framePercents.filter((value) => typeof value === "number" && Number.isFinite(value)).map((value) => Math.min(100, Math.max(0, value))) : [0, 15, 30, 50, 70, 90];
+        const frameDir = path.join(
+          app.getPath("temp"),
+          "infinio-video-frames",
+          crypto.randomUUID()
+        );
+        fs.mkdirSync(frameDir, { recursive: true });
+        const framePaths = [];
+        for (let index = 0; index < percents.length; index += 1) {
+          const percent = percents[index] ?? 0;
+          const seconds = Math.max(
+            0,
+            Math.min(duration * (percent / 100), Math.max(duration - 0.1, 0))
+          );
+          const outputPath = path.join(frameDir, `frame-${index + 1}.jpg`);
+          await execFileAsync(
+            ffmpegPath,
+            [
+              "-hide_banner",
+              "-loglevel",
+              "error",
+              "-y",
+              "-ss",
+              seconds.toFixed(3),
+              "-i",
+              normalizedPath,
+              "-frames:v",
+              "1",
+              outputPath
+            ],
+            {
+              windowsHide: true
+            }
+          );
+          if (fs.existsSync(outputPath)) {
+            framePaths.push(outputPath);
+          }
+        }
+        if (!framePaths.length) {
+          return { ok: false, error: "No frames were extracted" };
+        }
+        return {
+          ok: true,
+          framePaths
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error)
+        };
+      }
+    }
+  );
+  ipcMain.handle(
+    "ffmpeg:concatSegments",
+    async (_event, {
+      inputPaths,
+      outputPath
+    }) => {
+      try {
+        const ffmpegBin = await resolveBinaryExecutable("ffmpeg");
+        if (!ffmpegBin) return { ok: false, error: "ffmpeg \u672A\u627E\u5230\uFF0C\u8BF7\u786E\u8BA4\u5DF2\u5B89\u88C5\u6216\u91CD\u65B0\u6253\u5305\u3002" };
+        const validPaths = inputPaths.map((p) => path.normalize(p)).filter((p) => fs.existsSync(p));
+        if (validPaths.length === 0) return { ok: false, error: "\u6CA1\u6709\u53EF\u7528\u7684\u8F93\u5165\u89C6\u9891\u6587\u4EF6\u3002" };
+        fs.mkdirSync(path.dirname(path.normalize(outputPath)), { recursive: true });
+        const listFile = path.join(app.getPath("temp"), `infinio-concat-${Date.now()}.txt`);
+        const listContent = validPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n");
+        fs.writeFileSync(listFile, listContent, "utf8");
+        await execFileAsync(
+          ffmpegBin,
+          ["-y", "-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", path.normalize(outputPath)],
+          { windowsHide: true }
+        );
+        try {
+          fs.unlinkSync(listFile);
+        } catch {
+        }
+        return { ok: true, outputPath: path.normalize(outputPath) };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+  );
+  ipcMain.handle(
+    "ffmpeg:burnSubtitles",
+    async (_event, {
+      inputPath,
+      outputPath,
+      subtitleEntries
+    }) => {
+      try {
+        const ffmpegBin = await resolveBinaryExecutable("ffmpeg");
+        if (!ffmpegBin) return { ok: false, error: "ffmpeg \u672A\u627E\u5230\u3002" };
+        const normalizedInput = path.normalize(inputPath);
+        if (!fs.existsSync(normalizedInput)) return { ok: false, error: `\u8F93\u5165\u6587\u4EF6\u4E0D\u5B58\u5728: ${normalizedInput}` };
+        fs.mkdirSync(path.dirname(path.normalize(outputPath)), { recursive: true });
+        const srtFile = path.join(app.getPath("temp"), `infinio-subs-${Date.now()}.srt`);
+        const toSrtTime = (ms) => {
+          const h = Math.floor(ms / 36e5);
+          const m = Math.floor(ms % 36e5 / 6e4);
+          const s = Math.floor(ms % 6e4 / 1e3);
+          const ms2 = ms % 1e3;
+          return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")},${String(ms2).padStart(3, "0")}`;
+        };
+        const srtContent = subtitleEntries.map(
+          (entry, i) => `${i + 1}
+${toSrtTime(entry.startMs)} --> ${toSrtTime(entry.endMs)}
+${entry.text}
+`
+        ).join("\n");
+        fs.writeFileSync(srtFile, srtContent, "utf8");
+        const escapedSrt = srtFile.replace(/\\/g, "/").replace(/:/g, "\\:");
+        await execFileAsync(
+          ffmpegBin,
+          ["-y", "-i", normalizedInput, "-vf", `subtitles='${escapedSrt}'`, "-c:a", "copy", path.normalize(outputPath)],
+          { windowsHide: true }
+        );
+        try {
+          fs.unlinkSync(srtFile);
+        } catch {
+        }
+        return { ok: true, outputPath: path.normalize(outputPath) };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+  );
+  function cleanSrtDialogue(srtContent) {
+    const parseMs = (ts) => {
+      const [h, m, rest] = ts.split(":");
+      const [s, ms] = rest.split(",");
+      return +h * 36e5 + +m * 6e4 + +s * 1e3 + +ms;
+    };
+    const fmtMs = (ms) => {
+      const h = Math.floor(ms / 36e5);
+      const m = Math.floor(ms % 36e5 / 6e4);
+      const s = Math.floor(ms % 6e4 / 1e3);
+      const r = ms % 1e3;
+      return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")},${String(r).padStart(3, "0")}`;
+    };
+    const blocks = srtContent.trim().split(/\n\n+/);
+    const entries = [];
+    for (const block of blocks) {
+      const lines = block.trim().split("\n");
+      if (lines.length < 3) continue;
+      const textLines = lines.slice(2).join("\n").trim();
+      if (/^[\s(（\[【♪♫]*[\)）\]】♪♫\s]*$/.test(textLines)) continue;
+      if (/^[\s(（\[【].*[\)）\]】]\s*$/.test(textLines)) continue;
+      if (textLines.replace(/[\s\p{P}]/gu, "").length < 1) continue;
+      const [startStr, endStr] = lines[1].split(" --> ");
+      entries.push({ startMs: parseMs(startStr.trim()), endMs: parseMs(endStr.trim()), text: textLines });
+    }
+    const deduped = [];
+    for (const entry of entries) {
+      const prev = deduped[deduped.length - 1];
+      if (prev && entry.startMs < prev.endMs) {
+        if (entry.text === prev.text || prev.text.includes(entry.text)) continue;
+      }
+      deduped.push(entry);
+    }
+    for (let i = 0; i < deduped.length - 1; i++) {
+      if (deduped[i].endMs > deduped[i + 1].startMs) {
+        deduped[i].endMs = deduped[i + 1].startMs;
+      }
+    }
+    return deduped.map((e, i) => `${i + 1}
+${fmtMs(e.startMs)} --> ${fmtMs(e.endMs)}
+${e.text}`).join("\n\n") + "\n";
+  }
+  ipcMain.handle(
+    "ffmpeg:smartConcat",
+    async (_event, {
+      inputPaths,
+      outputPath,
+      transitions,
+      addSubtitles,
+      subtitleEntries,
+      whisperModelPath,
+      language
+    }) => {
+      try {
+        const ffmpegBin = await resolveBinaryExecutable("ffmpeg");
+        if (!ffmpegBin) return { ok: false, error: "ffmpeg \u672A\u627E\u5230\u3002" };
+        const validPaths = inputPaths.map((p) => path.normalize(p)).filter((p) => fs.existsSync(p));
+        if (validPaths.length === 0) return { ok: false, error: "\u6CA1\u6709\u53EF\u7528\u7684\u8F93\u5165\u89C6\u9891\u6587\u4EF6\u3002" };
+        fs.mkdirSync(path.dirname(path.normalize(outputPath)), { recursive: true });
+        const tempDir = app.getPath("temp");
+        const ts = Date.now();
+        const ffprobeBin = await resolveBinaryExecutable("ffprobe");
+        const durations = [];
+        if (ffprobeBin) {
+          for (const vp of validPaths) {
+            try {
+              const { stdout } = await execFileAsync(
+                ffprobeBin,
+                ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", vp],
+                { windowsHide: true }
+              );
+              durations.push(parseFloat(stdout.trim()) || 5);
+            } catch {
+              durations.push(5);
+            }
+          }
+        } else {
+          validPaths.forEach(() => durations.push(5));
+        }
+        const concatOutput = path.join(tempDir, `infinio-smart-concat-${ts}.mp4`);
+        if (validPaths.length === 1) {
+          await execFileAsync(
+            ffmpegBin,
+            ["-y", "-i", validPaths[0], "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", concatOutput],
+            { windowsHide: true, maxBuffer: 100 * 1024 * 1024 }
+          );
+        } else {
+          const effectiveTransitions = transitions.slice(0, validPaths.length - 1);
+          while (effectiveTransitions.length < validPaths.length - 1) {
+            effectiveTransitions.push({ type: "fade", duration: 0.5 });
+          }
+          const inputArgs = [];
+          for (const vp of validPaths) {
+            inputArgs.push("-i", vp);
+          }
+          const offsets = [];
+          let cumulative = 0;
+          for (let i = 0; i < validPaths.length - 1; i++) {
+            cumulative += durations[i];
+            const xfadeDur = effectiveTransitions[i].duration;
+            offsets.push(Math.max(0, cumulative - xfadeDur));
+            cumulative -= xfadeDur;
+          }
+          let filterGraph = "";
+          let prevLabel = "[0:v]";
+          for (let i = 0; i < validPaths.length - 1; i++) {
+            const t = effectiveTransitions[i];
+            const outLabel = i === validPaths.length - 2 ? "[vout]" : `[v${i + 1}]`;
+            filterGraph += `${prevLabel}[${i + 1}:v]xfade=transition=${t.type}:duration=${t.duration}:offset=${offsets[i].toFixed(3)}${outLabel}`;
+            if (i < validPaths.length - 2) filterGraph += ";";
+            prevLabel = outLabel;
+          }
+          let audioFilter = "";
+          let prevALabel = "[0:a]";
+          for (let i = 0; i < validPaths.length - 1; i++) {
+            const t = effectiveTransitions[i];
+            const outALabel = i === validPaths.length - 2 ? "[aout]" : `[a${i + 1}]`;
+            audioFilter += `${prevALabel}[${i + 1}:a]acrossfade=d=${t.duration}${outALabel}`;
+            if (i < validPaths.length - 2) audioFilter += ";";
+            prevALabel = outALabel;
+          }
+          const fullFilter = audioFilter ? `${filterGraph};${audioFilter}` : filterGraph;
+          const mapArgs = audioFilter ? ["-map", "[vout]", "-map", "[aout]"] : ["-map", "[vout]", "-map", "0:a?"];
+          await execFileAsync(
+            ffmpegBin,
+            [
+              "-y",
+              ...inputArgs,
+              "-filter_complex",
+              fullFilter,
+              ...mapArgs,
+              "-c:v",
+              "libx264",
+              "-preset",
+              "fast",
+              "-crf",
+              "18",
+              "-pix_fmt",
+              "yuv420p",
+              "-c:a",
+              "aac",
+              "-b:a",
+              "192k",
+              concatOutput
+            ],
+            { windowsHide: true, maxBuffer: 100 * 1024 * 1024 }
+          );
+        }
+        if (!fs.existsSync(concatOutput)) {
+          return { ok: false, error: "\u89C6\u9891\u62FC\u63A5\u5931\u8D25\uFF0C\u8F93\u51FA\u6587\u4EF6\u672A\u751F\u6210\u3002" };
+        }
+        let finalOutput = path.normalize(outputPath);
+        const burnSrt = async (srtEntries) => {
+          const toSrtTime = (ms) => {
+            const h = Math.floor(ms / 36e5), m = Math.floor(ms % 36e5 / 6e4);
+            const s = Math.floor(ms % 6e4 / 1e3), r = ms % 1e3;
+            return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")},${String(r).padStart(3, "0")}`;
+          };
+          const srtContent = srtEntries.map((e, i) => `${i + 1}
+${toSrtTime(e.startMs)} --> ${toSrtTime(e.endMs)}
+${e.text}`).join("\n\n") + "\n";
+          const srtFile = path.join(tempDir, `infinio-subs-${ts}.srt`);
+          fs.writeFileSync(srtFile, srtContent, "utf8");
+          const subtitledOutput = path.join(tempDir, `infinio-subtitled-${ts}.mp4`);
+          const escapedSrt = srtFile.replace(/\\/g, "/").replace(/:/g, "\\:");
+          await execFileAsync(
+            ffmpegBin,
+            [
+              "-y",
+              "-i",
+              concatOutput,
+              "-vf",
+              `subtitles='${escapedSrt}':force_style='FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=1,Shadow=1,Alignment=2'`,
+              "-c:v",
+              "libx264",
+              "-preset",
+              "fast",
+              "-crf",
+              "18",
+              "-pix_fmt",
+              "yuv420p",
+              "-c:a",
+              "copy",
+              subtitledOutput
+            ],
+            { windowsHide: true, maxBuffer: 100 * 1024 * 1024 }
+          );
+          try {
+            fs.unlinkSync(srtFile);
+          } catch {
+          }
+          return subtitledOutput;
+        };
+        if (addSubtitles) {
+          const resourcesDir = app.isPackaged ? process.resourcesPath : path.resolve(__dirname, "..");
+          const resolvedModelPath = whisperModelPath ? path.normalize(whisperModelPath) : path.join(resourcesDir, "vendor", "ffmpeg", "ggml-small-q5_1.bin");
+          if (!fs.existsSync(resolvedModelPath)) {
+            fs.copyFileSync(concatOutput, finalOutput);
+            try {
+              fs.unlinkSync(concatOutput);
+            } catch {
+            }
+            return { ok: true, outputPath: finalOutput, subtitleWarning: `whisper \u6A21\u578B\u672A\u627E\u5230\uFF08${resolvedModelPath}\uFF09\uFF0C\u5DF2\u8F93\u51FA\u65E0\u5B57\u5E55\u7248\u672C\u3002` };
+          }
+          const modelBasename = `ggml-model-${ts}.bin`;
+          const modelInTemp = path.join(tempDir, modelBasename);
+          const jsonBasename = `infinio-whisper-${ts}.json`;
+          const jsonOutput = path.join(tempDir, jsonBasename);
+          fs.copyFileSync(resolvedModelPath, modelInTemp);
+          try {
+            await execFileAsync(
+              ffmpegBin,
+              [
+                "-y",
+                "-i",
+                concatOutput,
+                "-af",
+                `whisper=model=${modelBasename}:language=${language || "zh"}:format=json:destination=${jsonBasename}:max_len=15:queue=1`,
+                "-f",
+                "null",
+                "-"
+              ],
+              { windowsHide: true, maxBuffer: 100 * 1024 * 1024, timeout: 3e5, cwd: tempDir }
+            );
+          } catch {
+          }
+          try {
+            fs.unlinkSync(modelInTemp);
+          } catch {
+          }
+          let srtEntries = [];
+          if (fs.existsSync(jsonOutput)) {
+            const jsonLines = fs.readFileSync(jsonOutput, "utf8");
+            try {
+              fs.unlinkSync(jsonOutput);
+            } catch {
+            }
+            const raw = jsonLines.trim().split("\n").map((l) => {
+              try {
+                return JSON.parse(l.trim());
+              } catch {
+                return null;
+              }
+            }).filter((e) => !!e);
+            let entries = raw.filter((e) => {
+              const t = e.text.trim();
+              if (/^[\s(（\[【♪♫]*[\)）\]】♪♫\s]*$/.test(t)) return false;
+              if (/^[\s(（\[【].*[\)）\]】]\s*$/.test(t)) return false;
+              if (t.replace(/[\s\p{P}]/gu, "").length < 1) return false;
+              return true;
+            });
+            entries = entries.filter((e, i) => {
+              const selfDur = e.end - e.start;
+              return !entries.some((other, j) => {
+                if (j === i || other.text !== e.text) return false;
+                const overlap = Math.max(0, Math.min(e.end, other.end) - Math.max(e.start, other.start));
+                return overlap / selfDur >= 0.95 && other.end - other.start > selfDur;
+              });
+            });
+            const merged = [];
+            for (const e of entries) {
+              const prev = merged[merged.length - 1];
+              if (prev && e.text === prev.text && e.start - prev.end < 200) {
+                prev.end = Math.max(prev.end, e.end);
+                continue;
+              }
+              merged.push({ ...e });
+            }
+            for (let i = 0; i < merged.length - 1; i++) {
+              if (merged[i].end > merged[i + 1].start) merged[i].end = merged[i + 1].start;
+            }
+            const textFreq = /* @__PURE__ */ new Map();
+            for (const e of merged) textFreq.set(e.text.trim(), (textFreq.get(e.text.trim()) ?? 0) + 1);
+            const deHallucinated = merged.filter((e) => {
+              const key = e.text.trim();
+              const charLen = key.replace(/\s/g, "").length;
+              return charLen <= 3 || (textFreq.get(key) ?? 0) < 3;
+            });
+            const deRepeat = deHallucinated.filter((e) => {
+              const t = e.text.trim();
+              const parts = t.split(/[,，。.、；;]/).map((p) => p.trim()).filter(Boolean);
+              if (parts.length >= 2 && parts[0] === parts[1]) return false;
+              const clean = t.replace(/[,，。.、；;\s]/g, "");
+              const half = Math.floor(clean.length / 2);
+              if (half >= 3 && clean.slice(0, half) === clean.slice(half)) return false;
+              return true;
+            });
+            srtEntries = deRepeat.map((e) => ({ startMs: e.start, endMs: e.end, text: e.text }));
+          }
+          if (srtEntries.length > 0) {
+            try {
+              const subtitledOutput = await burnSrt(srtEntries);
+              if (fs.existsSync(subtitledOutput)) {
+                fs.copyFileSync(subtitledOutput, finalOutput);
+                try {
+                  fs.unlinkSync(subtitledOutput);
+                } catch {
+                }
+              } else {
+                fs.copyFileSync(concatOutput, finalOutput);
+              }
+            } catch {
+              fs.copyFileSync(concatOutput, finalOutput);
+            }
+          } else {
+            fs.copyFileSync(concatOutput, finalOutput);
+          }
+        } else if (subtitleEntries && subtitleEntries.length > 0) {
+          try {
+            const subtitledOutput = await burnSrt(subtitleEntries.map((e) => ({ startMs: e.startMs, endMs: e.endMs, text: e.text })));
+            if (fs.existsSync(subtitledOutput)) {
+              fs.copyFileSync(subtitledOutput, finalOutput);
+              try {
+                fs.unlinkSync(subtitledOutput);
+              } catch {
+              }
+            } else {
+              fs.copyFileSync(concatOutput, finalOutput);
+            }
+          } catch {
+            fs.copyFileSync(concatOutput, finalOutput);
+          }
+        } else {
+          fs.copyFileSync(concatOutput, finalOutput);
+        }
+        try {
+          fs.unlinkSync(concatOutput);
+        } catch {
+        }
+        return { ok: true, outputPath: finalOutput };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+  );
   ipcMain.handle(
     "tool:execute",
     async (_event, { toolName, args }) => {
@@ -7757,6 +8683,16 @@ async function prepareWindowSession(win) {
   } catch (error) {
     log("warn", `failed to clear cache storage: ${error instanceof Error ? error.message : String(error)}`);
   }
+  win.webContents.session.webRequest.onHeadersReceived((details, callback) => {
+    const headers = { ...details.responseHeaders };
+    if (!headers["access-control-allow-origin"] && !headers["Access-Control-Allow-Origin"]) {
+      headers["Access-Control-Allow-Origin"] = ["*"];
+      headers["Access-Control-Allow-Methods"] = ["GET, HEAD, OPTIONS"];
+      headers["Access-Control-Allow-Headers"] = ["*"];
+    }
+    callback({ responseHeaders: headers });
+  });
+  log("info", "CORS headers injection configured");
 }
 async function createWindow() {
   log("info", "createWindow start");
@@ -7770,7 +8706,12 @@ async function createWindow() {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      webSecurity: false,
+      spellcheck: false,
+      // 低配优化：禁用拼写检查
+      backgroundThrottling: true
+      // 后台节流，减少低配机器资源占用
     },
     show: false,
     title: "InFinio-\u4E00\u7AD9\u5F0F\u667A\u80FD\u4F53\u81EA\u52A8\u5316\u5E73\u53F0"
@@ -7849,6 +8790,14 @@ function createTray() {
 }
 app.whenReady().then(async () => {
   log("info", "========== Electron \u4E3B\u8FDB\u7A0B\u542F\u52A8 ==========");
+  log("info", `\u6E32\u67D3\u6A21\u5F0F: ${GPU_DISABLED ? "\u8F6F\u4EF6\u6E32\u67D3(SwiftShader)" : "\u786C\u4EF6\u52A0\u901F"}`);
+  app.on("gpu-process-crashed", (_event, killed) => {
+    log("warn", `GPU \u8FDB\u7A0B\u5D29\u6E83 killed=${killed}\uFF0C\u4E0B\u6B21\u542F\u52A8\u5C06\u81EA\u52A8\u5207\u6362\u8F6F\u4EF6\u6E32\u67D3`);
+    try {
+      fs.writeFileSync(GPU_DISABLE_FLAG, "1");
+    } catch {
+    }
+  });
   setupIPC();
   await createWindow();
   createTray();

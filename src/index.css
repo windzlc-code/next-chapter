@@ -4,6 +4,23 @@
 @tailwind components;
 @tailwind utilities;
 
+/* 生成中卡片扫光动画 */
+@keyframes shimmer-sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(250%); }
+}
+@keyframes dot-pulse {
+  0%, 80%, 100% { transform: scale(0.55); opacity: 0.35; }
+  40%            { transform: scale(1);    opacity: 1;    }
+}
+.animate-shimmer-sweep {
+  will-change: transform;
+  animation: shimmer-sweep 1.8s ease-in-out infinite;
+}
+.animate-dot-pulse-0 { animation: dot-pulse 1.4s ease-in-out 0ms    infinite; }
+.animate-dot-pulse-1 { animation: dot-pulse 1.4s ease-in-out 160ms  infinite; }
+.animate-dot-pulse-2 { animation: dot-pulse 1.4s ease-in-out 320ms  infinite; }
+
 @layer base {
   :root {
     --background: 220 20% 97%;
@@ -51,13 +68,13 @@
   }
 
   .dark {
-    --background: 225 20% 7%;
+    --background: 240 3% 8%;
     --foreground: 210 40% 96%;
 
-    --card: 225 20% 11%;
+    --card: 220 12% 11%;
     --card-foreground: 210 40% 96%;
 
-    --popover: 225 20% 11%;
+    --popover: 220 12% 11%;
     --popover-foreground: 210 40% 96%;
 
     --primary: 250 85% 68%;
@@ -66,26 +83,26 @@
     --secondary: 225 18% 16%;
     --secondary-foreground: 210 30% 90%;
 
-    --muted: 225 18% 14%;
-    --muted-foreground: 220 15% 62%;
+    --muted: 225 15% 14%;
+    --muted-foreground: 220 12% 58%;
 
-    --accent: 170 70% 50%;
-    --accent-foreground: 0 0% 100%;
+    --accent: 225 15% 18%;
+    --accent-foreground: 210 40% 96%;
 
     --destructive: 0 70% 45%;
     --destructive-foreground: 0 0% 100%;
 
-    --border: 225 15% 20%;
-    --input: 225 15% 20%;
+    --border: 225 12% 18%;
+    --input: 225 12% 18%;
     --ring: 250 85% 68%;
 
-    --sidebar-background: 225 20% 9%;
+    --sidebar-background: 225 9% 9%;
     --sidebar-foreground: 210 30% 90%;
     --sidebar-primary: 250 85% 68%;
     --sidebar-primary-foreground: 0 0% 100%;
-    --sidebar-accent: 225 18% 14%;
+    --sidebar-accent: 225 15% 14%;
     --sidebar-accent-foreground: 210 30% 90%;
-    --sidebar-border: 225 15% 20%;
+    --sidebar-border: 225 12% 18%;
     --sidebar-ring: 250 85% 68%;
   }
 }
@@ -133,9 +150,37 @@
     display: none;
   }
 
+  /* 主页聊天区域右侧可视滚动条 */
+  .app-main-scrollbar {
+    scrollbar-width: auto;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.35) transparent;
+    overflow-anchor: none; /* 禁止浏览器在内容高度变化时自动调整滚动位置，防止抖动 */
+  }
+
+  .app-main-scrollbar::-webkit-scrollbar {
+    width: 10px;
+  }
+
+  .app-main-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .app-main-scrollbar::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--muted-foreground) / 0.35);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+    transition: background-color 0.2s;
+  }
+
+  .app-main-scrollbar::-webkit-scrollbar-thumb:hover {
+    background-color: hsl(var(--muted-foreground) / 0.6);
+  }
+
   .shimmer-progress > [data-state] > [data-state] {
     position: relative;
     overflow: hidden;
+    will-change: transform;
   }
   .shimmer-progress > [data-state] > [data-state]::after {
     content: '';
@@ -164,11 +209,12 @@
     background: hsl(var(--accent)) !important;
   }
   .progress-celebrate > [data-state] > [data-state] {
+    will-change: opacity, filter;
     animation: celebrate-flash 0.4s ease-in-out 3;
   }
   @keyframes celebrate-flash {
-    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 hsl(var(--accent) / 0); }
-    50% { opacity: 0.85; box-shadow: 0 0 12px 4px hsl(var(--accent) / 0.5); }
+    0%, 100% { opacity: 1; filter: brightness(1); }
+    50% { opacity: 0.85; filter: brightness(1.4) drop-shadow(0 0 6px hsl(var(--accent) / 0.6)); }
   }
 
   /* Home agent: icon breathing only (opacity + scale, no shadow filter). */
@@ -176,6 +222,29 @@
     transform-origin: center;
     will-change: transform, opacity;
     animation: home-agent-ai-avatar-breath 2s ease-in-out infinite;
+  }
+
+  /* Composer shell: theme-aware background */
+  .composer-shell-idle {
+    overflow: hidden;
+    border-radius: 30px;
+    background: hsl(var(--card) / 0.97);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.14);
+  }
+  .composer-shell-active {
+    overflow: hidden;
+    border-radius: 28px;
+    background: hsl(var(--card) / 0.97);
+  }
+
+  /* Composer dock fade: theme-aware gradient */
+  .composer-dock-fade {
+    background: linear-gradient(
+      180deg,
+      hsl(var(--background) / 0) 0%,
+      hsl(var(--background) / 0.92) 38%,
+      hsl(var(--background) / 0.98) 100%
+    );
   }
   @keyframes home-agent-ai-avatar-breath {
     0%,
@@ -188,4 +257,55 @@
       transform: scale(1.06);
     }
   }
+}
+
+/* ─── Light mode: override hardcoded dark colors in main app ─── */
+:root:not(.dark) [data-home-desktop-sidebar="true"] .text-slate-100,
+:root:not(.dark) [data-home-desktop-sidebar="true"] .text-slate-200,
+:root:not(.dark) [data-home-desktop-sidebar="true"] .text-white {
+  color: hsl(var(--foreground)) !important;
+}
+:root:not(.dark) [data-home-desktop-sidebar="true"] .text-slate-300 {
+  color: hsl(220 15% 30%) !important;
+}
+:root:not(.dark) [data-home-desktop-sidebar="true"] .text-slate-400,
+:root:not(.dark) [data-home-desktop-sidebar="true"] .text-slate-500,
+:root:not(.dark) [data-home-desktop-sidebar="true"] .text-slate-600 {
+  color: hsl(var(--muted-foreground)) !important;
+}
+:root:not(.dark) [data-home-desktop-sidebar="true"] .bg-\[\#141518\],
+:root:not(.dark) [data-home-desktop-sidebar="true"] .bg-\[\#14171c\]\/96 {
+  background-color: hsl(var(--background)) !important;
+}
+:root:not(.dark) [data-home-desktop-sidebar="true"] .border-white\/\[0\.06\],
+:root:not(.dark) [data-home-desktop-sidebar="true"] .border-white\/\[0\.08\],
+:root:not(.dark) [data-home-desktop-sidebar="true"] .border-white\/\[0\.1\] {
+  border-color: hsl(var(--border)) !important;
+}
+:root:not(.dark) [data-home-desktop-sidebar="true"] .hover\:bg-white\/\[0\.04\]:hover,
+:root:not(.dark) [data-home-desktop-sidebar="true"] .hover\:bg-white\/\[0\.05\]:hover {
+  background-color: hsl(var(--accent)) !important;
+}
+:root:not(.dark) [data-home-desktop-sidebar="true"] .bg-white\/\[0\.05\],
+:root:not(.dark) [data-home-desktop-sidebar="true"] .bg-white\/\[0\.04\],
+:root:not(.dark) [data-home-desktop-sidebar="true"] .bg-white\/\[0\.03\] {
+  background-color: hsl(var(--muted)) !important;
+}
+:root:not(.dark) [data-home-desktop-sidebar="true"] .bg-\[\#7c92ff\]\/14 {
+  background-color: hsl(250 85% 60% / 0.12) !important;
+}
+:root:not(.dark) [data-home-desktop-sidebar="true"] .ring-\[\#7c92ff\]\/30 {
+  --tw-ring-color: hsl(250 85% 60% / 0.3) !important;
+}
+
+/* Light mode: main app container text */
+:root:not(.dark) .app-main-container {
+  color: hsl(var(--foreground));
+}
+
+/* Light mode: dropdown menus */
+:root:not(.dark) .bg-\[\#14171c\]\/96 {
+  background-color: hsl(var(--popover)) !important;
+  color: hsl(var(--popover-foreground)) !important;
+  border-color: hsl(var(--border)) !important;
 }

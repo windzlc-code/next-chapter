@@ -21,6 +21,7 @@
     "test:watch": "vitest",
     "electron:sync-icon": "powershell -ExecutionPolicy Bypass -File scripts/sync-electron-icon.ps1",
     "electron:dev": "npm run electron:sync-icon && node electron/build.mjs && concurrently \"npm run dev\" \"node electron/dev-launch.cjs\"",
+    "electron:build:dir": "npm run build && npm run electron:sync-icon && node electron/build.mjs && electron-builder --config electron-builder.yml --dir",
     "electron:build": "npm run build && npm run electron:sync-icon && node electron/build.mjs && electron-builder --config electron-builder.yml",
     "electron:preview": "npm run build && npm run electron:sync-icon && node electron/build.mjs && node electron/preview-launch.cjs"
   },

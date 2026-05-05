@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { Fragment, createElement } from "react";
+import { Fragment, createElement, type ReactNode } from "react";
 import { vi } from "vitest";
 
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", {
@@ -26,7 +26,7 @@ const MOTION_PROPS = new Set([
 ]);
 
 function createMotionTag(tag: string) {
-  return ({ children, ...props }: Record<string, unknown>) => {
+  return ({ children, ...props }: Record<string, unknown> & { children?: ReactNode }) => {
     const filteredProps = Object.fromEntries(
       Object.entries(props).filter(([key]) => !MOTION_PROPS.has(key)),
     );
@@ -35,8 +35,8 @@ function createMotionTag(tag: string) {
 }
 
 vi.mock("framer-motion", () => ({
-  AnimatePresence: ({ children }: { children?: unknown }) => createElement(Fragment, null, children),
-  LayoutGroup: ({ children }: { children?: unknown }) => createElement(Fragment, null, children),
+  AnimatePresence: ({ children }: { children?: ReactNode }) => createElement(Fragment, null, children),
+  LayoutGroup: ({ children }: { children?: ReactNode }) => createElement(Fragment, null, children),
   motion: new Proxy(
     {},
     {

@@ -1,4 +1,6 @@
 import { clearStudioSession } from "@/lib/home-agent/session-store";
+import type { ChatAttachment } from "@/lib/agent/chat-attachments";
+import type { MessageInput } from "@/lib/agent/types";
 import {
   advanceOriginalScriptKickoff,
   buildOriginalScriptKickoffPrompt,
@@ -6,6 +8,18 @@ import {
   type OriginalScriptKickoffCompletion,
   isOriginalScriptKickoffGenreQuestion,
 } from "@/lib/home-agent/original-script-kickoff";
+import {
+  advanceAdaptationWorkflowKickoff,
+  buildAdaptationWorkflowStartPrompt,
+  isAdaptationWorkflowKickoffRequest,
+  type AdaptationWorkflowKickoffCompletion,
+} from "@/lib/home-agent/adaptation-workflow-kickoff";
+import {
+  advanceVideoWorkflowKickoff,
+  buildVideoWorkflowStartPrompt,
+  isVideoWorkflowKickoffRequest,
+  type VideoWorkflowKickoffCompletion,
+} from "@/lib/home-agent/video-workflow-kickoff";
 import { advanceStructuredAnswer, buildResetRuntimeState } from "./home-agent-conversation-state";
 import { serializeQuestionAnswers } from "./home-agent-session-utils";
 import type {
@@ -19,34 +33,42 @@ import type {
 type PushMessage = (role: HomeAgentMessage["role"], content: string) => void;
 
 export function resetHomeAgentConversation(params: {
+  activeProjectId?: string;
   qState: StudioQuestionState | null;
   rejectQuestion: (requestId: string) => void;
   interruptEngine: () => void;
   clearSurfacedTasks: () => void;
   setQState: (value: StudioQuestionState | null) => void;
+  setDeferredQuestionState: (value: StudioQuestionState | null) => void;
   setPopoverOverride: (value: ComposerQuestion | null) => void;
   setSuggested: (value: ComposerQuestion | null) => void;
   setSelectedValues: (value: string[]) => void;
+  setDeferredSelectedValues: (value: string[]) => void;
   setMode: (value: "idle") => void;
   setMessages: (value: HomeAgentMessage[]) => void;
   resetComposerDraft: (value?: string) => void;
+  setDeferredDraft: (value: string) => void;
   setCompactedMessageCount: (value: number) => void;
   setActiveProjectId: (value: string | undefined) => void;
   resetRuntime: () => void;
   setMetaReady: (value: boolean) => void;
 }) {
   const {
+    activeProjectId,
     qState,
     rejectQuestion,
     interruptEngine,
     clearSurfacedTasks,
     setQState,
+    setDeferredQuestionState,
     setPopoverOverride,
     setSuggested,
     setSelectedValues,
+    setDeferredSelectedValues,
     setMode,
     setMessages,
     resetComposerDraft,
+    setDeferredDraft,
     setCompactedMessageCount,
     setActiveProjectId,
     resetRuntime,
@@ -60,16 +82,22 @@ export function resetHomeAgentConversation(params: {
   interruptEngine();
   clearSurfacedTasks();
   setQState(null);
+  setDeferredQuestionState(null);
   setPopoverOverride(null);
   setSuggested(null);
   setSelectedValues([]);
+  setDeferredSelectedValues([]);
   setMode("idle");
   setMessages([]);
   resetComposerDraft("");
+  setDeferredDraft("");
   setCompactedMessageCount(0);
   setActiveProjectId(undefined);
   resetRuntime();
   setMetaReady(false);
+  // 注意：此处只清除全局会话缓存，不删除项目级别的持久化会话。
+  // removeProjectStudioSession 语义是"用户主动清除历史"，新建项目时不应调用，
+  // 否则切回旧项目时历史记录和媒体文件路径会丢失，只剩"已恢复项目"欢迎语。
   clearStudioSession();
 }
 
@@ -79,10 +107,20 @@ export function answerHomeAgentQuestion(params: {
   label?: string;
   qStepKey: (index: number, question: { header?: string }) => string;
   setSuggested: (value: ComposerQuestion | null) => void;
-  send: (value: string, shown?: string) => Promise<void>;
+  send: (
+    value: MessageInput,
+    shown?: string,
+    opts?: {
+      skipUserBubble?: boolean;
+      attachments?: ChatAttachment[];
+      disableAutoResearch?: boolean;
+    },
+  ) => Promise<void>;
   push: PushMessage;
   resolveQuestion: (requestId: string, output: string) => boolean | Promise<boolean>;
   completeOriginalScriptKickoff?: (completion: OriginalScriptKickoffCompletion) => void | Promise<void>;
+  completeAdaptationWorkflowKickoff?: (completion: AdaptationWorkflowKickoffCompletion) => void | Promise<void>;
+  completeVideoWorkflowKickoff?: (completion: VideoWorkflowKickoffCompletion) => void | Promise<void>;
   setQState: (value: StudioQuestionState | null) => void;
   setSelectedValues: (value: string[]) => void;
   resetComposerDraft: (value?: string) => void;
@@ -97,6 +135,8 @@ export function answerHomeAgentQuestion(params: {
     push,
     resolveQuestion,
     completeOriginalScriptKickoff,
+    completeAdaptationWorkflowKickoff,
+    completeVideoWorkflowKickoff,
     setQState,
     setSelectedValues,
     resetComposerDraft,
@@ -113,6 +153,30 @@ export function answerHomeAgentQuestion(params: {
     setQState(null);
     setSelectedValues([]);
     resetComposerDraft("");
+    return;
+  }
+
+  if (isVideoWorkflowKickoffRequest(qState.request)) {
+    const completion = advanceVideoWorkflowKickoff({ value, label });
+    if (!completion) return;
+    setQState(null);
+    setSelectedValues([]);
+    resetComposerDraft("");
+    void Promise.resolve(completeVideoWorkflowKickoff?.(completion)).catch(() => {
+      void send(buildVideoWorkflowStartPrompt(completion.source), completion.userBubble);
+    });
+    return;
+  }
+
+  if (isAdaptationWorkflowKickoffRequest(qState.request)) {
+    const completion = advanceAdaptationWorkflowKickoff({ value, label });
+    if (!completion) return;
+    setQState(null);
+    setSelectedValues([]);
+    resetComposerDraft("");
+    void Promise.resolve(completeAdaptationWorkflowKickoff?.(completion)).catch(() => {
+      void send(buildAdaptationWorkflowStartPrompt(), completion.userBubble);
+    });
     return;
   }
 
@@ -164,7 +228,7 @@ export function answerHomeAgentQuestion(params: {
     setSelectedValues([]);
     resetComposerDraft("");
 
-    if (qState.source === "restored") {
+    if (qState.source === "restored" || qState.source === "deferred") {
       void send(promptForSend, transition.userBubble);
       return;
     }
@@ -240,6 +304,10 @@ export function resetRuntimeState(setRuntime: React.Dispatch<React.SetStateActio
   setRuntime((prev) => buildResetRuntimeState(prev));
 }
 
+function isVideoWorkflowChoice(question: ComposerQuestion | null, value: string): boolean {
+  return value.startsWith("video:") || Boolean(question?.answerKey?.startsWith("video-"));
+}
+
 export function handleHomeAgentChoiceSelection(params: {
   snapshot: ConversationProjectSnapshot | null;
   value: string;
@@ -249,11 +317,10 @@ export function handleHomeAgentChoiceSelection(params: {
   answer: (value: string, label?: string) => void;
   setSelectedValues: React.Dispatch<React.SetStateAction<string[]>>;
   videoProjectChoiceHandler: (snapshot: ConversationProjectSnapshot, value: string, label: string) => boolean;
-  videoReviewChoiceHandler: (snapshot: ConversationProjectSnapshot, value: string, label: string) => boolean;
   videoAssetChoiceHandler: (snapshot: ConversationProjectSnapshot, value: string, label: string) => boolean;
   scriptProjectChoiceHandler: (snapshot: ConversationProjectSnapshot, value: string, label: string) => boolean;
   autoResearchChoiceHandler: (value: string, label: string) => boolean | Promise<boolean>;
-}) {
+}): boolean {
   const {
     snapshot,
     value,
@@ -263,7 +330,6 @@ export function handleHomeAgentChoiceSelection(params: {
     answer,
     setSelectedValues,
     videoProjectChoiceHandler,
-    videoReviewChoiceHandler,
     videoAssetChoiceHandler,
     scriptProjectChoiceHandler,
     autoResearchChoiceHandler,
@@ -271,39 +337,56 @@ export function handleHomeAgentChoiceSelection(params: {
 
   if (question?.id.startsWith("auto-research:")) {
     void Promise.resolve(autoResearchChoiceHandler(value, label));
-    return;
+    return true;
   }
 
-  if (snapshot?.projectKind === "video" && videoProjectChoiceHandler(snapshot, value, label)) {
-    return;
+  if (question?.multiSelect && question.answerKey === "题材选择") {
+    setSelectedValues((prev) => {
+      if (!prev.includes(value) && isOriginalScriptKickoffGenreQuestion(question) && prev.length >= 2) {
+        return prev;
+      }
+      return prev.includes(value) ? prev.filter((item) => item !== value) : [...prev, value];
+    });
+    return false;
   }
 
-  if (snapshot?.projectKind === "video" && question?.id.startsWith("review-")) {
-    if (videoReviewChoiceHandler(snapshot, value, label)) {
-      return;
-    }
+  if (
+    question?.answerKey === "script-episode" &&
+    value.startsWith("script:episode-duration:")
+  ) {
+    setSelectedValues([value]);
+    return true;
   }
 
-  if (snapshot?.projectKind === "video" && videoAssetChoiceHandler(snapshot, value, label)) {
-    return;
+  const isVideoChoice = isVideoWorkflowChoice(question, value);
+
+  if (snapshot && (snapshot.projectKind === "video" || isVideoChoice) && videoProjectChoiceHandler(snapshot, value, label)) {
+    return true;
+  }
+
+  if (snapshot && (snapshot.projectKind === "video" || isVideoChoice) && videoAssetChoiceHandler(snapshot, value, label)) {
+    return true;
+  }
+
+  if (isVideoChoice) {
+    return true;
   }
 
   if (
     (snapshot?.projectKind === "script" || snapshot?.projectKind === "adaptation") &&
-    question?.id.startsWith("script-") &&
     scriptProjectChoiceHandler(snapshot, value, label)
   ) {
-    return;
+    return true;
   }
 
   if (!question?.multiSelect && question?.submissionMode !== "confirm") {
     answer(value, label);
-    return;
+    return true;
   }
 
   if (!question?.multiSelect && question?.submissionMode === "confirm" && question?.options.length === 1) {
     answer(value, label);
-    return;
+    return true;
   }
 
   setSelectedValues((prev) => {
@@ -315,17 +398,28 @@ export function handleHomeAgentChoiceSelection(params: {
     }
     return [value];
   });
+  return false;
 }
 
 export function submitHomeAgentComposer(params: {
   qState: StudioQuestionState | null;
   question: ComposerQuestion | null;
   draft: string;
+  attachmentsPresent?: boolean;
   confirmStructuredAnswer: () => void;
+  deferQuestionToChat?: () => void;
   answer: (value: string, label?: string) => void;
-  send: (value: string, shown?: string) => Promise<void>;
+  send: (
+    value: MessageInput,
+    shown?: string,
+    opts?: {
+      skipUserBubble?: boolean;
+      attachments?: ChatAttachment[];
+      disableAutoResearch?: boolean;
+    },
+  ) => Promise<void>;
 }) {
-  const { qState, question, draft, confirmStructuredAnswer, answer, send } = params;
+  const { qState, question, draft, attachmentsPresent, confirmStructuredAnswer, deferQuestionToChat, answer, send } = params;
 
   if (qState && (question?.submissionMode === "confirm" || question?.multiSelect)) {
     confirmStructuredAnswer();
@@ -333,6 +427,10 @@ export function submitHomeAgentComposer(params: {
   }
 
   if (qState) {
+    if ((draft.trim() || attachmentsPresent) && deferQuestionToChat) {
+      deferQuestionToChat();
+      return;
+    }
     answer(draft);
     return;
   }

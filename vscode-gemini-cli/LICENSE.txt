@@ -1,5 +1,0 @@
-UNLICENSED
-
-This extension is intended for local/private use inside the next-chapter repository.
-No permission is granted to copy, modify, distribute, or use this extension outside
-the repository owner's approval.

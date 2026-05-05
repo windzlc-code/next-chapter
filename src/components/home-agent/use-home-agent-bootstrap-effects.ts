@@ -1,6 +1,5 @@
 import * as React from "react";
 import { getAllTasks, type Task } from "@/lib/agent/tools/task-tools";
-import { readStudioProjectSession } from "@/lib/home-agent/session-store";
 import type { ConversationProjectSnapshot, StudioRuntimeState, StudioSessionState } from "@/lib/home-agent/types";
 
 const { useEffect, useRef } = React;
@@ -34,7 +33,7 @@ export function useHomeAgentBootstrapEffects(params: {
   setActiveProjectId: React.Dispatch<React.SetStateAction<string | undefined>>;
   setTasks: React.Dispatch<React.SetStateAction<Task[]>>;
   loadProjectStore: () => Promise<{
-    listRecentConversationSnapshots(limit?: number): Promise<ConversationProjectSnapshot[]>;
+    listRecentConversationSnapshots(limit?: number, options?: { fast?: boolean }): Promise<ConversationProjectSnapshot[]>;
     readSkillDrafts(): StudioRuntimeState["skillDrafts"];
     readMaintenanceReports(): StudioRuntimeState["maintenanceReports"];
   }>;
@@ -84,6 +83,7 @@ export function useHomeAgentBootstrapEffects(params: {
     writeDesktopSidebarCollapsed,
   } = params;
   const previousSessionIdRef = useRef(runtime.sessionId);
+  const hasWrittenDesktopSidebarRef = useRef(false);
 
   useEffect(
     () => () => {
@@ -121,6 +121,10 @@ export function useHomeAgentBootstrapEffects(params: {
   }, [compactedMessageCount, compactedMessageCountRef]);
 
   useEffect(() => {
+    if (!hasWrittenDesktopSidebarRef.current) {
+      hasWrittenDesktopSidebarRef.current = true;
+      return;
+    }
     writeDesktopSidebarCollapsed(desktopSidebarCollapsed);
   }, [desktopSidebarCollapsed, writeDesktopSidebarCollapsed]);
 
@@ -130,21 +134,16 @@ export function useHomeAgentBootstrapEffects(params: {
     const hydrateRecentProjects = async () => {
       try {
         const store = await loadProjectStore();
-        const items = await store.listRecentConversationSnapshots(8);
-        const sessions = items
-          .map((snapshot) => readStudioProjectSession(snapshot.projectId))
-          .filter((session): session is StudioSessionState => Boolean(session));
+        // 加载前先执行自动剪枝（若开关开启且超出上限）
+        const items = await store.listRecentConversationSnapshots(16, { fast: true });
         if (cancelled) return;
         React.startTransition(() => {
           setRuntime((prev) => {
-            if (
-              areProjectSnapshotsEquivalent(items, prev.recentProjects) &&
-              areRecentSessionsEquivalent(sessions, prev.recentProjectSessions)
-            ) {
+            if (areProjectSnapshotsEquivalent(items, prev.recentProjects)) {
               return prev;
             }
 
-            return { ...prev, recentProjects: items, recentProjectSessions: sessions };
+            return { ...prev, recentProjects: items };
           });
           setRecentProjectsReady(true);
         });
@@ -241,8 +240,13 @@ export function useHomeAgentBootstrapEffects(params: {
       });
     };
 
-    syncTasks();
+    const cancelInitialSync = scheduleBackgroundTask(() => {
+      syncTasks();
+    }, 900);
     window.addEventListener("agent:tasks-updated", syncTasks);
-    return () => window.removeEventListener("agent:tasks-updated", syncTasks);
-  }, [areTaskListsEquivalent, setTasks]);
+    return () => {
+      cancelInitialSync();
+      window.removeEventListener("agent:tasks-updated", syncTasks);
+    };
+  }, [areTaskListsEquivalent, scheduleBackgroundTask, setTasks]);
 }

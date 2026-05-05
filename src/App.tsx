@@ -2,13 +2,23 @@ import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { Suspense, lazy, useEffect } from "react";
 import { BrowserRouter, HashRouter, Routes, Route, useLocation, useNavigate } from "react-router-dom";
 import { ThemeProvider } from "next-themes";
-import Home from "./pages/Home";
 import NotFound from "./pages/NotFound";
 
-const queryClient = new QueryClient();
+const Home = lazy(() => import("./pages/Home"));
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 5 * 60 * 1000,   // 5分钟内不重新请求
+      gcTime: 10 * 60 * 1000,     // 10分钟后回收缓存
+      retry: 1,
+      refetchOnWindowFocus: false,
+    },
+  },
+});
 
 const isFileProtocol = typeof window !== "undefined" && window.location.protocol === "file:";
 const Router = isFileProtocol ? HashRouter : BrowserRouter;
@@ -94,22 +104,24 @@ function LegacyHomeRedirect({ utility }: { utility?: "settings" }) {
 }
 
 const App = () => (
-  <ThemeProvider attribute="class" defaultTheme="light" storageKey="storyforge-theme">
+  <ThemeProvider attribute="class" defaultTheme="dark" storageKey="storyforge-theme">
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <Toaster />
         <Sonner />
         <Router>
-          <Routes>
-            <Route path="/" element={<Home />} />
-            <Route path="/modules" element={<LegacyHomeRedirect />} />
-            <Route path="/workspace" element={<LegacyHomeRedirect />} />
-            <Route path="/script-creator" element={<LegacyHomeRedirect />} />
-            <Route path="/compliance-review" element={<LegacyHomeRedirect />} />
-            <Route path="/settings" element={<LegacyHomeRedirect utility="settings" />} />
-            <Route path="/history" element={<LegacyHomeRedirect />} />
-            <Route path="*" element={<NotFound />} />
-          </Routes>
+          <Suspense fallback={null}>
+            <Routes>
+              <Route path="/" element={<Home />} />
+              <Route path="/modules" element={<LegacyHomeRedirect />} />
+              <Route path="/workspace" element={<LegacyHomeRedirect />} />
+              <Route path="/script-creator" element={<LegacyHomeRedirect />} />
+              <Route path="/compliance-review" element={<LegacyHomeRedirect />} />
+              <Route path="/settings" element={<LegacyHomeRedirect utility="settings" />} />
+              <Route path="/history" element={<LegacyHomeRedirect />} />
+              <Route path="*" element={<NotFound />} />
+            </Routes>
+          </Suspense>
         </Router>
       </TooltipProvider>
     </QueryClientProvider>

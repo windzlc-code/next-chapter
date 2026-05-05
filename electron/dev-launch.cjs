@@ -1,7 +1,8 @@
 const http = require('node:http');
 const { spawn } = require('node:child_process');
+const electronBinary = require('electron');
 
-const url = 'http://localhost:8080';
+const url = 'http://127.0.0.1:8080';
 const timeoutMs = 30000;
 const start = Date.now();
 
@@ -30,9 +31,8 @@ function launchElectron() {
   delete env.ELECTRON_RUN_AS_NODE;
 
   console.log('[dev-launch] Launching Electron...');
-  const child = spawn('electron', ['.'], {
+  const child = spawn(electronBinary, ['.'], {
     stdio: 'inherit',
-    shell: true,
     env,
   });
 

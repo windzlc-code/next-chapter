@@ -21,11 +21,16 @@ extraResources:
     to: files
     filter:
       - "**/*"
+      - "!projects/**"
   - from: config/builtin-api.json
     to: config/builtin-api.json
+  - from: vendor/ffmpeg
+    to: vendor/ffmpeg
+    filter:
+      - "**/*"
 
 asar: true
-compression: maximum
+compression: normal
 
 # 禁用代码签名（避免 winCodeSign macOS 符号链接问题）
 win:

@@ -19,7 +19,17 @@ export function buildResetRuntimeState(previous: StudioRuntimeState): StudioRunt
     skillDrafts: [],
     maintenanceReports: [],
     recentMessageSummary: "",
+    fullAutoRun: null,
   };
+}
+
+function isStaleReviewQuestion(q: ComposerQuestion | null | undefined): boolean {
+  if (!q) return false;
+  return (
+    q.id.startsWith("review-") ||
+    q.answerKey === "review-stage-panel" ||
+    q.answerKey?.startsWith("review-")
+  );
 }
 
 export function buildOpenProjectSessionState(params: {
@@ -37,17 +47,29 @@ export function buildOpenProjectSessionState(params: {
 
   if (savedSession) {
     return {
+      creationMode: "fast" as const,
+      automationMode: savedSession.automationMode ?? snapshot.automationMode ?? "manual",
+      devMode: savedSession.devMode ?? false,
       qState: savedSession.qState ?? null,
-      popoverOverride: null,
+      deferredQuestionState: savedSession.deferredQuestionState ?? null,
+      popoverOverride: isStaleReviewQuestion(savedSession.pendingChoiceQuestion) ? null : (savedSession.pendingChoiceQuestion ?? null),
       suggested: null,
       selectedValues: savedSession.selectedValues ?? [],
+      deferredSelectedValues: savedSession.deferredSelectedValues ?? [],
       selectedTextModelKey: savedSession.selectedTextModelKey,
+      selectedImageModelFamily: savedSession.selectedImageModelFamily,
+      imageGenerationPrefs:
+        savedSession.imageGenerationPrefs ?? videoProject?.imageGenerationPrefs,
+      selectedVideoModelKey: savedSession.selectedVideoModelKey,
+      videoGenerationPrefs:
+        savedSession.videoGenerationPrefs ?? videoProject?.videoGenerationPrefs,
       mode:
         savedSession.mode === "recovering" || savedSession.mode === "maintenance-review"
           ? savedSession.mode
           : ("active" as const),
       messages: savedSession.messages.length ? savedSession.messages : [createAssistantMessage(buildBrief(snapshot))],
       draft: savedSession.draft ?? "",
+      deferredDraft: savedSession.deferredDraft ?? "",
       compactedMessageCount: savedSession.compactedMessageCount ?? 0,
       surfacedTaskIds: savedSession.surfacedTaskIds ?? [],
       surfacedTaskFollowupKeys: savedSession.surfacedTaskFollowupKeys ?? [],
@@ -56,24 +78,36 @@ export function buildOpenProjectSessionState(params: {
         ? `${savedSession.qState.request.id}:${savedSession.qState.currentIndex}`
         : null,
       sessionId: savedSession.sessionId ?? crypto.randomUUID(),
+      fullAutoRun: savedSession.fullAutoRun ?? null,
     };
   }
 
   return {
+    creationMode: "fast" as const,
+    automationMode: snapshot.automationMode ?? "manual",
+    devMode: false,
     qState: null,
+    deferredQuestionState: null,
     popoverOverride: null,
     suggested: getSuggestedQuestion(snapshot, videoProject),
     selectedValues: [],
+    deferredSelectedValues: [],
     selectedTextModelKey: undefined,
+    selectedImageModelFamily: videoProject?.imageGenerationPrefs?.familyKey,
+    imageGenerationPrefs: videoProject?.imageGenerationPrefs,
+    selectedVideoModelKey: videoProject?.videoGenerationPrefs?.modelKey,
+    videoGenerationPrefs: videoProject?.videoGenerationPrefs,
     mode: "active" as const,
     messages: [createAssistantMessage(buildBrief(snapshot))],
     draft: "",
+    deferredDraft: "",
     compactedMessageCount: 0,
     surfacedTaskIds: [],
     surfacedTaskFollowupKeys: [],
     surfacedProjectSuggestionKeys: [],
     previousQuestionStep: null,
     sessionId: crypto.randomUUID(),
+    fullAutoRun: null,
   };
 }
 
