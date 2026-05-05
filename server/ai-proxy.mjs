@@ -193,8 +193,24 @@ function buildUpstreamUrl(baseEndpoint, pathName = "", search = "") {
   if (/^https?:\/\//i.test(suffix)) {
     return suffix;
   }
+
+  const parsed = new URL(trimmedBase);
+  const basePath = trimTrailingSlash(parsed.pathname || "");
   const normalizedPath = suffix.startsWith("/") ? suffix : `/${suffix}`;
-  return `${trimmedBase}${normalizedPath}${search || ""}`;
+
+  // Frontend callers often already include `/v1/...` or `/v1beta/...` in the proxied path.
+  // If the configured base endpoint also ends with that same version prefix, avoid joining it twice.
+  if (
+    basePath &&
+    (normalizedPath === basePath || normalizedPath.startsWith(`${basePath}/`))
+  ) {
+    parsed.pathname = normalizedPath;
+  } else {
+    parsed.pathname = `${basePath}${normalizedPath}` || normalizedPath;
+  }
+
+  parsed.search = search || "";
+  return parsed.toString();
 }
 
 function buildProxyUpstreamUrl(provider, requestUrl, session) {

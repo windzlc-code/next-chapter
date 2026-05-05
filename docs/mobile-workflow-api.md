@@ -71,13 +71,13 @@ Headers:
 Examples:
 
 - GPT text chat:
-  `POST /api/proxy/gpt/chat/completions`
+  `POST /api/proxy/gpt/v1/chat/completions`
 - Claude text chat:
-  `POST /api/proxy/claude/chat/completions`
+  `POST /api/proxy/claude/v1/messages`
 - Gemini:
-  `POST /api/proxy/gemini/models/gemini-3-pro:generateContent`
+  `POST /api/proxy/gemini/v1beta/models/gemini-3-pro:generateContent`
 - Seedream image:
-  `POST /api/proxy/seedream/models/{model}:generateImages`
+  `POST /api/proxy/seedream/v1beta/models/{model}:generateImages`
 - Seedance video:
   `POST /api/proxy/jimeng`
 
