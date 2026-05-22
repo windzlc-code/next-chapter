@@ -467,6 +467,28 @@ function findSessionForProjectId(
   );
 }
 
+function getRecentProjectSessionsWithStorageFallback(
+  recentProjectSessions: Array<
+    Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot">
+  > = [],
+): Array<Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot">> {
+  const merged = [...recentProjectSessions];
+  const seen = new Set(
+    merged
+      .map((session) => session.projectId || session.currentProjectSnapshot?.projectId || "")
+      .filter(Boolean),
+  );
+
+  for (const session of listStudioProjectSessions()) {
+    const key = session.projectId || session.currentProjectSnapshot?.projectId || "";
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    merged.push(session);
+  }
+
+  return merged;
+}
+
 export function resolveEffectiveProjectAutomationMode(params: {
   snapshot?: Pick<ConversationProjectSnapshot, "projectId" | "automationMode"> | null;
   recentProjectSessions?: Array<
@@ -488,7 +510,10 @@ export function resolveEffectiveProjectAutomationMode(params: {
     return normalizeAutomationMode(currentProjectSnapshot.automationMode ?? snapshot.automationMode);
   }
 
-  const session = findSessionForProjectId(snapshot.projectId, recentProjectSessions);
+  const session = findSessionForProjectId(
+    snapshot.projectId,
+    getRecentProjectSessionsWithStorageFallback(recentProjectSessions),
+  );
   if (session?.automationMode) {
     return normalizeAutomationMode(session.automationMode);
   }
@@ -518,9 +543,10 @@ export function filterRecentProjectsForAutomationMode(params: {
     currentProjectSnapshot = null,
     currentSessionProjectId = null,
   } = params;
+  const sessionSource = getRecentProjectSessionsWithStorageFallback(recentProjectSessions);
   const hiddenBridgedVideoProjectIds = collectHiddenBridgedVideoProjectIds({
     recentProjects,
-    recentProjectSessions,
+    recentProjectSessions: sessionSource,
     currentProjectSnapshot,
     currentSessionProjectId,
   });
@@ -530,7 +556,7 @@ export function filterRecentProjectsForAutomationMode(params: {
       !hiddenBridgedVideoProjectIds.has(project.projectId) &&
       resolveEffectiveProjectAutomationMode({
         snapshot: project,
-        recentProjectSessions,
+        recentProjectSessions: sessionSource,
         currentProjectSnapshot,
       }) === mode,
   );
@@ -585,10 +611,11 @@ export function mergeRecentProjectsWithSessionSnapshots(params: {
     currentSessionProjectId = null,
     limit = 50,
   } = params;
+  const sessionSource = getRecentProjectSessionsWithStorageFallback(recentProjectSessions);
 
   const hiddenBridgedVideoProjectIds = collectHiddenBridgedVideoProjectIds({
     recentProjects,
-    recentProjectSessions,
+    recentProjectSessions: sessionSource,
     currentProjectSnapshot,
     currentSessionProjectId,
   });
@@ -598,7 +625,7 @@ export function mergeRecentProjectsWithSessionSnapshots(params: {
     : recentProjects;
   const currentSnapshotProjectId = trimProjectId(currentProjectSnapshot?.projectId);
   const currentSessionProjectIdNormalized = trimProjectId(currentSessionProjectId);
-  const sessionSnapshots = recentProjectSessions
+  const sessionSnapshots = sessionSource
     .map((session) => {
       const snapshot = session.currentProjectSnapshot;
       if (!snapshot?.projectId) return null;
@@ -627,7 +654,7 @@ export function mergeRecentProjectsWithSessionSnapshots(params: {
       !previousSnapshot &&
       resolveEffectiveProjectAutomationMode({
         snapshot,
-        recentProjectSessions,
+        recentProjectSessions: sessionSource,
         currentProjectSnapshot,
       }) === "full-auto";
     const shouldSurfaceMissingSnapshot =
