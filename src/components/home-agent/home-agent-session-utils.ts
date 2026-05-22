@@ -566,10 +566,6 @@ export function resolveEffectiveProjectAutomationMode(params: {
     return normalizeAutomationMode(snapshot?.automationMode);
   }
 
-  if (currentProjectSnapshot?.projectId === snapshot.projectId) {
-    return normalizeAutomationMode(currentProjectSnapshot.automationMode ?? snapshot.automationMode);
-  }
-
   const session = findSessionForProjectId(
     snapshot.projectId,
     getRecentProjectSessionsWithStorageFallback(recentProjectSessions),
@@ -579,6 +575,10 @@ export function resolveEffectiveProjectAutomationMode(params: {
   }
   if (session?.currentProjectSnapshot?.automationMode) {
     return normalizeAutomationMode(session.currentProjectSnapshot.automationMode);
+  }
+
+  if (currentProjectSnapshot?.projectId === snapshot.projectId) {
+    return normalizeAutomationMode(currentProjectSnapshot.automationMode ?? snapshot.automationMode);
   }
 
   return normalizeAutomationMode(snapshot.automationMode);

@@ -485,6 +485,31 @@ describe("mode-filter fallbacks", () => {
     expect(filtered.map((project) => project.projectId)).toEqual(["shared-project"]);
   });
 
+  it("prefers a persisted session mode over a stale current project snapshot", () => {
+    const staleCurrentSnapshot = createSnapshot({
+      projectId: "shared-project",
+      title: "Current Project",
+      automationMode: "manual",
+    });
+
+    const resolved = resolveEffectiveProjectAutomationMode({
+      snapshot: staleCurrentSnapshot,
+      currentProjectSnapshot: staleCurrentSnapshot,
+      recentProjectSessions: [
+        createSession({
+          projectId: "shared-project",
+          automationMode: "full-auto",
+          currentProjectSnapshot: {
+            ...staleCurrentSnapshot,
+            automationMode: "full-auto",
+          },
+        }),
+      ],
+    });
+
+    expect(resolved).toBe("full-auto");
+  });
+
   it("hides a bridged video history card when the source script session already owns it", () => {
     const sourceScriptSnapshot = createSnapshot({
       projectId: "script-project-1",
