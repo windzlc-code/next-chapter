@@ -13,6 +13,8 @@ import type {
   StudioSessionState,
 } from "@/lib/home-agent/types";
 
+const STUDIO_PROJECT_SESSIONS_STORAGE_KEY = "storyforge-home-agent-project-sessions-v1";
+
 export function createInitialStudioSeed(): {
   session: StudioSessionState | null;
   runtime: StudioRuntimeState;
@@ -479,7 +481,24 @@ function getRecentProjectSessionsWithStorageFallback(
       .filter(Boolean),
   );
 
-  for (const session of listStudioProjectSessions()) {
+  const storageSessions =
+    typeof window === "undefined"
+      ? []
+      : (() => {
+          try {
+            const raw = window.localStorage.getItem(STUDIO_PROJECT_SESSIONS_STORAGE_KEY);
+            const parsed = raw ? JSON.parse(raw) : {};
+            return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+              ? Object.values(parsed) as Array<
+                  Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot">
+                >
+              : [];
+          } catch {
+            return [];
+          }
+        })();
+
+  for (const session of storageSessions) {
     const key = session.projectId || session.currentProjectSnapshot?.projectId || "";
     if (!key || seen.has(key)) continue;
     seen.add(key);
