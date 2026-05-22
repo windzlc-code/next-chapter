@@ -20,6 +20,7 @@ import {
   autoAdjustComplianceAction,
   analyzeReferenceScriptAction,
   enterDramaStepAction,
+  generateCreativePlanAction,
   generateDirectoryAction,
   generateEpisodeAction,
   generateEpisodeBatchAction,
@@ -241,6 +242,24 @@ describe("drama workflow service actions", () => {
     expect(nextProject.creativePlan).toBe("Creative plan before refresh");
     expect(nextProject.characters).toBe("Characters before refresh");
     expect(nextProject.currentStep).toBe("directory");
+  });
+
+  it("uses the selected home agent text model for drama generation", async () => {
+    localStorage.setItem("storyforge-home-agent-text-model-v1", "gpt-5.4");
+    const project = createProject({ currentStep: "creative-plan" });
+    const runtime = createRuntime(project);
+
+    mockedCallGeminiStream.mockResolvedValueOnce("Creative plan from selected model");
+
+    await generateCreativePlanAction({ projectId: project.id }, runtime);
+
+    expect(mockedCallGeminiStream).toHaveBeenCalledWith(
+      "gpt-5.4",
+      expect.any(Array),
+      expect.any(Function),
+      expect.any(Object),
+      expect.any(AbortSignal),
+    );
   });
 
   it("stores the confirmed duration when entering episode writing", async () => {

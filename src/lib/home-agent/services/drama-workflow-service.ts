@@ -10,7 +10,7 @@ import {
   buildStructureTransformPrompt,
 } from "@/lib/drama-prompts";
 import { callGeminiStream } from "@/lib/gemini-client";
-import { readStoredDecomposeModel } from "@/lib/gemini-text-models";
+import { readStoredHomeAgentTextModelKey } from "@/lib/home-agent/text-models";
 import { readStoredLlmParams } from "@/lib/home-agent/llm-params";
 
 // 全局细纲生成 AbortController 注册表，支持从 UI 取消
@@ -1349,7 +1349,7 @@ async function generateDramaText(
 ): Promise<string> {
   const storedParams = readStoredLlmParams();
   const resolvedMaxTokens = maxOutputTokens ?? storedParams.maxOutputTokens;
-  const model = modelOverride ?? readStoredDecomposeModel();
+  const model = modelOverride ?? readStoredHomeAgentTextModelKey();
   const timeoutMs = calcTimeoutMs(resolvedMaxTokens);
   const timeoutAbort = new AbortController();
   let didTimeout = false;
