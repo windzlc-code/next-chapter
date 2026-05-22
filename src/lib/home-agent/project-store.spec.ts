@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createDramaSnapshot,
   createVideoSnapshot,
@@ -124,6 +124,10 @@ describe("project-store", () => {
     localStorage.clear();
     invalidateProjectsCache();
     __resetSessionStoreCachesForTests();
+    vi.unstubAllGlobals();
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new Error("network disabled in project-store tests");
+    }));
   });
 
   it("normalizes legacy drama projects with missing workflow arrays and compliance workspace", () => {

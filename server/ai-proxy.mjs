@@ -22,6 +22,13 @@ const HOME_AGENT_SHARED_STATE_PATH = path.resolve(
 const HOME_AGENT_SHARED_STATE_LIMIT = Number(
   process.env.HOME_AGENT_SHARED_STATE_LIMIT || 15 * 1024 * 1024,
 );
+const HOME_AGENT_ARCHIVE_STATE_PATH = path.resolve(
+  process.env.HOME_AGENT_ARCHIVE_STATE_PATH ||
+    path.join(process.cwd(), "server-data", "home-agent-archive-state.json"),
+);
+const HOME_AGENT_ARCHIVE_STATE_LIMIT = Number(
+  process.env.HOME_AGENT_ARCHIVE_STATE_LIMIT || 80 * 1024 * 1024,
+);
 const WORKFLOW_STORE = createWorkflowStore({
   storePath: process.env.WORKFLOW_STORE_PATH,
   maxTasks: Number(process.env.WORKFLOW_MAX_TASKS || 500),
@@ -125,6 +132,131 @@ const HOME_AGENT_SHARED_STORAGE_KEYS = new Set([
   "storyforge-home-agent-automation-mode-v1",
   "storyforge-home-agent-project-meta-v1",
 ]);
+
+function hasOwnProperty(object, key) {
+  return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+function sanitizeIsoTimestamp(value, fallback = new Date().toISOString()) {
+  if (typeof value !== "string" || !value.trim()) return fallback;
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : fallback;
+}
+
+function cloneJsonValue(value, fallback = null) {
+  if (typeof value === "undefined") return fallback;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return fallback;
+  }
+}
+
+function sanitizeConversationArchiveManifest(input, projectId, dirNameFallback = projectId) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const recommendedActions = Array.isArray(input.recommendedActions)
+    ? input.recommendedActions.filter((item) => typeof item === "string").slice(0, 24)
+    : [];
+  const projectKind =
+    input.projectKind === "script" || input.projectKind === "adaptation" || input.projectKind === "video"
+      ? input.projectKind
+      : "script";
+  return {
+    archiveVersion: Number.isFinite(input.archiveVersion) ? Number(input.archiveVersion) : 1,
+    projectId,
+    title:
+      typeof input.title === "string" && input.title.trim()
+        ? input.title.trim().slice(0, 160)
+        : projectId,
+    projectKind,
+    automationMode:
+      input.automationMode === "manual" || input.automationMode === "full-auto"
+        ? input.automationMode
+        : undefined,
+    updatedAt: sanitizeIsoTimestamp(input.updatedAt),
+    messageCount: Number.isFinite(input.messageCount) ? Math.max(0, Number(input.messageCount)) : 0,
+    artifactCount: Number.isFinite(input.artifactCount) ? Math.max(0, Number(input.artifactCount)) : 0,
+    currentObjective:
+      typeof input.currentObjective === "string" ? input.currentObjective.slice(0, 800) : "",
+    derivedStage: typeof input.derivedStage === "string" ? input.derivedStage.slice(0, 400) : "",
+    agentSummary: typeof input.agentSummary === "string" ? input.agentSummary.slice(0, 4000) : "",
+    recommendedActions,
+    dirName:
+      typeof input.dirName === "string" && input.dirName.trim()
+        ? input.dirName.trim().slice(0, 200)
+        : dirNameFallback,
+    hasFullHistory: input.hasFullHistory !== false,
+  };
+}
+
+function sanitizeHomeAgentArchiveEntry(input, projectId, existingEntry = null) {
+  const source = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  const existing = existingEntry && typeof existingEntry === "object" ? existingEntry : null;
+  const nextDirName =
+    typeof source.dirName === "string" && source.dirName.trim()
+      ? source.dirName.trim().slice(0, 200)
+      : typeof existing?.dirName === "string" && existing.dirName.trim()
+        ? existing.dirName.trim().slice(0, 200)
+        : projectId;
+
+  const manifest = hasOwnProperty(source, "manifest")
+    ? sanitizeConversationArchiveManifest(source.manifest, projectId, nextDirName)
+    : sanitizeConversationArchiveManifest(existing?.manifest, projectId, nextDirName);
+
+  return {
+    projectId,
+    dirName: manifest?.dirName || nextDirName,
+    manifest,
+    session: hasOwnProperty(source, "session")
+      ? cloneJsonValue(source.session, null)
+      : cloneJsonValue(existing?.session, null),
+    project: hasOwnProperty(source, "project")
+      ? cloneJsonValue(source.project, null)
+      : cloneJsonValue(existing?.project, null),
+    updatedAt: sanitizeIsoTimestamp(
+      source.updatedAt || manifest?.updatedAt || existing?.updatedAt || new Date().toISOString(),
+    ),
+  };
+}
+
+function sanitizeHomeAgentArchiveState(input) {
+  const rawProjects =
+    input?.projects && typeof input.projects === "object" && !Array.isArray(input.projects)
+      ? input.projects
+      : {};
+  const projects = {};
+  for (const [projectId, value] of Object.entries(rawProjects)) {
+    if (typeof projectId !== "string" || !projectId.trim()) continue;
+    projects[projectId] = sanitizeHomeAgentArchiveEntry(value, projectId, null);
+  }
+  return {
+    version: 1,
+    updatedAt: sanitizeIsoTimestamp(input?.updatedAt, new Date(0).toISOString()),
+    savedAt: sanitizeIsoTimestamp(input?.savedAt),
+    projects,
+  };
+}
+
+function buildHomeAgentArchiveStateIndex(state) {
+  const safeState = sanitizeHomeAgentArchiveState(state);
+  return {
+    version: 1,
+    updatedAt: safeState.updatedAt,
+    savedAt: safeState.savedAt,
+    projects: Object.values(safeState.projects)
+      .map((entry) => ({
+        projectId: entry.projectId,
+        dirName: entry.dirName,
+        manifest: entry.manifest,
+        updatedAt: entry.updatedAt,
+      }))
+      .sort(
+        (a, b) =>
+          new Date(b.updatedAt || b.manifest?.updatedAt || 0).getTime() -
+          new Date(a.updatedAt || a.manifest?.updatedAt || 0).getTime(),
+      ),
+  };
+}
 
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload);
@@ -844,6 +976,96 @@ async function handleWorkflowApi(req, res, requestUrl) {
       const state = sanitizeHomeAgentSharedState(payload);
       await writeJsonFileAtomic(HOME_AGENT_SHARED_STATE_PATH, state);
       sendJson(res, 200, { state });
+      return true;
+    }
+
+    sendJson(res, 405, { error: "Method not allowed" });
+    return true;
+  }
+
+  if (requestUrl.pathname === "/api/home-agent/archive-state") {
+    if (req.method === "GET") {
+      const state = await readJsonFileSafe(HOME_AGENT_ARCHIVE_STATE_PATH, {
+        version: 1,
+        updatedAt: null,
+        savedAt: null,
+        projects: {},
+      });
+      sendJson(res, 200, {
+        state: buildHomeAgentArchiveStateIndex(state),
+      });
+      return true;
+    }
+
+    sendJson(res, 405, { error: "Method not allowed" });
+    return true;
+  }
+
+  if (requestUrl.pathname.startsWith("/api/home-agent/archive-state/")) {
+    const projectId = decodeURIComponent(
+      requestUrl.pathname.slice("/api/home-agent/archive-state/".length),
+    ).trim();
+    if (!projectId) {
+      sendJson(res, 400, { error: "Missing projectId" });
+      return true;
+    }
+
+    const state = sanitizeHomeAgentArchiveState(
+      await readJsonFileSafe(HOME_AGENT_ARCHIVE_STATE_PATH, {
+        version: 1,
+        updatedAt: null,
+        savedAt: null,
+        projects: {},
+      }),
+    );
+
+    if (req.method === "GET") {
+      sendJson(res, 200, {
+        entry: state.projects[projectId] ?? null,
+      });
+      return true;
+    }
+
+    if (req.method === "PUT") {
+      const payload = await readRequestBody(req, { limit: HOME_AGENT_ARCHIVE_STATE_LIMIT });
+      const entryInput =
+        payload?.entry && typeof payload.entry === "object" && !Array.isArray(payload.entry)
+          ? payload.entry
+          : payload;
+      const nextEntry = sanitizeHomeAgentArchiveEntry(
+        entryInput,
+        projectId,
+        state.projects[projectId] ?? null,
+      );
+      const nextState = {
+        ...state,
+        updatedAt: new Date().toISOString(),
+        savedAt: new Date().toISOString(),
+        projects: {
+          ...state.projects,
+          [projectId]: nextEntry,
+        },
+      };
+      await writeJsonFileAtomic(HOME_AGENT_ARCHIVE_STATE_PATH, nextState);
+      sendJson(res, 200, { entry: nextEntry });
+      return true;
+    }
+
+    if (req.method === "DELETE") {
+      if (!state.projects[projectId]) {
+        sendJson(res, 200, { ok: true, deleted: false });
+        return true;
+      }
+      const nextProjects = { ...state.projects };
+      delete nextProjects[projectId];
+      const nextState = {
+        ...state,
+        updatedAt: new Date().toISOString(),
+        savedAt: new Date().toISOString(),
+        projects: nextProjects,
+      };
+      await writeJsonFileAtomic(HOME_AGENT_ARCHIVE_STATE_PATH, nextState);
+      sendJson(res, 200, { ok: true, deleted: true });
       return true;
     }
 

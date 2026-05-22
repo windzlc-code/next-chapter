@@ -26,6 +26,7 @@ import {
   deleteConversationArchive,
   invalidateConversationArchiveScanCache,
   readConversationArchiveFull,
+  readConversationArchiveFullLocalOnly,
   readLatestConversationArchiveSession,
   writeConversationArchiveFull,
 } from "./conversation-archive";
@@ -1663,7 +1664,7 @@ async function writeSessionToFile(session: StudioSessionState): Promise<void> {
 /** 从文件系统读取指定项目的会话（用于 localStorage 为空时的恢复） */
 export async function readProjectSessionFromFile(projectId: string): Promise<StudioSessionState | null> {
   if (hasSessionResetMarker(projectId)) return null;
-  const archive = await readConversationArchiveFull(projectId);
+  const archive = await readConversationArchiveFullLocalOnly(projectId);
   const archiveSession = normalizeStudioSession(archive?.session ?? null);
   if (archiveSession && !shouldIgnoreDeletedProjectSession(archiveSession)) {
     if (

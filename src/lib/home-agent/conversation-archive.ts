@@ -1,5 +1,9 @@
 import { getProjectRootPath } from "@/lib/file-cache";
 import { getResolvedFilesStoragePath } from "@/lib/storage-path";
+import {
+  canUseHomeAgentSyncFetch,
+  resolveHomeAgentSyncEndpoint,
+} from "./cloud-sync-endpoint";
 import type {
   AutomationMode,
   ConversationProjectKind,
@@ -14,6 +18,7 @@ const FULL_HISTORY_FILE = "chat-history.full.json";
 const LEGACY_HISTORY_FILE = "chat-history.json";
 const PROJECT_FILE = "project.json";
 const DIR_SEPARATOR = "--";
+const ARCHIVE_STATE_ENDPOINT = "/api/home-agent/archive-state";
 
 export interface ConversationArchiveManifest {
   archiveVersion: number;
@@ -37,9 +42,27 @@ export interface ConversationArchiveRecord {
   manifest: ConversationArchiveManifest;
 }
 
+interface ConversationArchiveRemoteEntry {
+  projectId: string;
+  dirName: string;
+  manifest: ConversationArchiveManifest | null;
+  session: StudioSessionState | null;
+  project: unknown | null;
+  updatedAt: string;
+}
+
+interface ConversationArchiveRemoteIndexEntry {
+  projectId: string;
+  dirName: string;
+  manifest: ConversationArchiveManifest | null;
+  updatedAt: string;
+}
+
 type StorageApi = NonNullable<typeof window.electronAPI>["storage"];
 
 let archiveScanCache: ConversationArchiveRecord[] | null = null;
+let remoteArchiveIndexCache: ConversationArchiveRemoteIndexEntry[] | null = null;
+const remoteArchiveEntryCache = new Map<string, ConversationArchiveRemoteEntry | null>();
 
 function getStorage(): StorageApi | null {
   if (typeof window === "undefined") return null;
@@ -119,6 +142,104 @@ function cloneManifest(manifest: ConversationArchiveManifest): ConversationArchi
     ...manifest,
     recommendedActions: [...manifest.recommendedActions],
   };
+}
+
+function timestampOf(value: string | null | undefined): number {
+  if (!value) return 0;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function canUseRemoteArchiveSync(): boolean {
+  return canUseHomeAgentSyncFetch();
+}
+
+function normalizeRemoteManifest(input: unknown): ConversationArchiveManifest | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const record = input as Partial<ConversationArchiveManifest>;
+  const projectKind =
+    record.projectKind === "script" || record.projectKind === "adaptation" || record.projectKind === "video"
+      ? record.projectKind
+      : null;
+  const projectId = typeof record.projectId === "string" ? record.projectId.trim() : "";
+  if (!projectId || !projectKind) return null;
+
+  return {
+    archiveVersion: Number.isFinite(record.archiveVersion) ? Number(record.archiveVersion) : 1,
+    projectId,
+    title: typeof record.title === "string" && record.title.trim() ? record.title.trim() : projectId,
+    projectKind,
+    automationMode: normalizeAutomationMode(record.automationMode),
+    updatedAt:
+      typeof record.updatedAt === "string" && record.updatedAt.trim()
+        ? record.updatedAt
+        : new Date().toISOString(),
+    messageCount: Number.isFinite(record.messageCount) ? Number(record.messageCount) : 0,
+    artifactCount: Number.isFinite(record.artifactCount) ? Number(record.artifactCount) : 0,
+    currentObjective: typeof record.currentObjective === "string" ? record.currentObjective : "",
+    derivedStage: typeof record.derivedStage === "string" ? record.derivedStage : "",
+    agentSummary: typeof record.agentSummary === "string" ? record.agentSummary : "",
+    recommendedActions: Array.isArray(record.recommendedActions)
+      ? record.recommendedActions.filter((item): item is string => typeof item === "string")
+      : [],
+    dirName: typeof record.dirName === "string" && record.dirName.trim() ? record.dirName.trim() : projectId,
+    hasFullHistory: record.hasFullHistory !== false,
+  };
+}
+
+function normalizeRemoteArchiveEntry(input: unknown): ConversationArchiveRemoteEntry | null {
+  const state =
+    input && typeof input === "object" && "entry" in input
+      ? (input as { entry?: unknown }).entry
+      : input;
+  if (!state || typeof state !== "object" || Array.isArray(state)) return null;
+  const record = state as Partial<ConversationArchiveRemoteEntry>;
+  const projectId = typeof record.projectId === "string" ? record.projectId.trim() : "";
+  if (!projectId) return null;
+  return {
+    projectId,
+    dirName: typeof record.dirName === "string" && record.dirName.trim() ? record.dirName.trim() : projectId,
+    manifest: normalizeRemoteManifest(record.manifest),
+    session:
+      record.session && typeof record.session === "object" && !Array.isArray(record.session)
+        ? (record.session as StudioSessionState)
+        : null,
+    project: record.project ?? null,
+    updatedAt:
+      typeof record.updatedAt === "string" && record.updatedAt.trim()
+        ? record.updatedAt
+        : new Date().toISOString(),
+  };
+}
+
+function normalizeRemoteArchiveIndex(input: unknown): ConversationArchiveRemoteIndexEntry[] {
+  const state =
+    input && typeof input === "object" && "state" in input
+      ? (input as { state?: unknown }).state
+      : input;
+  if (!state || typeof state !== "object" || Array.isArray(state)) return [];
+  const projects = (state as { projects?: unknown }).projects;
+  if (!Array.isArray(projects)) return [];
+  return projects
+    .map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+      const record = entry as Partial<ConversationArchiveRemoteIndexEntry>;
+      const projectId = typeof record.projectId === "string" ? record.projectId.trim() : "";
+      if (!projectId) return null;
+      return {
+        projectId,
+        dirName:
+          typeof record.dirName === "string" && record.dirName.trim()
+            ? record.dirName.trim()
+            : projectId,
+        manifest: normalizeRemoteManifest(record.manifest),
+        updatedAt:
+          typeof record.updatedAt === "string" && record.updatedAt.trim()
+            ? record.updatedAt
+            : new Date().toISOString(),
+      } satisfies ConversationArchiveRemoteIndexEntry;
+    })
+    .filter((entry): entry is ConversationArchiveRemoteIndexEntry => Boolean(entry));
 }
 
 function buildManifest(
@@ -206,6 +327,123 @@ async function writeJson(filePath: string, value: unknown): Promise<boolean> {
   return !!result.ok;
 }
 
+async function fetchRemoteArchiveIndex(
+  options?: { refresh?: boolean },
+): Promise<ConversationArchiveRemoteIndexEntry[]> {
+  if (!canUseRemoteArchiveSync()) return [];
+  if (remoteArchiveIndexCache && !options?.refresh) {
+    return remoteArchiveIndexCache.map((entry) => ({
+      ...entry,
+      manifest: entry.manifest ? cloneManifest(entry.manifest) : null,
+    }));
+  }
+
+  try {
+    const response = await fetch(resolveHomeAgentSyncEndpoint(ARCHIVE_STATE_ENDPOINT), {
+      method: "GET",
+      cache: "no-store",
+      headers: { accept: "application/json" },
+    });
+    if (!response.ok) return [];
+    const entries = normalizeRemoteArchiveIndex(await response.json()).sort(
+      (a, b) =>
+        Math.max(timestampOf(b.updatedAt), timestampOf(b.manifest?.updatedAt)) -
+        Math.max(timestampOf(a.updatedAt), timestampOf(a.manifest?.updatedAt)),
+    );
+    remoteArchiveIndexCache = entries;
+    return entries.map((entry) => ({
+      ...entry,
+      manifest: entry.manifest ? cloneManifest(entry.manifest) : null,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+async function fetchRemoteArchiveEntry(
+  projectId: string,
+  options?: { refresh?: boolean },
+): Promise<ConversationArchiveRemoteEntry | null> {
+  if (!projectId || !canUseRemoteArchiveSync()) return null;
+  if (remoteArchiveEntryCache.has(projectId) && !options?.refresh) {
+    const cached = remoteArchiveEntryCache.get(projectId) ?? null;
+    return cached
+      ? {
+          ...cached,
+          manifest: cached.manifest ? cloneManifest(cached.manifest) : null,
+        }
+      : null;
+  }
+
+  try {
+    const response = await fetch(
+      resolveHomeAgentSyncEndpoint(`${ARCHIVE_STATE_ENDPOINT}/${encodeURIComponent(projectId)}`),
+      {
+        method: "GET",
+        cache: "no-store",
+        headers: { accept: "application/json" },
+      },
+    );
+    if (!response.ok) return null;
+    const entry = normalizeRemoteArchiveEntry(await response.json());
+    remoteArchiveEntryCache.set(projectId, entry);
+    return entry
+      ? {
+          ...entry,
+          manifest: entry.manifest ? cloneManifest(entry.manifest) : null,
+        }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function pushRemoteArchiveEntry(
+  projectId: string,
+  entry: Partial<ConversationArchiveRemoteEntry>,
+): Promise<boolean> {
+  if (!projectId || !canUseRemoteArchiveSync()) return false;
+  try {
+    const response = await fetch(
+      resolveHomeAgentSyncEndpoint(`${ARCHIVE_STATE_ENDPOINT}/${encodeURIComponent(projectId)}`),
+      {
+        method: "PUT",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify({ entry }),
+      },
+    );
+    if (!response.ok) return false;
+    const nextEntry = normalizeRemoteArchiveEntry(await response.json());
+    remoteArchiveEntryCache.set(projectId, nextEntry);
+    remoteArchiveIndexCache = null;
+    return Boolean(nextEntry);
+  } catch {
+    return false;
+  }
+}
+
+async function deleteRemoteArchiveEntry(projectId: string): Promise<boolean> {
+  if (!projectId || !canUseRemoteArchiveSync()) return false;
+  try {
+    const response = await fetch(
+      resolveHomeAgentSyncEndpoint(`${ARCHIVE_STATE_ENDPOINT}/${encodeURIComponent(projectId)}`),
+      {
+        method: "DELETE",
+        headers: { accept: "application/json" },
+      },
+    );
+    if (!response.ok) return false;
+    remoteArchiveEntryCache.delete(projectId);
+    remoteArchiveIndexCache = null;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function listArchiveDirectories(): Promise<Array<{ name: string; dir: string }>> {
   const root = await getArchiveRoot();
   const storage = getStorage();
@@ -264,6 +502,8 @@ async function readManifestAt(name: string, dir: string): Promise<ConversationAr
 
 export function invalidateConversationArchiveScanCache(): void {
   archiveScanCache = null;
+  remoteArchiveIndexCache = null;
+  remoteArchiveEntryCache.clear();
 }
 
 async function copyArchiveDirectory(sourceDir: string, destDir: string): Promise<boolean> {
@@ -327,6 +567,68 @@ export async function resolveConversationArchiveDir(
   return joinPath(root, buildArchiveDirName(projectId, title));
 }
 
+async function getSessionsDbDir(): Promise<string | null> {
+  const storage = getStorage();
+  if (!storage?.getDefaultPath) return null;
+  try {
+    const paths = await storage.getDefaultPath();
+    return joinPath(paths.db.replace(/[\\/]+$/, ""), "sessions");
+  } catch {
+    return null;
+  }
+}
+
+async function materializeRemoteArchiveEntry(entry: ConversationArchiveRemoteEntry): Promise<boolean> {
+  const storage = getStorage();
+  if (!storage?.writeText) return false;
+
+  const title =
+    entry.manifest?.title ||
+    getProjectTitle(entry.project) ||
+    entry.projectId;
+  const dir = await resolveConversationArchiveDir(entry.projectId, title);
+  if (!dir) return false;
+
+  const dirName = getBaseName(dir);
+  const manifest = entry.manifest
+    ? {
+        ...cloneManifest(entry.manifest),
+        projectId: entry.projectId,
+        dirName,
+        title: entry.manifest.title || title || entry.projectId,
+      }
+    : null;
+
+  let wrote = false;
+  if (entry.session) {
+    wrote = (await writeJson(joinPath(dir, FULL_HISTORY_FILE), entry.session)) || wrote;
+    const sessionsDir = await getSessionsDbDir();
+    if (sessionsDir) {
+      await storage.writeText(
+        joinPath(sessionsDir, `${entry.projectId}.json`),
+        JSON.stringify(entry.session),
+      );
+    }
+  }
+  if (typeof entry.project !== "undefined" && entry.project !== null) {
+    wrote = (await writeJson(joinPath(dir, PROJECT_FILE), entry.project)) || wrote;
+  }
+  if (manifest) {
+    wrote = (await writeJson(joinPath(dir, MANIFEST_FILE), manifest)) || wrote;
+  }
+  return wrote;
+}
+
+async function hydrateRemoteArchiveEntryIfNeeded(
+  projectId: string,
+  remoteEntry?: ConversationArchiveRemoteEntry | null,
+): Promise<void> {
+  if (!getStorage()) return;
+  const entry = remoteEntry ?? (await fetchRemoteArchiveEntry(projectId));
+  if (!entry) return;
+  void materializeRemoteArchiveEntry(entry);
+}
+
 export async function writeConversationArchiveFull(
   session: StudioSessionState,
   project?: unknown,
@@ -337,9 +639,7 @@ export async function writeConversationArchiveFull(
 
   const title = getSnapshotTitle(session.currentProjectSnapshot) || getProjectTitle(project) || projectId;
   const dir = await resolveConversationArchiveDir(projectId, title);
-  if (!dir) return false;
-
-  const dirName = getBaseName(dir);
+  const dirName = dir ? getBaseName(dir) : buildArchiveDirName(projectId, title);
   const manifest = buildManifest(
     {
       ...session,
@@ -362,7 +662,7 @@ export async function writeConversationArchiveFull(
   };
 
   let wroteHistory = false;
-  if (options?.copyLegacyProjectMedia && storage?.exportChatHistory) {
+  if (dir && options?.copyLegacyProjectMedia && storage?.exportChatHistory) {
     const sourceDir = await getProjectRootPath(projectId);
     const result = await storage.exportChatHistory({
       sourceDir: sourceDir ?? "",
@@ -373,17 +673,32 @@ export async function writeConversationArchiveFull(
     wroteHistory = !!result.ok;
   }
 
-  if (!wroteHistory) {
+  if (dir && !wroteHistory) {
     wroteHistory = await writeJson(joinPath(dir, FULL_HISTORY_FILE), fullSession);
   }
-  if (!wroteHistory) return false;
 
-  await writeJson(joinPath(dir, MANIFEST_FILE), manifest);
-  if (project) {
-    await writeJson(joinPath(dir, PROJECT_FILE), project);
+  let wroteLocal = wroteHistory;
+  if (dir) {
+    wroteLocal = (await writeJson(joinPath(dir, MANIFEST_FILE), manifest)) || wroteLocal;
+    if (project) {
+      wroteLocal = (await writeJson(joinPath(dir, PROJECT_FILE), project)) || wroteLocal;
+    }
+  }
+
+  const remoteEntry: Partial<ConversationArchiveRemoteEntry> = {
+    projectId,
+    dirName,
+    manifest,
+    session: fullSession as StudioSessionState,
+    ...(typeof project !== "undefined" ? { project } : {}),
+    updatedAt: manifest.updatedAt,
+  };
+  const wroteRemote = dir ? false : await pushRemoteArchiveEntry(projectId, remoteEntry);
+  if (dir) {
+    void pushRemoteArchiveEntry(projectId, remoteEntry);
   }
   invalidateConversationArchiveScanCache();
-  return true;
+  return wroteLocal || wroteRemote;
 }
 
 export async function writeConversationArchiveProject(
@@ -394,9 +709,12 @@ export async function writeConversationArchiveProject(
 ): Promise<boolean> {
   if (!projectId) return false;
   const dir = await resolveConversationArchiveDir(projectId, title || projectId);
-  if (!dir) return false;
-  const wroteProject = await writeJson(joinPath(dir, PROJECT_FILE), project);
-  const existing = await readManifestAt(getBaseName(dir), dir);
+  const dirName = dir ? getBaseName(dir) : buildArchiveDirName(projectId, title || projectId);
+  const wroteProject = dir ? await writeJson(joinPath(dir, PROJECT_FILE), project) : false;
+  const existing =
+    (dir ? await readManifestAt(dirName, dir) : null) ??
+    (await fetchRemoteArchiveEntry(projectId))?.manifest ??
+    null;
   const manifest: ConversationArchiveManifest =
     existing ??
     {
@@ -411,21 +729,35 @@ export async function writeConversationArchiveProject(
       derivedStage: "",
       agentSummary: "",
       recommendedActions: [],
-      dirName: getBaseName(dir),
+      dirName,
       hasFullHistory: false,
     };
-  await writeJson(joinPath(dir, MANIFEST_FILE), {
+  const nextManifest: ConversationArchiveManifest = {
     ...manifest,
     title: title || manifest.title,
     projectKind,
     updatedAt: new Date().toISOString(),
-    dirName: getBaseName(dir),
-  });
+    dirName,
+  };
+  if (dir) {
+    await writeJson(joinPath(dir, MANIFEST_FILE), nextManifest);
+  }
+  const remoteEntry: Partial<ConversationArchiveRemoteEntry> = {
+    projectId,
+    dirName,
+    manifest: nextManifest,
+    project,
+    updatedAt: nextManifest.updatedAt,
+  };
+  const wroteRemote = dir ? false : await pushRemoteArchiveEntry(projectId, remoteEntry);
+  if (dir) {
+    void pushRemoteArchiveEntry(projectId, remoteEntry);
+  }
   invalidateConversationArchiveScanCache();
-  return wroteProject;
+  return wroteProject || wroteRemote;
 }
 
-export async function readConversationArchiveFull(projectId: string): Promise<{
+async function readConversationArchiveFullLocal(projectId: string): Promise<{
   session: StudioSessionState | null;
   project: unknown | null;
   manifest: ConversationArchiveManifest | null;
@@ -440,6 +772,40 @@ export async function readConversationArchiveFull(projectId: string): Promise<{
   return { session, project, manifest };
 }
 
+export async function readConversationArchiveFullLocalOnly(projectId: string): Promise<{
+  session: StudioSessionState | null;
+  project: unknown | null;
+  manifest: ConversationArchiveManifest | null;
+} | null> {
+  return readConversationArchiveFullLocal(projectId);
+}
+
+export async function readConversationArchiveFull(projectId: string): Promise<{
+  session: StudioSessionState | null;
+  project: unknown | null;
+  manifest: ConversationArchiveManifest | null;
+} | null> {
+  const [localArchive, remoteEntry] = await Promise.all([
+    readConversationArchiveFullLocal(projectId),
+    fetchRemoteArchiveEntry(projectId),
+  ]);
+
+  if (!remoteEntry) return localArchive;
+  if (
+    localArchive?.manifest &&
+    timestampOf(localArchive.manifest.updatedAt) > Math.max(timestampOf(remoteEntry.updatedAt), timestampOf(remoteEntry.manifest?.updatedAt))
+  ) {
+    return localArchive;
+  }
+
+  void hydrateRemoteArchiveEntryIfNeeded(projectId, remoteEntry);
+  return {
+    session: remoteEntry.session ?? localArchive?.session ?? null,
+    project: remoteEntry.project ?? localArchive?.project ?? null,
+    manifest: remoteEntry.manifest ?? localArchive?.manifest ?? null,
+  };
+}
+
 export async function readLatestConversationArchiveSession(): Promise<StudioSessionState | null> {
   const records = await scanConversationArchives();
   for (const record of records) {
@@ -449,7 +815,7 @@ export async function readLatestConversationArchiveSession(): Promise<StudioSess
   return null;
 }
 
-export async function scanConversationArchives(options?: { refresh?: boolean }): Promise<ConversationArchiveRecord[]> {
+async function scanConversationArchivesLocal(options?: { refresh?: boolean }): Promise<ConversationArchiveRecord[]> {
   if (archiveScanCache && !options?.refresh) {
     return archiveScanCache.map((record) => ({
       dir: record.dir,
@@ -485,6 +851,73 @@ export async function scanConversationArchives(options?: { refresh?: boolean }):
   return records;
 }
 
+export async function scanConversationArchives(options?: { refresh?: boolean }): Promise<ConversationArchiveRecord[]> {
+  const localRecords = await scanConversationArchivesLocal(options);
+  const remoteEntries = await fetchRemoteArchiveIndex(options);
+  if (!remoteEntries.length) return localRecords;
+
+  const archiveRoot = await getArchiveRoot();
+  const mergedByProjectId = new Map<string, ConversationArchiveRecord>();
+  for (const record of localRecords) {
+    mergedByProjectId.set(record.manifest.projectId, {
+      dir: record.dir,
+      manifest: cloneManifest(record.manifest),
+    });
+  }
+
+  for (const remoteEntry of remoteEntries) {
+    if (!remoteEntry.manifest?.projectId) continue;
+    const existing = mergedByProjectId.get(remoteEntry.manifest.projectId);
+    const remoteRecord: ConversationArchiveRecord = {
+      dir: archiveRoot ? joinPath(archiveRoot, remoteEntry.dirName) : remoteEntry.dirName,
+      manifest: cloneManifest(remoteEntry.manifest),
+    };
+    if (!existing) {
+      mergedByProjectId.set(remoteEntry.manifest.projectId, remoteRecord);
+      continue;
+    }
+    const existingTime = timestampOf(existing.manifest.updatedAt);
+    const remoteTime = Math.max(timestampOf(remoteEntry.updatedAt), timestampOf(remoteEntry.manifest.updatedAt));
+    if (remoteTime > existingTime) {
+      mergedByProjectId.set(remoteEntry.manifest.projectId, remoteRecord);
+    }
+  }
+
+  return [...mergedByProjectId.values()].sort(
+    (a, b) => timestampOf(b.manifest.updatedAt) - timestampOf(a.manifest.updatedAt),
+  );
+}
+
+export async function hydrateConversationArchivesFromCloud(): Promise<number> {
+  if (!getStorage()) return 0;
+  const remoteEntries = await fetchRemoteArchiveIndex({ refresh: true });
+  if (!remoteEntries.length) return 0;
+
+  let materializedCount = 0;
+  for (const remoteEntry of remoteEntries) {
+    const localArchive = await readConversationArchiveFullLocal(remoteEntry.projectId);
+    const localUpdatedAt = timestampOf(localArchive?.manifest?.updatedAt);
+    const remoteUpdatedAt = Math.max(
+      timestampOf(remoteEntry.updatedAt),
+      timestampOf(remoteEntry.manifest?.updatedAt),
+    );
+    if (localArchive?.manifest && localUpdatedAt >= remoteUpdatedAt) {
+      continue;
+    }
+
+    const fullRemoteEntry = await fetchRemoteArchiveEntry(remoteEntry.projectId, { refresh: true });
+    if (!fullRemoteEntry) continue;
+    if (await materializeRemoteArchiveEntry(fullRemoteEntry)) {
+      materializedCount += 1;
+    }
+  }
+
+  if (materializedCount > 0) {
+    invalidateConversationArchiveScanCache();
+  }
+  return materializedCount;
+}
+
 export async function listConversationArchiveSnapshots(): Promise<ConversationProjectSnapshot[]> {
   const records = await scanConversationArchives();
   return records.map((record) => manifestToSnapshot(record.manifest));
@@ -493,13 +926,16 @@ export async function listConversationArchiveSnapshots(): Promise<ConversationPr
 export async function deleteConversationArchive(projectId: string): Promise<boolean> {
   if (!projectId) return false;
   const storage = getStorage();
-  if (!storage?.deleteDir) return false;
   const matches = await findArchiveDirs(projectId);
   let deleted = false;
-  for (const match of matches) {
-    const result = await storage.deleteDir(match.dir);
-    deleted = !!result.ok || deleted;
+  if (storage?.deleteDir) {
+    for (const match of matches) {
+      const result = await storage.deleteDir(match.dir);
+      deleted = !!result.ok || deleted;
+    }
   }
+  const remoteDeleted = await deleteRemoteArchiveEntry(projectId);
+  deleted = deleted || remoteDeleted;
   if (deleted) invalidateConversationArchiveScanCache();
   return deleted;
 }

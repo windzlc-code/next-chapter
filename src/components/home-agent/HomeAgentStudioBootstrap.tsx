@@ -3,6 +3,7 @@ import {
   hydrateHomeAgentCloudSharedState,
   startHomeAgentCloudSharedStateSync,
 } from "@/lib/home-agent/cloud-shared-state";
+import { hydrateConversationArchivesFromCloud } from "@/lib/home-agent/conversation-archive";
 import HomeStudioStartupFallback from "./HomeStudioStartupFallback";
 
 type HomeAgentStudioProps = React.ComponentProps<typeof import("./HomeAgentStudio")["default"]>;
@@ -28,6 +29,7 @@ export default function HomeAgentStudioBootstrap(props: HomeAgentStudioProps) {
 
     const boot = async () => {
       await hydrateHomeAgentCloudSharedState();
+      await hydrateConversationArchivesFromCloud();
       if (cancelled) return;
       stopCloudSync = startHomeAgentCloudSharedStateSync();
       frameA = window.requestAnimationFrame(() => {
