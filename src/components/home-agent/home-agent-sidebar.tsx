@@ -2225,7 +2225,7 @@ const SidebarProjectHistory = memo(function SidebarProjectHistory({
         currentProjectSnapshot,
         currentSessionProjectId: currentProjectId,
       }),
-    [currentProjectId, currentProjectSnapshot, recentProjectSessions, recentProjects],
+    [automationMode, currentProjectId, currentProjectSnapshot, recentProjectSessions, recentProjects],
   );
   const [stableProjects, setStableProjects] = useState<ConversationProjectSnapshot[]>(displayProjects);
   const [isSelectMode, setIsSelectMode] = useState(false);

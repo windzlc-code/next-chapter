@@ -447,6 +447,44 @@ describe("mode-filter fallbacks", () => {
     expect(filtered.map((project) => project.projectId)).toEqual(["manual-project"]);
   });
 
+  it("uses persisted project sessions when runtime sessions have stale mode data", () => {
+    const staleManualSnapshot = createSnapshot({
+      projectId: "shared-project",
+      title: "Shared Project",
+      automationMode: "manual",
+      updatedAt: "2026-04-08T00:01:00.000Z",
+    });
+    const fullAutoSnapshot = {
+      ...staleManualSnapshot,
+      automationMode: "full-auto" as const,
+      updatedAt: "2026-04-08T00:05:00.000Z",
+    };
+    localStorage.setItem(
+      "storyforge-home-agent-project-sessions-v1",
+      JSON.stringify({
+        "shared-project": createSession({
+          projectId: "shared-project",
+          automationMode: "full-auto",
+          currentProjectSnapshot: fullAutoSnapshot,
+        }),
+      }),
+    );
+
+    const filtered = filterRecentProjectsForAutomationMode({
+      recentProjects: [staleManualSnapshot],
+      recentProjectSessions: [
+        createSession({
+          projectId: "shared-project",
+          automationMode: "manual",
+          currentProjectSnapshot: staleManualSnapshot,
+        }),
+      ],
+      mode: "full-auto",
+    });
+
+    expect(filtered.map((project) => project.projectId)).toEqual(["shared-project"]);
+  });
+
   it("hides a bridged video history card when the source script session already owns it", () => {
     const sourceScriptSnapshot = createSnapshot({
       projectId: "script-project-1",

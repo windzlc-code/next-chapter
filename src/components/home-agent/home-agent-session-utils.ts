@@ -469,17 +469,52 @@ function findSessionForProjectId(
   );
 }
 
+function timestampOfProjectSession(
+  session: Pick<StudioSessionState, "currentProjectSnapshot">,
+): number {
+  const value = session.currentProjectSnapshot?.updatedAt;
+  if (!value) return 0;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function mergeProjectSessionFallback(
+  existing: Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot">,
+  fallback: Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot">,
+): Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot"> {
+  const fallbackIsNewer =
+    timestampOfProjectSession(fallback) >= timestampOfProjectSession(existing);
+  const shouldPreferFallbackSnapshot =
+    Boolean(fallback.currentProjectSnapshot) &&
+    (!existing.currentProjectSnapshot || fallbackIsNewer);
+  const shouldPreferFallbackMode =
+    Boolean(fallback.automationMode) &&
+    (!existing.automationMode || fallbackIsNewer);
+
+  return {
+    ...existing,
+    ...fallback,
+    projectId: existing.projectId || fallback.projectId,
+    automationMode: shouldPreferFallbackMode
+      ? fallback.automationMode
+      : existing.automationMode ?? fallback.automationMode,
+    currentProjectSnapshot: shouldPreferFallbackSnapshot
+      ? fallback.currentProjectSnapshot
+      : existing.currentProjectSnapshot ?? fallback.currentProjectSnapshot,
+  };
+}
+
 function getRecentProjectSessionsWithStorageFallback(
   recentProjectSessions: Array<
     Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot">
   > = [],
 ): Array<Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot">> {
   const merged = [...recentProjectSessions];
-  const seen = new Set(
-    merged
-      .map((session) => session.projectId || session.currentProjectSnapshot?.projectId || "")
-      .filter(Boolean),
-  );
+  const indexByProjectId = new Map<string, number>();
+  merged.forEach((session, index) => {
+    const key = session.projectId || session.currentProjectSnapshot?.projectId || "";
+    if (key) indexByProjectId.set(key, index);
+  });
 
   const storageSessions =
     typeof window === "undefined"
@@ -500,8 +535,13 @@ function getRecentProjectSessionsWithStorageFallback(
 
   for (const session of storageSessions) {
     const key = session.projectId || session.currentProjectSnapshot?.projectId || "";
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
+    if (!key) continue;
+    const existingIndex = indexByProjectId.get(key);
+    if (existingIndex !== undefined) {
+      merged[existingIndex] = mergeProjectSessionFallback(merged[existingIndex], session);
+      continue;
+    }
+    indexByProjectId.set(key, merged.length);
     merged.push(session);
   }
 
