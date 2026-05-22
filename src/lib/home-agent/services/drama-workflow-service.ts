@@ -140,24 +140,30 @@ export function ensureDramaProject(
     typeof options?.projectId === "string" && options.projectId.trim()
       ? options.projectId.trim()
       : null;
+  const snapshotProjectId =
+    runtime.currentProjectSnapshot?.projectKind === "script" ||
+    runtime.currentProjectSnapshot?.projectKind === "adaptation"
+      ? runtime.currentProjectSnapshot.projectId.trim()
+      : "";
+  const lookupProjectId = requestedProjectId || snapshotProjectId || null;
 
   if (
     !options?.forceNew &&
     runtime.currentDramaProject &&
-    (!requestedProjectId || runtime.currentDramaProject.id === requestedProjectId)
+    (!lookupProjectId || runtime.currentDramaProject.id === lookupProjectId)
   ) {
     return { ...runtime.currentDramaProject };
   }
-  if (!options?.forceNew && requestedProjectId) {
-    const storedProject = loadStoredDramaProjectById(requestedProjectId);
+  if (!options?.forceNew && lookupProjectId) {
+    const storedProject = loadStoredDramaProjectById(lookupProjectId);
     if (storedProject) {
       return { ...storedProject };
     }
   }
   const seededProjectId =
-    requestedProjectId
-      ? requestedProjectId
-      : runtime.currentProjectSnapshot?.projectId?.trim() || "";
+    lookupProjectId
+      ? lookupProjectId
+      : "";
   return {
     ...createEmptyDramaProject(mode),
     ...(seededProjectId ? { id: seededProjectId } : {}),

@@ -214,6 +214,35 @@ describe("drama workflow service actions", () => {
     expect(nextProject.outlineBatchStatuses).toHaveLength(1);
   });
 
+  it("reloads the stored drama project from the snapshot before continuing after refresh", async () => {
+    const project = createProject({
+      currentStep: "characters",
+      creativePlan: "Creative plan before refresh",
+      characters: "Characters before refresh",
+    });
+    upsertStoredDramaProject(project);
+    const runtimeAfterRefresh: StudioRuntimeState = {
+      ...createRuntime(project),
+      currentDramaProject: null,
+      currentProjectSnapshot: createDramaSnapshot(project),
+    };
+
+    mockedCallGeminiStream.mockResolvedValueOnce(
+      "1. Episode 1 - summary 1\n2. Episode 2 - summary 2",
+    );
+
+    const result = await generateDirectoryAction(
+      { projectId: project.id },
+      runtimeAfterRefresh,
+    );
+    const nextProject = result.data?.dramaProject as DramaProject;
+
+    expect(nextProject.id).toBe(project.id);
+    expect(nextProject.creativePlan).toBe("Creative plan before refresh");
+    expect(nextProject.characters).toBe("Characters before refresh");
+    expect(nextProject.currentStep).toBe("directory");
+  });
+
   it("stores the confirmed duration when entering episode writing", async () => {
     const project = createProject({
       currentStep: "outlines",
