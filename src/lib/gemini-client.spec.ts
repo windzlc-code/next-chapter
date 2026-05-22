@@ -1,15 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const mockApiConfig = {
+  geminiEndpoint: "https://api.tu-zi.com/v1beta",
+  geminiKey: "test-gemini-key",
+  gptEndpoint: "https://api.tu-zi.com/v1",
+  gptKey: "test-gpt-key",
+  seedreamEndpoint: "https://api.tu-zi.com/v1beta",
+  seedreamKey: "test-seedream-key",
+  tuziEndpoint: "https://api.tuziapi.com",
+  tuziKey: "test-tuzi-key",
+};
+
 vi.mock("@/lib/api-config", () => ({
-  getApiConfig: () => ({
-    geminiEndpoint: "https://api.tu-zi.com/v1beta",
-    geminiKey: "test-gemini-key",
-    gptEndpoint: "https://api.tu-zi.com/v1",
-    gptKey: "test-gpt-key",
-    tuziEndpoint: "https://api.tuziapi.com",
-    tuziKey: "test-tuzi-key",
-  }),
+  getApiConfig: () => ({ ...mockApiConfig }),
   resolveConfiguredModelName: (model: string) => model,
+  syncApiConfigToServerProxy: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock("@/lib/network-retry-settings", () => ({
@@ -23,8 +28,13 @@ vi.mock("@/lib/upload-base64-to-storage", () => ({
 
 import {
   AsyncImageTaskPendingError,
+  callGemini,
   callAsyncImageGeneration,
+  callSeedreamImage,
   callTuziImageGeneration,
+  directFetch,
+  explainGeminiNoText,
+  extractText,
   fetchImageAsBase64,
   getProgressiveAsyncImagePollIntervalMs,
   isAsyncImageTaskPendingError,
@@ -36,6 +46,14 @@ describe("gemini async image transport", () => {
     vi.restoreAllMocks();
     vi.useRealTimers();
     window.electronAPI = undefined;
+    mockApiConfig.geminiEndpoint = "https://api.tu-zi.com/v1beta";
+    mockApiConfig.geminiKey = "test-gemini-key";
+    mockApiConfig.gptEndpoint = "https://api.tu-zi.com/v1";
+    mockApiConfig.gptKey = "test-gpt-key";
+    mockApiConfig.seedreamEndpoint = "https://api.tu-zi.com/v1beta";
+    mockApiConfig.seedreamKey = "test-seedream-key";
+    mockApiConfig.tuziEndpoint = "https://api.tuziapi.com";
+    mockApiConfig.tuziKey = "test-tuzi-key";
   });
 
   it("uses the requested progressive polling cadence", () => {
@@ -47,7 +65,7 @@ describe("gemini async image transport", () => {
     expect(getProgressiveAsyncImagePollIntervalMs(240_000)).toBe(5000);
   });
 
-  it("submits production nano banana 2 images to /v1/images/generations", async () => {
+  it("submits production nano banana 2 images through the local GPT proxy in browser dev", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
       new Response(
         JSON.stringify({
@@ -69,13 +87,12 @@ describe("gemini async image transport", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
 
     const submitCall = fetchSpy.mock.calls[0];
-    expect(submitCall?.[0]).toBe("https://api.tu-zi.com/v1/images/generations");
+    expect(submitCall?.[0]).toBe("/api/proxy/gpt/v1/images/generations");
 
     const submitInit = submitCall?.[1] as RequestInit;
     expect(submitInit.method).toBe("POST");
     expect(submitInit.headers).toEqual(
       expect.objectContaining({
-        Authorization: "Bearer test-gemini-key",
         "Content-Type": "application/json",
       }),
     );
@@ -87,7 +104,7 @@ describe("gemini async image transport", () => {
     });
   });
 
-  it("routes gpt-image-2 image generation through the GPT endpoint and key", async () => {
+  it("routes gpt-image-2 image generation through the GPT proxy in browser dev", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
       new Response(
         JSON.stringify({
@@ -108,12 +125,11 @@ describe("gemini async image transport", () => {
 
     expect(result).toEqual({ base64: "AQID", mimeType: "image/png" });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
-    expect(fetchSpy.mock.calls[0]?.[0]).toBe("https://api.tu-zi.com/v1/images/generations");
+    expect(fetchSpy.mock.calls[0]?.[0]).toBe("/api/proxy/gpt/v1/images/generations");
 
     const submitInit = fetchSpy.mock.calls[0]?.[1] as RequestInit;
     expect(submitInit.headers).toEqual(
       expect.objectContaining({
-        Authorization: "Bearer test-gpt-key",
         "Content-Type": "application/json",
       }),
     );
@@ -130,6 +146,147 @@ describe("gemini async image transport", () => {
         service: "gpt",
       }),
     );
+  });
+
+  it("routes non-gpt image generations through the GPT proxy when proxy defaults are active", async () => {
+    mockApiConfig.geminiEndpoint = "/api/proxy/gemini";
+    mockApiConfig.gptEndpoint = "/api/proxy/gpt";
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          data: [{ b64_json: "AQID", mime_type: "image/png" }],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    const consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+    const result = await callTuziImageGeneration("draw a proxy robot", {
+      model: "gemini-3-pro-image-preview",
+      size: "1536x1024",
+    });
+
+    expect(result).toEqual({ base64: "AQID", mimeType: "image/png" });
+    expect(fetchSpy.mock.calls[0]?.[0]).toBe("/api/proxy/gpt/v1/images/generations");
+    const submitInit = fetchSpy.mock.calls[0]?.[1] as RequestInit;
+    expect(submitInit.headers).toEqual(
+      expect.objectContaining({
+        "Content-Type": "application/json",
+      }),
+    );
+    expect((submitInit.headers as Record<string, string>).Authorization).toBeUndefined();
+    expect(consoleInfoSpy).toHaveBeenCalledWith(
+      "[image-generation] submitting /v1/images/generations",
+      expect.objectContaining({
+        model: "gemini-3-pro-image-preview",
+        service: "gpt",
+      }),
+    );
+  });
+
+  it("submits Seedream images through the local Seedream proxy route in browser dev", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          data: [{ b64_json: "AQID", mime_type: "image/png" }],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+
+    const result = await callSeedreamImage("paint a sci-fi poster", {
+      model: "doubao-seedream-5-0-260128",
+      size: "1536x1024",
+    });
+
+    expect(result).toEqual({ base64: "AQID", mimeType: "image/png" });
+    expect(fetchSpy.mock.calls[0]?.[0]).toBe(
+      "/api/proxy/seedream/v1beta/models/doubao-seedream-5-0-260128:generateImages",
+    );
+    const submitInit = fetchSpy.mock.calls[0]?.[1] as RequestInit;
+    expect(submitInit.headers).toEqual(
+      expect.objectContaining({
+        "Content-Type": "application/json",
+      }),
+    );
+    expect(JSON.parse(String(submitInit.body))).toEqual({
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: "paint a sci-fi poster" }],
+        },
+      ],
+      size: "1536x1024",
+      watermark: false,
+    });
+  });
+
+  it("syncs local api config before calling a local server proxy endpoint", async () => {
+    mockApiConfig.geminiEndpoint = "/api/proxy/gemini";
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const apiConfigModule = await import("@/lib/api-config");
+
+    await directFetch(
+      "/api/proxy/gemini/v1beta/models/test:generateContent",
+      { "Content-Type": "application/json" },
+      JSON.stringify({ prompt: "hello" }),
+      undefined,
+      "gemini",
+    );
+
+    expect(apiConfigModule.syncApiConfigToServerProxy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("extracts Seedream image URLs from Gemini-style candidates responses", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: "![image](https://cdn.example.com/seedream-result.png)",
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(Uint8Array.from([1, 2, 3]), {
+          status: 200,
+          headers: { "Content-Type": "image/png" },
+        }),
+      );
+
+    const result = await callSeedreamImage("paint a moonlit lake", {
+      model: "doubao-seedream-5-0-260128",
+    });
+
+    expect(result).toEqual({ base64: "AQID", mimeType: "image/png" });
+    expect(fetchSpy.mock.calls[1]?.[0]).toBe("https://cdn.example.com/seedream-result.png");
   });
 
   it("loads local file references through Electron before submitting image generation", async () => {
@@ -374,5 +531,130 @@ describe("gemini async image transport", () => {
       message: "请求已取消",
     });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("gemini text transport", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("passes structured json constraints through the chat completions bridge", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: "{\"ok\":true}" } }],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+
+    await callGemini(
+      "gpt-5.4",
+      [
+        { role: "system", parts: [{ text: "use strict json" }] },
+        { role: "user", parts: [{ text: "return json" }] },
+      ],
+      {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: "object",
+          properties: {
+            ok: { type: "boolean" },
+          },
+          required: ["ok"],
+        },
+      },
+    );
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy.mock.calls[0]?.[0]).toBe("https://api.tu-zi.com/v1/chat/completions");
+    const init = fetchSpy.mock.calls[0]?.[1] as RequestInit;
+    const payload = JSON.parse(String(init.body));
+    expect(payload.messages[0]).toEqual({
+      role: "system",
+      content: "use strict json",
+    });
+    expect(payload.response_format).toEqual({
+      type: "json_schema",
+      json_schema: {
+        name: "structured_output",
+        schema: {
+          type: "object",
+          properties: {
+            ok: { type: "boolean" },
+          },
+          required: ["ok"],
+        },
+        strict: true,
+      },
+    });
+  });
+
+  it("maps system prompts onto Gemini native systemInstruction blocks", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: "{\"ok\":true}" }] } }],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+
+    await callGemini(
+      "gemini-3-flash-preview",
+      [
+        { role: "system", parts: [{ text: "follow decomposition rules" }] },
+        { role: "user", parts: [{ text: "return json" }] },
+      ],
+      {
+        responseMimeType: "application/json",
+      },
+    );
+
+    const init = fetchSpy.mock.calls[0]?.[1] as RequestInit;
+    const payload = JSON.parse(String(init.body));
+    expect(payload.systemInstruction).toEqual({
+      role: "system",
+      parts: [{ text: "follow decomposition rules" }],
+    });
+    expect(payload.contents).toEqual([
+      { role: "user", parts: [{ text: "return json" }] },
+    ]);
+  });
+
+  it("extracts typed chat content blocks and explains reasoning-only chat responses", () => {
+    expect(
+      extractText({
+        choices: [
+          {
+            message: {
+              content: [
+                { type: "text", text: "first" },
+                { type: "output_text", content: " second" },
+              ],
+            },
+          },
+        ],
+      }),
+    ).toBe("first second");
+
+    expect(
+      explainGeminiNoText({
+        choices: [
+          {
+            message: {
+              reasoning_content: "internal chain of thought",
+            },
+          },
+        ],
+      }),
+    ).toContain("reasoning_content");
   });
 });

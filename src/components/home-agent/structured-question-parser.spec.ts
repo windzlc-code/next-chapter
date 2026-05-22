@@ -521,4 +521,39 @@ AskUserQuestion {
 
     expect(result.request).toBeNull();
   });
+
+  it("collapses split markdown decorators around question blocks without leaking empty marker lines", () => {
+    const result = extractStructuredQuestion(`
+好的，开始新项目！
+
+为了给你最合适的创作方案，我需要先了解几个关键信息：
+
+**
+问题 1 / 3 - 内容类型
+**
+**
+请先确认你想做什么类型的内容？
+**
+- 微短剧脚本
+- 短视频脚本
+- 长视频策划
+
+请告诉我这三个问题的答案，我会根据你的情况设计最高效的创作路径。
+`);
+
+    expect(result.cleanedText).toBe(
+      "好的，开始新项目！\n\n为了给你最合适的创作方案，我需要先了解几个关键信息：\n\n请告诉我这三个问题的答案，我会根据你的情况设计最高效的创作路径。",
+    );
+    expect(result.cleanedText).not.toContain("**");
+    expect(result.request?.questions).toHaveLength(1);
+    expect(result.request?.questions[0]).toMatchObject({
+      header: "内容类型",
+      question: "请先确认你想做什么类型的内容？",
+    });
+    expect(result.request?.questions[0]?.options.map((option) => option.label)).toEqual([
+      "微短剧脚本",
+      "短视频脚本",
+      "长视频策划",
+    ]);
+  });
 });

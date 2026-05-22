@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { AssistantCreationGuideBody } from "./AssistantCreationGuideBody";
 
@@ -213,5 +213,77 @@ describe("AssistantCreationGuideBody", () => {
     expect(screen.getByPlaceholderText("添加场景标签")).toBeInTheDocument();
     expect(screen.getByPlaceholderText("添加人物标签")).toBeInTheDocument();
     expect(screen.queryByText("[添加标签]")).not.toBeInTheDocument();
+  });
+  it("renders minified storyboard json blocks after restore without falling back to raw code", () => {
+    const breakdown = {
+      summary: {
+        total_episodes: 1,
+        total_clips: 1,
+        total_duration: "15s",
+      },
+      episodes: [
+        {
+          episode: "第 1 集",
+          summary: {
+            clips_count: 1,
+            total_duration: "15s",
+          },
+          clips: [
+            {
+              id: "segment-1-1-1",
+              title: "片段 1-1",
+              duration: "15s",
+              tags: ["深夜食堂 雨夜", "苏暖", "陆沉渊"],
+              shots: [
+                {
+                  index: 1,
+                  content: "暴雨击打窗外霓虹，苏暖在厨房门口抬眼看向陆沉渊。",
+                  links: 0,
+                },
+              ],
+              footer_info: "无字幕、无水印、无屏幕文字",
+            },
+          ],
+        },
+      ],
+    };
+
+    render(
+      <AssistantCreationGuideBody
+        content={["以下按导出拆镜 xlsx 的分段结构展示：", "", "```json", JSON.stringify(breakdown), "```"].join("\n")}
+      />,
+    );
+
+    expect(screen.getByText("第 1 集")).toBeInTheDocument();
+    expect(screen.getByText("片段1-1")).toBeInTheDocument();
+    expect(screen.queryByText(/\"summary\"/)).not.toBeInTheDocument();
+  });
+
+  it("renders entity checklist tables with compact horizontal layout and stable header wrapping", async () => {
+    render(
+      <AssistantCreationGuideBody
+        content={[
+          "| 序号 | 角色名 | 描述 | 角色变体 |",
+          "| --- | --- | --- | --- |",
+          "| 1 | 苏暖 | 年轻女性，厨师，眼神清澈，气质坚韧。 | 睡裙：棉质睡裙，居家休息时的装束。 |",
+        ].join("\n")}
+      />,
+    );
+
+    const table = (await screen.findAllByRole("table"))[0];
+    const wrapper = table.parentElement as HTMLElement | null;
+    expect(wrapper).not.toBeNull();
+    expect(wrapper?.className).toContain("overflow-hidden");
+    expect(table.className).toContain("table-fixed");
+
+    const roleNameHeader = await waitFor(
+      () => screen.getByText("角色名").closest("th") as HTMLElement | null,
+    );
+    expect(roleNameHeader).not.toBeNull();
+    expect(roleNameHeader?.className).toContain("whitespace-nowrap");
+
+    const descriptionCell = screen.getByText(/年轻女性，厨师/).closest("td") as HTMLElement | null;
+    expect(descriptionCell).not.toBeNull();
+    expect(descriptionCell?.querySelector("div")?.className).toContain("[-webkit-line-clamp:3]");
   });
 });

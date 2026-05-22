@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ComposerQuestion, ConversationProjectSnapshot } from "@/lib/home-agent/types";
-import { handleHomeAgentChoiceSelection } from "./home-agent-session-actions";
+import type {
+  ComposerQuestion,
+  ConversationProjectSnapshot,
+  StudioRuntimeState,
+} from "@/lib/home-agent/types";
+import {
+  handleHomeAgentChoiceSelection,
+  resetRuntimeState,
+} from "./home-agent-session-actions";
 
 function createSnapshot(
   overrides: Partial<ConversationProjectSnapshot> = {},
@@ -39,6 +46,44 @@ function createQuestion(
     answerKey: "script-characters",
     ...overrides,
   };
+}
+
+function createRuntime(overrides: Partial<StudioRuntimeState> = {}): StudioRuntimeState {
+  return {
+    sessionId: "session-1",
+    suppressHistoricalMemory: false,
+    currentProjectSnapshot: {
+      projectId: "project-1",
+      projectKind: "video",
+      title: "Project 1",
+      currentObjective: "Continue workflow",
+      derivedStage: "角色与场景",
+      agentSummary: "summary",
+      recommendedActions: [],
+      artifacts: [],
+      automationMode: "full-auto",
+    },
+    currentDramaProject: null,
+    currentVideoProject: null,
+    currentSetupDraft: null,
+    skillDrafts: [],
+    maintenanceReports: [],
+    recentProjects: [],
+    recentProjectSessions: [],
+    recentMessageSummary: "recent",
+    fullAutoRun: {
+      status: "running",
+      currentStepIndex: 2,
+      currentStepLabel: "角色转译",
+      plan: {
+        id: "plan-1",
+        mode: "adaptation-v1",
+        steps: [],
+        currentStepIndex: 2,
+      },
+    },
+    ...overrides,
+  } as StudioRuntimeState;
 }
 
 describe("handleHomeAgentChoiceSelection", () => {
@@ -193,5 +238,23 @@ describe("handleHomeAgentChoiceSelection", () => {
     expect(handled).toBe(true);
     expect(answer).not.toHaveBeenCalledWith("video:kickoff:prefs:mode:text-to-video", "文生视频");
     expect(setSelectedValues).not.toHaveBeenCalled();
+  });
+});
+
+describe("resetRuntimeState", () => {
+  it("clears the runtime ref synchronously while resetting state", () => {
+    const setRuntime = vi.fn();
+    const runtimeRef = { current: createRuntime() };
+
+    resetRuntimeState(setRuntime, runtimeRef);
+
+    expect(runtimeRef.current.currentProjectSnapshot).toBeNull();
+    expect(runtimeRef.current.fullAutoRun).toBeNull();
+    expect(runtimeRef.current.currentDramaProject).toBeNull();
+    expect(runtimeRef.current.currentVideoProject).toBeNull();
+    expect(setRuntime).toHaveBeenCalledWith(expect.any(Function));
+
+    const updater = setRuntime.mock.calls[0][0] as () => StudioRuntimeState;
+    expect(updater()).toBe(runtimeRef.current);
   });
 });

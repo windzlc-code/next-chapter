@@ -6,15 +6,23 @@ import type {
   MaintenanceReport,
   SkillDraft,
   StudioRuntimeState,
+  VideoWorkflowTaskBoard,
+  VideoWorkflowTaskBoardItem,
 } from "@/lib/home-agent/types";
 import { getDurationConstraints } from "@/lib/drama-prompts";
 import type { CharacterSetting, Scene, SceneSetting } from "@/types/project";
 import { EPISODE_COUNTS, GENRES, TARGET_MARKETS } from "@/types/drama";
+import { buildVideoGenerationRouteHint } from "@/lib/home-agent/video-generation-route-hint";
 import {
   canSwitchToVideoWorkflowStep,
   hasAutoExportableVideoSegments,
+  hasIncompleteVideoEpisodeCoverage,
+  hasPassedVideoScriptBreakdown,
 } from "@/lib/home-agent/video-workflow-step-gates";
+import { hasUsableMediaUrl } from "@/lib/home-agent/media-url";
+import { buildCharacterAudioPresetPickerValue } from "@/lib/home-agent/character-audio-preset-library";
 import { getVideoImageGenerationBatchLimit } from "@/lib/home-agent/image-models";
+import { getHomeAgentVideoGenerationBatchLimit } from "@/lib/home-agent/video-models";
 import { buildRecoveryActionRationale, summarizeRecoveryArtifacts } from "./home-agent-session-utils";
 import { truncateCopy } from "./home-agent-task-utils";
 
@@ -161,6 +169,45 @@ export function listRunningVideoSceneIdsForSegment(
     .map((scene) => scene.id);
 }
 
+function getVideoGenerationBatchCount(
+  total: number,
+  prefs?: PersistedVideoProject["videoGenerationPrefs"] | null,
+): number {
+  return Math.min(total, getHomeAgentVideoGenerationBatchLimit(prefs));
+}
+
+function buildVideoGenerationBatchLabel(
+  kind: "segment" | "scene",
+  total: number,
+  prefs?: PersistedVideoProject["videoGenerationPrefs"] | null,
+): string {
+  const batchCount = getVideoGenerationBatchCount(total, prefs);
+  return kind === "segment"
+    ? `智能生成片段 ${batchCount}/${total}`
+    : `智能生成镜头 ${batchCount}/${total}`;
+}
+
+function getStoryboardFrameBatchCount(
+  total: number,
+  prefs?: PersistedVideoProject["imageGenerationPrefs"] | null,
+): number {
+  return Math.min(total, getVideoImageGenerationBatchLimit(prefs));
+}
+
+function buildStoryboardFrameBatchLabel(
+  total: number,
+  prefs?: PersistedVideoProject["imageGenerationPrefs"] | null,
+): string {
+  return `智能补图 剩余${total}（本轮${getStoryboardFrameBatchCount(total, prefs)}）`;
+}
+
+function buildReferenceAssetBatchLabel(
+  total: number,
+  prefs?: PersistedVideoProject["imageGenerationPrefs"] | null,
+): string {
+  return `智能补图 剩余${total}（本轮${Math.min(total, getVideoImageGenerationBatchLimit(prefs))}）`;
+}
+
 export function listCompletedVideoScenes(project: PersistedVideoProject | null | undefined): Scene[] {
   if (!project) return [];
   return [...project.scenes].filter((scene) => !!scene.videoUrl).sort(compareSceneOrder);
@@ -215,60 +262,21 @@ function filterQuestionOptions(
   return options.length ? { ...question, options } : null;
 }
 
-function parseVideoEpisodeNumber(value: string): number {
-  const digitMap: Record<string, number> = {
-    零: 0,
-    一: 1,
-    二: 2,
-    三: 3,
-    四: 4,
-    五: 5,
-    六: 6,
-    七: 7,
-    八: 8,
-    九: 9,
-  };
-  if (/^\d+$/.test(value)) return Number(value);
-  if (value === "十") return 10;
-  const tenIndex = value.indexOf("十");
-  if (tenIndex >= 0) {
-    const tens = tenIndex === 0 ? 1 : digitMap[value[tenIndex - 1]] ?? 0;
-    const ones = tenIndex === value.length - 1 ? 0 : digitMap[value[tenIndex + 1]] ?? 0;
-    return tens * 10 + ones;
-  }
-  return value.split("").reduce((acc, char) => acc * 10 + (digitMap[char] ?? 0), 0);
+function withoutQuestionActionValue(
+  question: ComposerQuestion | null,
+  actionValue: string,
+): ComposerQuestion | null {
+  return filterQuestionOptions(question, (value) => value !== actionValue);
 }
 
-function listVideoScriptEpisodeNumbers(script: string): number[] {
-  const episodeNumbers = new Set<number>();
-  const pattern = /(?:^|\n)\s*(?:EP\s*(\d+)|第\s*([零一二三四五六七八九十\d]+)\s*[集话期章]|Episode\s+(\d+))/gim;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(script)) !== null) {
-    const raw = match[1] || match[2] || match[3] || "";
-    const episodeNumber = parseVideoEpisodeNumber(raw);
-    if (Number.isFinite(episodeNumber) && episodeNumber > 0) {
-      episodeNumbers.add(episodeNumber);
-    }
+function hasConfirmedVideoScriptBreakdown(
+  project: PersistedVideoProject | null | undefined,
+): boolean {
+  if (!project) return false;
+  if ((project.scenes.length ?? 0) > 0) {
+    return hasPassedVideoScriptBreakdown(project);
   }
-  return [...episodeNumbers].sort((a, b) => a - b);
-}
-
-function hasIncompleteVideoEpisodeCoverage(project: PersistedVideoProject | null | undefined): boolean {
-  if (!project?.scenes.length) return false;
-  const scriptEpisodes = listVideoScriptEpisodeNumbers(project.script || "");
-  if (scriptEpisodes.length <= 1) return false;
-
-  const sceneEpisodes = new Set<number>();
-  for (const scene of project.scenes) {
-    const match = String(scene.segmentLabel || "").trim().match(/^(\d+)-/);
-    if (!match) continue;
-    const episodeNumber = Number(match[1]);
-    if (Number.isFinite(episodeNumber) && episodeNumber > 0) {
-      sceneEpisodes.add(episodeNumber);
-    }
-  }
-
-  return scriptEpisodes.some((episodeNumber) => !sceneEpisodes.has(episodeNumber));
+  return project.scriptBreakdownPassed === true;
 }
 
 function shouldShowVideoBridgeOption(
@@ -283,11 +291,8 @@ function shouldShowVideoBridgeOption(
   const sceneAssetCount = project?.sceneSettings.length ?? 0;
   const shotPacketCount = countShotPackets(project);
   const mode = project?.videoGenerationPrefs?.mode ?? "image-to-video";
+  const breakdownPassed = hasConfirmedVideoScriptBreakdown(project);
 
-  const bootstrapReady = Boolean(
-    project?.targetPlatform?.trim() &&
-      project?.shotStyle?.trim(),
-  );
   const hasEntities = characterCount > 0 || sceneAssetCount > 0;
   const generatableStoryboardSceneCount = countGeneratableStoryboardScenes(project, readyReferenceIds);
   const referencesReady = generatableStoryboardSceneCount > 0;
@@ -315,18 +320,20 @@ function shouldShowVideoBridgeOption(
 
   switch (value) {
     case "video:bridge:entities":
-      return stage !== "脚本拆解" || (sceneCount > 0 && bootstrapReady);
+      return true;
+    case "video:bridge:next-step":
+      return breakdownPassed;
     case "video:bridge:platform":
       return false;
     case "video:bridge:reference-assets":
+    case "video:bridge:reference-assets:full":
       return hasEntities;
     case "video:bridge:storyboard":
       return stage !== "角色与场景" || (sceneCount > 0 && referencesReady);
     case "video:bridge:storyboard-frames":
       return countReadyStoryboardFrameScenes(project) < sceneCount;
     case "video:bridge:shots":
-      // 只要有镜头拆解结果就可以编译（文生视频/图生视频均支持）
-      return sceneCount > 0;
+      return sceneCount > 0 && breakdownPassed;
     case "video:bridge:prompts":
       // 只有在编译了镜头指令包后才显示（严格门控：必须先执行过 video:bridge:shots）
       return shotPacketCount > 0 && sceneCount > 0;
@@ -343,7 +350,8 @@ function shouldShowVideoBridgeOption(
       if (
         value.startsWith("video:bridge:prompts:segment:episode:") ||
         value.startsWith("video:bridge:prompts:segment:label:") ||
-        value.startsWith("video:bridge:prompts:segment:ep-group:")
+        value.startsWith("video:bridge:prompts:segment:ep-group:") ||
+        value.startsWith("video:panel:bridge:prompts:segment:ep-group:")
       ) {
         return shotPacketCount > 0 && sceneCount > 0;
       }
@@ -395,17 +403,664 @@ function resolveVisibleVideoStageName(stage: string | null | undefined): VideoVi
   }
 }
 
+function resolveVideoContinuationStage(
+  snapshot: ConversationProjectSnapshot,
+  project: PersistedVideoProject | null | undefined,
+): VideoVisibleStage {
+  const snapshotStage = resolveVisibleVideoStageName(snapshot.derivedStage);
+  if (snapshot.projectKind !== "video" || !project || typeof project.currentStep !== "number") {
+    return snapshotStage;
+  }
+
+  if (project.currentStep === 2) {
+    return "角色与场景";
+  }
+
+  if (project.currentStep === 3) {
+    return (project.videoGenerationPrefs?.mode ?? "image-to-video") === "text-to-video"
+      ? "角色与场景"
+      : "分镜图生成";
+  }
+
+  if (project.currentStep === 5) {
+    if (
+      Boolean(project.productionStateBundle?.directoryPath) ||
+      listCompletedVideoScenes(project).length > 0 ||
+      listFailedVideoScenes(project).length > 0
+    ) {
+      return "预览与导出";
+    }
+  }
+
+  if (project.currentStep === 4) {
+    const isTextToVideo = (project.videoGenerationPrefs?.mode ?? "image-to-video") === "text-to-video";
+    const hasGenerationContext =
+      Boolean(project.videoPromptBatch?.trim()) ||
+      listGeneratableVideoScenes(project).length > 0 ||
+      listRunningVideoScenes(project).length > 0 ||
+      listFailedVideoScenes(project).length > 0 ||
+      (isTextToVideo &&
+        (
+          listGeneratableSegmentVideoLabels(project).length > 0 ||
+          listRunningSegmentVideoLabels(project).length > 0 ||
+          listFailedSegmentVideoLabels(project).length > 0
+        ));
+
+    if (hasGenerationContext) {
+      return "视频生成";
+    }
+  }
+
+  return snapshotStage;
+}
+
+function createVideoTaskBoardItem(
+  id: string,
+  label: string,
+  value: string | number,
+  state: VideoWorkflowTaskBoardItem["state"],
+  tone: VideoWorkflowTaskBoardItem["tone"] = "default",
+): VideoWorkflowTaskBoardItem {
+  return { id, label, value, state, tone };
+}
+
+function normalizeVideoPromptTaskBoardLabels(
+  items: VideoWorkflowTaskBoardItem[],
+): VideoWorkflowTaskBoardItem[] {
+  return items.map((item) => {
+    if (item.id === "segment-prompts") {
+      return {
+        ...item,
+        label: item.state === "attention" ? "缺片段提示词" : "片段提示词",
+      };
+    }
+    if (item.id === "shot-prompts") {
+      return {
+        ...item,
+        label: item.state === "attention" ? "缺镜头提示词" : "镜头提示词",
+      };
+    }
+    return item;
+  });
+}
+
+type VideoTaskBoardDetailContext = {
+  sceneCount: number;
+  characterCount: number;
+  sceneAssetCount: number;
+  characterVariantCount: number;
+  sceneVariantCount: number;
+  totalReferenceCount: number;
+  missingReferenceCount: number;
+  storyboardedSceneCount: number;
+  missingStoryboardCount: number;
+  shotPacketCount: number;
+  generatableSceneCount: number;
+  runningSceneCount: number;
+  failedSceneCount: number;
+  completedSceneCount: number;
+  segmentPendingCount: number;
+  segmentRunningCount: number;
+  segmentFailedCount: number;
+  segmentPromptCount: number;
+  totalSegmentCount: number;
+  shotPromptCount: number;
+};
+
+function appendVideoTaskBoardVariantHint(detail: string, variantCount: number): string {
+  if (variantCount <= 0) return detail;
+  return `${detail} · 含 ${variantCount} 个变体`;
+}
+
+function decorateVideoTaskBoardDetail(
+  itemId: VideoWorkflowTaskBoardItem["id"],
+  detail: string,
+  context: VideoTaskBoardDetailContext,
+): string {
+  if (itemId === "characters") {
+    return appendVideoTaskBoardVariantHint(detail, context.characterVariantCount);
+  }
+
+  if (itemId === "scene-settings") {
+    return appendVideoTaskBoardVariantHint(detail, context.sceneVariantCount);
+  }
+
+  return detail;
+}
+
+function withVideoTaskBoardDetails(
+  items: VideoWorkflowTaskBoardItem[],
+  context: VideoTaskBoardDetailContext,
+): VideoWorkflowTaskBoardItem[] {
+  return items.map((item) => {
+    const count = typeof item.value === "number" ? item.value : Number(item.value) || 0;
+    const compactDetailById: Partial<Record<VideoWorkflowTaskBoardItem["id"], string>> = {
+      "scene-drafts": count > 0 ? `已拆出 ${count} 个镜头草案` : "等待拆出首批镜头草案",
+      characters: count > 0 ? `已整理 ${count} 个角色` : "还没有角色列表",
+      "scene-settings": count > 0 ? `已整理 ${count} 个场景` : "还没有场景设定",
+      "missing-assets": count > 0 ? `待补 ${count} 项角色或场景素材` : "角色与场景素材已补齐",
+      "missing-references": count > 0 ? `待补 ${count} 张角色或场景参考图` : "参考图已准备完成",
+      "shot-packets": count > 0 ? `已编译 ${count} 个镜头包` : "还没有镜头包",
+      "segment-prompts":
+        count > 0 && context.segmentPromptCount < context.totalSegmentCount
+          ? `片段提示词 ${context.segmentPromptCount}/${context.totalSegmentCount}，待补 ${count}`
+          : `片段提示词 ${context.segmentPromptCount}/${Math.max(context.totalSegmentCount, context.segmentPromptCount)} 已完成`,
+      "shot-prompts":
+        count > 0 && context.shotPromptCount < context.sceneCount
+          ? `镜头提示词 ${context.shotPromptCount}/${context.sceneCount}，待补 ${count}`
+          : `镜头提示词 ${context.shotPromptCount}/${Math.max(context.sceneCount, context.shotPromptCount)} 已完成`,
+      "storyboarded-scenes":
+        context.sceneCount > 0 ? `分镜图 ${context.storyboardedSceneCount}/${context.sceneCount}` : "分镜图已生成",
+      "missing-storyboards": count > 0 ? `待补 ${count} 张分镜图` : "分镜图已补齐",
+      "segment-video-pending": count > 0 ? `待生成 ${count} 个片段视频` : "没有待生成的片段视频",
+      "segment-video-running": count > 0 ? `${count} 个片段视频生成中` : "没有进行中的片段视频",
+      "segment-video-failed": count > 0 ? `${count} 个片段视频生成失败` : "片段视频没有失败项",
+      "video-pending": count > 0 ? `待生成 ${count} 个镜头` : "没有待生成的镜头",
+      "video-running": count > 0 ? `${count} 个镜头生成中` : "没有进行中的镜头任务",
+      "video-failed": count > 0 ? `${count} 个镜头生成失败` : "没有失败的镜头",
+      "completed-scenes": count > 0 ? `已完成 ${count} 个镜头` : "还没有已出片镜头",
+      "remaining-scenes": count > 0 ? `还有 ${count} 个镜头待补片` : "可出片镜头都已完成",
+      "running-scenes": count > 0 ? `${count} 个镜头仍在出片` : "没有进行中的出片任务",
+    };
+    let compactDetail = compactDetailById[item.id];
+    if (item.id === "missing-references" && context.totalReferenceCount > 0) {
+      compactDetail =
+        context.missingReferenceCount > 0
+          ? `\u53c2\u8003\u56fe ${context.totalReferenceCount - context.missingReferenceCount}/${context.totalReferenceCount}\uff0c\u5f85\u8865 ${context.missingReferenceCount}`
+          : `\u53c2\u8003\u56fe ${context.totalReferenceCount}/${context.totalReferenceCount} \u5df2\u51c6\u5907\u5b8c\u6210`;
+    }
+    if (compactDetail) {
+      return {
+        ...item,
+        detail: decorateVideoTaskBoardDetail(item.id, compactDetail, context),
+      };
+    }
+    let detail: string;
+
+    switch (item.id) {
+      case "scene-drafts":
+        detail =
+          count > 0 ? `已拆出 ${count} 个镜头草案，可继续整理角色与场景。` : "等待从剧本拆解出首批镜头草案。";
+        break;
+      case "characters":
+        detail =
+          count > 0 ? `已整理 ${count} 个角色，继续补资产后就能往下推进。` : "还没有整理出角色列表。";
+        break;
+      case "scene-settings":
+        detail =
+          count > 0 ? `已整理 ${count} 个场景，继续补场景资产即可。` : "还没有整理出场景设定。";
+        break;
+      case "missing-assets":
+        detail =
+          count > 0 ? `还有 ${count} 项角色或场景素材未补齐，会影响后续出图与出片。` : "角色与场景素材已补齐。";
+        break;
+      case "missing-references":
+        detail =
+          count > 0 ? `还有 ${count} 张角色或场景参考图待补齐。` : "角色与场景参考图已准备完成。";
+        break;
+      case "shot-packets":
+        detail =
+          count > 0 ? `已编译 ${count} 个镜头包，可直接衔接提示词和出片。` : "还没有生成镜头包。";
+        break;
+      case "segment-prompts":
+        detail =
+          count > 0 && context.segmentPromptCount < context.totalSegmentCount
+            ? `${context.segmentPromptCount}/${context.totalSegmentCount} 个片段已写提示词，剩余 ${count} 个待补。`
+            : `${context.segmentPromptCount}/${Math.max(context.totalSegmentCount, context.segmentPromptCount)} 个片段提示词已准备完成。`;
+        break;
+      case "shot-prompts":
+        detail =
+          count > 0 && context.shotPromptCount < context.sceneCount
+            ? `${context.shotPromptCount}/${context.sceneCount} 个镜头已写提示词，剩余 ${count} 个待补。`
+            : `${context.shotPromptCount}/${Math.max(context.sceneCount, context.shotPromptCount)} 个镜头提示词已准备完成。`;
+        break;
+      case "storyboarded-scenes":
+        detail =
+          context.sceneCount > 0
+            ? `${context.storyboardedSceneCount}/${context.sceneCount} 个镜头已有分镜图。`
+            : "分镜图已生成，可继续检查素材。";
+        break;
+      case "missing-storyboards":
+        detail =
+          count > 0 ? `还有 ${count} 个镜头缺分镜图，建议先补齐。` : "所有镜头的分镜图都已补齐。";
+        break;
+      case "segment-video-pending":
+        detail = count > 0 ? `还有 ${count} 个片段已排队待出片。` : "当前没有待生成的片段视频。";
+        break;
+      case "segment-video-running":
+        detail = count > 0 ? `${count} 个片段视频正在生成，可先等回收结果。` : "当前没有进行中的片段视频任务。";
+        break;
+      case "segment-video-failed":
+        detail = count > 0 ? `${count} 个片段视频生成失败，建议优先补发。` : "片段视频没有失败项。";
+        break;
+      case "video-pending":
+        detail = count > 0 ? `还有 ${count} 个镜头已准备好，等待出片。` : "当前没有待生成的镜头。";
+        break;
+      case "video-running":
+        detail = count > 0 ? `${count} 个镜头正在生成，可先等待最新结果。` : "当前没有进行中的镜头任务。";
+        break;
+      case "video-failed":
+        detail = count > 0 ? `${count} 个镜头出片失败，需要补发或重试。` : "当前没有失败的镜头。";
+        break;
+      case "completed-scenes":
+        detail = count > 0 ? `已完成 ${count} 个镜头，可进入预览与检查。` : "还没有已出片的镜头。";
+        break;
+      case "remaining-scenes":
+        detail = count > 0 ? `还有 ${count} 个镜头尚未出片，可以继续补发。` : "所有可出片镜头都已处理完成。";
+        break;
+      case "running-scenes":
+        detail = count > 0 ? `${count} 个镜头仍在后台出片，稍后可刷新回收。` : "当前没有进行中的出片任务。";
+        break;
+      default:
+        detail = `${item.label} ${item.value}`;
+        break;
+    }
+
+    if (item.id === "missing-references" && context.totalReferenceCount > 0) {
+      detail =
+        context.missingReferenceCount > 0
+          ? `\u89d2\u8272\u4e0e\u573a\u666f\u53c2\u8003\u56fe\u5df2\u5c31\u7eea ${context.totalReferenceCount - context.missingReferenceCount}/${context.totalReferenceCount}\uff0c\u8fd8\u6709 ${context.missingReferenceCount} \u5f20\u5f85\u8865\u9f50\u3002`
+          : `\u89d2\u8272\u4e0e\u573a\u666f\u53c2\u8003\u56fe\u5df2\u5168\u90e8\u51c6\u5907\u5b8c\u6210\uff08${context.totalReferenceCount}/${context.totalReferenceCount}\uff09\u3002`;
+    }
+
+    return {
+      ...item,
+      detail: decorateVideoTaskBoardDetail(item.id, detail, context),
+    };
+  });
+}
+
+export function buildVideoWorkflowTaskBoard(
+  snapshot: ConversationProjectSnapshot | null | undefined,
+  project: PersistedVideoProject | null | undefined,
+): VideoWorkflowTaskBoard | null {
+  if (!snapshot || snapshot.projectKind !== "video") return null;
+
+  const stage = resolveVideoContinuationStage(snapshot, project);
+  const mode = project?.videoGenerationPrefs?.mode ?? "image-to-video";
+  const headerHint = buildVideoGenerationRouteHint({
+    project,
+    modelKey: project?.videoGenerationPrefs?.modelKey,
+    mode,
+  });
+  const withHeaderHint = (
+    board: VideoWorkflowTaskBoard | null,
+  ): VideoWorkflowTaskBoard | null =>
+    board
+      ? {
+          ...board,
+          headerHint,
+        }
+      : null;
+  const isTextToVideo = mode === "text-to-video";
+  const readyReferenceIds = buildReadyReferenceIdsFromAssets(project);
+  const sceneCount = project?.scenes.length ?? 0;
+  const characterCount = project?.characters.length ?? 0;
+  const sceneAssetCount = project?.sceneSettings.length ?? 0;
+  const characterVariantCount = (project?.characters ?? []).reduce(
+    (total, item) => total + (item.costumes?.length ?? 0),
+    0,
+  );
+  const sceneVariantCount = (project?.sceneSettings ?? []).reduce(
+    (total, item) => total + (item.timeVariants?.length ?? 0),
+    0,
+  );
+  const missingReferenceCount = listVideoReferenceAssetTargetIds(project).length;
+  const totalReferenceCount = listVideoReferenceAssetTargetIds(project, { includeReady: true }).length;
+  const storyboardedSceneCount = countStoryboardedScenes(project);
+  const missingStoryboardCount = Math.max(sceneCount - storyboardedSceneCount, 0);
+  const shotPacketCount = countShotPackets(project);
+  const completedScenes = listCompletedVideoScenes(project);
+  const runningScenes = listRunningVideoScenes(project);
+  const failedScenes = listFailedVideoScenes(project);
+  const generatableScenes = listGeneratableVideoScenes(project);
+  const segmentVideoCandidates = isTextToVideo ? listGeneratableSegmentVideoLabels(project) : [];
+  const runningSegmentVideoCandidates = isTextToVideo ? listRunningSegmentVideoLabels(project) : [];
+  const failedSegmentVideoCandidates = isTextToVideo ? listFailedSegmentVideoLabels(project) : [];
+  const hasSegmentPrompts = Object.keys(project?.segmentVideoPrompts ?? {}).length > 0;
+  const t2vAllSegmentLabels = isTextToVideo
+    ? [
+        ...new Set(
+            (project?.scenes ?? [])
+              .map((item) => item.segmentLabel?.trim())
+              .filter((label): label is string => Boolean(label && EPISODE_SEGMENT_RE.test(label))),
+          ),
+      ]
+    : [];
+  const t2vSegmentPromptCount = t2vAllSegmentLabels.filter(
+    (label) => Boolean(project?.segmentVideoPrompts?.[label]?.prompt?.trim()),
+  ).length;
+  const t2vShotPromptCount = (project?.scenes ?? []).filter((item) => Boolean(item.enhancedVideoPrompt?.trim())).length;
+  const scriptBreakdownStage = VIDEO_VISIBLE_STAGE_FLOW[0];
+  const entityStage = VIDEO_VISIBLE_STAGE_FLOW[1];
+  const storyboardStage = VIDEO_VISIBLE_STAGE_FLOW[2];
+  const generationStage = VIDEO_VISIBLE_STAGE_FLOW[3];
+  const previewStage = VIDEO_VISIBLE_STAGE_FLOW[4];
+  const detailContext: VideoTaskBoardDetailContext = {
+    sceneCount,
+    characterCount,
+    sceneAssetCount,
+    characterVariantCount,
+    sceneVariantCount,
+    totalReferenceCount,
+    missingReferenceCount,
+    storyboardedSceneCount,
+    missingStoryboardCount,
+    shotPacketCount,
+    generatableSceneCount: generatableScenes.length,
+    runningSceneCount: runningScenes.length,
+    failedSceneCount: failedScenes.length,
+    completedSceneCount: completedScenes.length,
+    segmentPendingCount: segmentVideoCandidates.length,
+    segmentRunningCount: runningSegmentVideoCandidates.length,
+    segmentFailedCount: failedSegmentVideoCandidates.length,
+    segmentPromptCount: t2vSegmentPromptCount,
+    totalSegmentCount: t2vAllSegmentLabels.length,
+    shotPromptCount: t2vShotPromptCount,
+  };
+
+  switch (stage) {
+    case scriptBreakdownStage:
+      return withHeaderHint({
+        stage,
+        items: withVideoTaskBoardDetails([
+          createVideoTaskBoardItem(
+            "scene-drafts",
+            "镜头草案",
+            sceneCount,
+            sceneCount > 0 ? "completed" : "pending",
+          ),
+        ], detailContext),
+      });
+    case entityStage:
+      if (isTextToVideo) {
+        const missingFullReferenceTargetIds = listVideoReferenceAssetTargetIds(project);
+        const items: VideoWorkflowTaskBoardItem[] = [
+          createVideoTaskBoardItem(
+            "characters",
+            "角色",
+            characterCount,
+            characterCount > 0 ? "completed" : "pending",
+          ),
+          createVideoTaskBoardItem(
+            "scene-settings",
+            "场景",
+            sceneAssetCount,
+            sceneAssetCount > 0 ? "completed" : "pending",
+          ),
+        ];
+
+        if (characterCount > 0 || sceneAssetCount > 0 || missingFullReferenceTargetIds.length > 0) {
+          items.push(
+            createVideoTaskBoardItem(
+              "missing-assets",
+              "缺素材",
+              missingFullReferenceTargetIds.length,
+              missingFullReferenceTargetIds.length > 0 ? "attention" : "completed",
+              missingFullReferenceTargetIds.length > 0 ? "warning" : "default",
+            ),
+          );
+        }
+
+        if (shotPacketCount > 0 || sceneCount > 0) {
+          items.push(
+            createVideoTaskBoardItem(
+              "shot-packets",
+              "镜头包",
+              shotPacketCount,
+              shotPacketCount > 0 ? "completed" : "pending",
+            ),
+          );
+        }
+
+        if (t2vAllSegmentLabels.length > 0) {
+          const missingSegmentPromptCount = Math.max(t2vAllSegmentLabels.length - t2vSegmentPromptCount, 0);
+          items.push(
+            createVideoTaskBoardItem(
+              "segment-prompts",
+              missingSegmentPromptCount > 0 ? "缺片段词" : "片段词",
+              missingSegmentPromptCount > 0 ? missingSegmentPromptCount : t2vSegmentPromptCount,
+              missingSegmentPromptCount > 0 ? "attention" : "completed",
+              missingSegmentPromptCount > 0 ? "warning" : "default",
+            ),
+          );
+        }
+
+        if (shotPacketCount > 0 || t2vShotPromptCount > 0) {
+          const missingShotPromptCount = Math.max(sceneCount - t2vShotPromptCount, 0);
+          items.push(
+            createVideoTaskBoardItem(
+              "shot-prompts",
+              missingShotPromptCount > 0 ? "缺镜头词" : "镜头词",
+              missingShotPromptCount > 0 ? missingShotPromptCount : t2vShotPromptCount,
+              missingShotPromptCount > 0 ? "attention" : "completed",
+              missingShotPromptCount > 0 ? "warning" : "default",
+            ),
+          );
+        }
+
+        return withHeaderHint(
+          items.length
+            ? {
+                stage,
+                items: withVideoTaskBoardDetails(
+                  normalizeVideoPromptTaskBoardLabels(items),
+                  detailContext,
+                ),
+              }
+            : null,
+        );
+      }
+
+      return withHeaderHint({
+        stage,
+        items: withVideoTaskBoardDetails([
+          createVideoTaskBoardItem(
+            "characters",
+            "角色",
+            characterCount,
+            characterCount > 0 ? "completed" : "pending",
+          ),
+          createVideoTaskBoardItem(
+            "scene-settings",
+            "场景",
+            sceneAssetCount,
+            sceneAssetCount > 0 ? "completed" : "pending",
+          ),
+          createVideoTaskBoardItem(
+            "missing-references",
+            "缺参考图",
+            totalReferenceCount,
+            missingReferenceCount > 0 ? "attention" : "completed",
+            missingReferenceCount > 0 ? "warning" : "default",
+          ),
+        ], detailContext),
+      });
+    case storyboardStage:
+      if (!sceneCount && !storyboardedSceneCount && !shotPacketCount) return null;
+      if (!isTextToVideo) {
+        const items: VideoWorkflowTaskBoardItem[] = [
+          createVideoTaskBoardItem(
+            "storyboarded-scenes",
+            "已出分镜图",
+            storyboardedSceneCount,
+            storyboardedSceneCount > 0 ? "completed" : "pending",
+          ),
+          createVideoTaskBoardItem(
+            "shot-packets",
+            "镜头包",
+            shotPacketCount,
+            shotPacketCount > 0 ? "completed" : "pending",
+          ),
+        ];
+        if (shotPacketCount > 0 || t2vShotPromptCount > 0) {
+          const missingShotPromptCount = Math.max(sceneCount - t2vShotPromptCount, 0);
+          items.push(
+            createVideoTaskBoardItem(
+              "shot-prompts",
+              missingShotPromptCount > 0 ? "缺镜头提示词" : "镜头提示词",
+              missingShotPromptCount > 0 ? missingShotPromptCount : t2vShotPromptCount,
+              missingShotPromptCount > 0 ? "attention" : "completed",
+              missingShotPromptCount > 0 ? "warning" : "default",
+            ),
+          );
+        }
+        return withHeaderHint({
+          stage,
+          items: withVideoTaskBoardDetails(normalizeVideoPromptTaskBoardLabels(items), detailContext),
+        });
+      }
+      return withHeaderHint({
+        stage,
+        items: withVideoTaskBoardDetails([
+          createVideoTaskBoardItem(
+            "storyboarded-scenes",
+            "已出分镜图",
+            storyboardedSceneCount,
+            storyboardedSceneCount > 0 ? "completed" : "pending",
+          ),
+          createVideoTaskBoardItem(
+            "shot-packets",
+            "镜头包",
+            shotPacketCount,
+            shotPacketCount > 0 ? "completed" : "pending",
+          ),
+        ], detailContext),
+      });
+    case generationStage: {
+      const hasGenerationContext =
+        generatableScenes.length > 0 ||
+        runningScenes.length > 0 ||
+        failedScenes.length > 0 ||
+        completedScenes.length > 0 ||
+        segmentVideoCandidates.length > 0 ||
+        runningSegmentVideoCandidates.length > 0 ||
+        failedSegmentVideoCandidates.length > 0 ||
+        hasSegmentPrompts;
+      if (!hasGenerationContext) return null;
+
+      const items: VideoWorkflowTaskBoardItem[] = [];
+      if (isTextToVideo && (segmentVideoCandidates.length > 0 || runningSegmentVideoCandidates.length > 0 || failedSegmentVideoCandidates.length > 0 || hasSegmentPrompts)) {
+        items.push(
+          createVideoTaskBoardItem(
+            "segment-video-pending",
+            "待生成片段",
+            segmentVideoCandidates.length,
+            segmentVideoCandidates.length > 0 ? "pending" : "completed",
+          ),
+          createVideoTaskBoardItem(
+            "segment-video-running",
+            "片段生成中",
+            runningSegmentVideoCandidates.length,
+            runningSegmentVideoCandidates.length > 0 ? "attention" : "completed",
+            runningSegmentVideoCandidates.length > 0 ? "warning" : "default",
+          ),
+          createVideoTaskBoardItem(
+            "segment-video-failed",
+            "片段失败",
+            failedSegmentVideoCandidates.length,
+            failedSegmentVideoCandidates.length > 0 ? "attention" : "completed",
+            failedSegmentVideoCandidates.length > 0 ? "danger" : "default",
+          ),
+        );
+      }
+
+      items.push(
+        createVideoTaskBoardItem(
+          "video-pending",
+          "待生成",
+          generatableScenes.length,
+          generatableScenes.length > 0 ? "pending" : "completed",
+        ),
+        createVideoTaskBoardItem(
+          "video-running",
+          "生成中",
+          runningScenes.length,
+          runningScenes.length > 0 ? "attention" : "completed",
+          runningScenes.length > 0 ? "warning" : "default",
+        ),
+        createVideoTaskBoardItem(
+          "video-failed",
+          "失败",
+          failedScenes.length,
+          failedScenes.length > 0 ? "attention" : "completed",
+          failedScenes.length > 0 ? "danger" : "default",
+        ),
+      );
+
+      return withHeaderHint({ stage, items: withVideoTaskBoardDetails(items, detailContext) });
+    }
+    case previewStage:
+      if (!completedScenes.length && !runningScenes.length && !generatableScenes.length) return null;
+      return withHeaderHint({
+        stage,
+        items: withVideoTaskBoardDetails([
+          createVideoTaskBoardItem(
+            "completed-scenes",
+            "已出片",
+            completedScenes.length,
+            completedScenes.length > 0 ? "completed" : "pending",
+          ),
+          createVideoTaskBoardItem(
+            "remaining-scenes",
+            "待补片",
+            generatableScenes.length,
+            generatableScenes.length > 0 ? "pending" : "completed",
+          ),
+          createVideoTaskBoardItem(
+            "running-scenes",
+            "生成中",
+            runningScenes.length,
+            runningScenes.length > 0 ? "attention" : "completed",
+            runningScenes.length > 0 ? "warning" : "default",
+          ),
+        ], detailContext),
+      });
+    default:
+      return null;
+  }
+}
+
 function getVideoPanelLayout(
   stage: string | null | undefined,
   mode?: string,
 ): Pick<ComposerQuestion, "stepIndex" | "totalSteps"> {
   const visibleStage = resolveVisibleVideoStageName(stage);
-  const flow = mode === "text-to-video" ? TEXT_TO_VIDEO_STAGE_FLOW : VIDEO_VISIBLE_STAGE_FLOW;
+  const flow = getVideoVisibleStageFlow(mode);
   const idx = flow.indexOf(visibleStage);
   return {
     stepIndex: Math.max(idx >= 0 ? idx : VIDEO_VISIBLE_STAGE_FLOW.indexOf(visibleStage), 0),
     totalSteps: flow.length,
   };
+}
+
+function getVideoVisibleStageFlow(mode?: string): readonly VideoVisibleStage[] {
+  return mode === "text-to-video" ? TEXT_TO_VIDEO_STAGE_FLOW : VIDEO_VISIBLE_STAGE_FLOW;
+}
+
+function getVideoVisibleStepMeta(
+  stage: string | null | undefined,
+  mode?: string,
+): { visibleStage: VideoVisibleStage; stepNumber: number; totalSteps: number } {
+  const visibleStage = resolveVisibleVideoStageName(stage);
+  const flow = getVideoVisibleStageFlow(mode);
+  const idx = flow.indexOf(visibleStage);
+  const fallbackIdx = VIDEO_VISIBLE_STAGE_FLOW.indexOf(visibleStage);
+  const stepIndex = idx >= 0 ? idx : Math.max(fallbackIdx, 0);
+  return {
+    visibleStage,
+    stepNumber: stepIndex + 1,
+    totalSteps: flow.length,
+  };
+}
+
+export function formatVideoStepLabelWithCount(
+  label: string,
+  stage: string | null | undefined,
+  mode?: string,
+): string {
+  const { stepNumber, totalSteps } = getVideoVisibleStepMeta(stage, mode);
+  return `${label}（第 ${stepNumber}/${totalSteps} 步）`;
 }
 
 function createVideoPanelOption(
@@ -416,6 +1071,129 @@ function createVideoPanelOption(
   extras?: Partial<ComposerQuestionOption>,
 ): ComposerQuestionOption {
   return createStepQuestionOption(id, label, value, rationale, extras);
+}
+
+function buildShotLevelVideoPromptModeChildren(snapshot: ConversationProjectSnapshot): ComposerQuestionOption[] {
+  return [
+    {
+      id: `${snapshot.projectId}-video-bridge-prompts-all`,
+      label: "按集分批生成",
+      value: "video:bridge:prompts:all",
+      rationale: "生成当前集内所有镜头的视频提示词，后续点击每次补齐一集。",
+    },
+    {
+      id: `${snapshot.projectId}-video-bridge-prompts-batch`,
+      label: "按片段分批生成",
+      value: "video:bridge:prompts:batch",
+      rationale: "每次按顺序生成一个片段内的所有分镜提示词，已覆盖的镜头持续叠加更新，点击一次推进一个片段。",
+    },
+  ];
+}
+
+function markQuestionOptionTreeDevOnly(option: ComposerQuestionOption): ComposerQuestionOption {
+  return {
+    ...option,
+    devOnly: true,
+    children: option.children?.map(markQuestionOptionTreeDevOnly),
+  };
+}
+
+function hasReadySegmentPrompt(
+  project: PersistedVideoProject | null | undefined,
+  segmentLabel: string,
+): boolean {
+  return Boolean(project?.segmentVideoPrompts?.[segmentLabel]?.prompt?.trim());
+}
+
+function buildSegmentPromptSingleListChildren(
+  snapshot: ConversationProjectSnapshot,
+  project: PersistedVideoProject | null | undefined,
+): ComposerQuestionOption[] {
+  if (!project?.scenes.length) return [];
+
+  const episodeMap = new Map<string, string[]>();
+  const episodeOrder: string[] = [];
+  const segmentScenes = new Map<string, Scene[]>();
+
+  [...project.scenes].sort(compareSceneOrder).forEach((scene) => {
+    const segmentLabel = scene.segmentLabel?.trim();
+    if (!segmentLabel || !EPISODE_SEGMENT_RE.test(segmentLabel)) return;
+
+    const episodeKey = EPISODE_SEGMENT_RE.exec(segmentLabel)?.[1];
+    if (!episodeKey) return;
+
+    if (!episodeMap.has(episodeKey)) {
+      episodeMap.set(episodeKey, []);
+      episodeOrder.push(episodeKey);
+    }
+
+    const segmentLabels = episodeMap.get(episodeKey)!;
+    if (!segmentLabels.includes(segmentLabel)) segmentLabels.push(segmentLabel);
+
+    const groupedScenes = segmentScenes.get(segmentLabel) ?? [];
+    groupedScenes.push(scene);
+    segmentScenes.set(segmentLabel, groupedScenes);
+  });
+
+  return episodeOrder.map((episodeKey) => {
+    const segmentLabels = episodeMap.get(episodeKey) ?? [];
+    const encodedEpisode = encodeURIComponent(episodeKey);
+    const readyCount = segmentLabels.filter((segmentLabel) => hasReadySegmentPrompt(project, segmentLabel)).length;
+    const missingCount = Math.max(segmentLabels.length - readyCount, 0);
+    const allReady = segmentLabels.length > 0 && missingCount === 0;
+
+    return markQuestionOptionTreeDevOnly(
+      createVideoPanelOption(
+        `${snapshot.projectId}-video-bridge-prompts-segment-ep-${episodeKey}`,
+        allReady
+          ? `第 ${episodeKey} 集（已就绪 ${readyCount}/${segmentLabels.length}）`
+          : `第 ${episodeKey} 集（待补 ${missingCount}/${segmentLabels.length}）`,
+        `video:panel:bridge:prompts:segment:ep-group:${encodedEpisode}`,
+        allReady
+          ? `该集 ${segmentLabels.length} 个片段提示词都已就绪，可按集或按单片段重新生成。`
+          : `该集共 ${segmentLabels.length} 个片段，当前还缺 ${missingCount} 个提示词。`,
+        {
+          children: [
+            createVideoPanelOption(
+              `${snapshot.projectId}-video-bridge-prompts-segment-episode-${episodeKey}`,
+              readyCount === 0
+                ? `生成第 ${episodeKey} 集片段提示词（${segmentLabels.length}）`
+                : missingCount === 0
+                  ? `重生成第 ${episodeKey} 集片段提示词（${segmentLabels.length}）`
+                  : `重建第 ${episodeKey} 集片段提示词（${segmentLabels.length}）`,
+              `video:bridge:prompts:segment:episode:${encodedEpisode}`,
+              readyCount === 0
+                ? `只处理第 ${episodeKey} 集的 ${segmentLabels.length} 个片段。`
+                : missingCount === 0
+                  ? `会重新生成第 ${episodeKey} 集全部 ${segmentLabels.length} 个片段提示词。`
+                  : `会重建第 ${episodeKey} 集全部 ${segmentLabels.length} 个片段提示词，其中 ${readyCount} 个已有提示词会被覆盖。`,
+            ),
+            ...segmentLabels.map((segmentLabel) => {
+              const groupedScenes = segmentScenes.get(segmentLabel) ?? [];
+              const hasPrompt = hasReadySegmentPrompt(project, segmentLabel);
+              const sceneNames = groupedScenes
+                .map((scene) => scene.sceneName?.trim())
+                .filter(Boolean)
+                .slice(0, 2)
+                .join(" / ");
+
+              return createVideoPanelOption(
+                `${snapshot.projectId}-video-bridge-prompts-segment-label-${segmentLabel}`,
+                `${hasPrompt ? "重生成" : "生成"} 片段 ${segmentLabel}`,
+                `video:bridge:prompts:segment:label:${encodeURIComponent(segmentLabel)}`,
+                [
+                  hasPrompt
+                    ? `只重建片段 ${segmentLabel} 的合并提示词。`
+                    : `只处理片段 ${segmentLabel} 的合并提示词。`,
+                  sceneNames ? `当前镜头：${sceneNames}` : "",
+                ].filter(Boolean).join(" "),
+              );
+            }),
+          ],
+        },
+      ),
+    );
+  });
 }
 
 export function ensureUniqueOptionIds(options: ComposerQuestionOption[]): ComposerQuestionOption[] {
@@ -441,15 +1219,87 @@ export function ensureUniqueOptionIds(options: ComposerQuestionOption[]): Compos
   });
 }
 
+function getVideoWorkflowBranchPriority(option: ComposerQuestionOption): number {
+  const value = option.value?.trim() ?? "";
+  if (!value) return 50;
+  if (option.disabled) return 100;
+
+  if (value === "video:bridge:entities") return 0;
+  if (value.startsWith("video:bridge:analyze")) return 1;
+  if (value === "video:bridge:next-step") return 2;
+  if (value === "video:bridge:platform") return 3;
+  if (value.includes(":remaining")) return 3;
+  if (value.includes(":failed")) return 4;
+  if (value.includes(":refresh")) return 5;
+  if (value.includes(":full")) return 6;
+  if (value.startsWith("video:generate:segment-video:")) return 7;
+  if (value.includes(":all")) return 8;
+  if (value.includes(":batch")) return 9;
+  if (value.startsWith("video:generate:episode:")) return 10;
+  if (value.startsWith("video:generate:segment:")) return 11;
+  if (value.startsWith("video:bridge:storyboard-frames:episode:")) return 12;
+  if (value.startsWith("video:bridge:storyboard-frames:segment:")) return 13;
+  if (value.startsWith("video:bridge:shots")) return 14;
+  if (value.startsWith("video:bridge:prompts")) return 15;
+  if (value.startsWith("video:generate:scene:")) return 30;
+  if (value.startsWith("video:bridge:storyboard-frame:scene:")) return 31;
+  if (value.startsWith("video:bridge:reference-assets:character-variant:")) return 32;
+  if (value.startsWith("video:bridge:reference-assets:scene-variant:")) return 33;
+  if (value.startsWith("video:step:")) return 40;
+  if (value.startsWith("video:export:") || value === "video:bridge:export-xlsx") return 41;
+  return 20;
+}
+
+function prioritizeVideoWorkflowBranchOptions(
+  options: ComposerQuestionOption[],
+): ComposerQuestionOption[] {
+  return options
+    .map((option, index) => ({
+      option: option.children?.length
+        ? {
+            ...option,
+            children: prioritizeVideoWorkflowBranchOptions(option.children),
+          }
+        : option,
+      index,
+    }))
+    .sort((left, right) => {
+      const score = getVideoWorkflowBranchPriority(left.option) - getVideoWorkflowBranchPriority(right.option);
+      if (score !== 0) return score;
+      return left.index - right.index;
+    })
+    .map(({ option }) => option);
+}
+
+function collectDistinctVideoPanelOptions(
+  options: Array<ComposerQuestionOption | null | undefined>,
+  seenValues: Set<string>,
+): ComposerQuestionOption[] {
+  const nextOptions: ComposerQuestionOption[] = [];
+
+  for (const option of options) {
+    if (!option) continue;
+    const value = option.value?.trim();
+    if (value && seenValues.has(value)) continue;
+    if (value) seenValues.add(value);
+    nextOptions.push(option);
+  }
+
+  return ensureUniqueOptionIds(prioritizeVideoWorkflowBranchOptions(nextOptions));
+}
+
 function createVideoPanelGroup(
   snapshot: ConversationProjectSnapshot,
   groupKey: string,
   label: string,
   rationale: string,
   options: Array<ComposerQuestionOption | null | undefined | false>,
+  extras?: Partial<ComposerQuestionOption>,
 ): ComposerQuestionOption | null {
   const children = ensureUniqueOptionIds(
-    options.filter((option): option is ComposerQuestionOption => Boolean(option)),
+    prioritizeVideoWorkflowBranchOptions(
+      options.filter((option): option is ComposerQuestionOption => Boolean(option)),
+    ),
   );
   if (!children.length) return null;
   return createVideoPanelOption(
@@ -457,7 +1307,7 @@ function createVideoPanelGroup(
     label,
     `video:panel:${groupKey}`,
     rationale,
-    { children },
+    { children, ...extras },
   );
 }
 
@@ -669,14 +1519,14 @@ function buildReadyReferenceIdsFromAssets(project: PersistedVideoProject | null 
 
   (project?.characters ?? []).forEach((character) => {
     const activeCostume = character.costumes?.find((costume) => costume.id === character.activeCostumeId);
-    if (character.imageUrl?.trim() || activeCostume?.imageUrl?.trim()) {
+    if (hasUsableMediaUrl(character.imageUrl) || hasUsableMediaUrl(activeCostume?.imageUrl)) {
       readyCharacterIds.add(character.id);
     }
   });
 
   (project?.sceneSettings ?? []).forEach((sceneSetting) => {
     const activeTimeVariant = sceneSetting.timeVariants?.find((variant) => variant.id === sceneSetting.activeTimeVariantId);
-    if (sceneSetting.imageUrl?.trim() || activeTimeVariant?.imageUrl?.trim()) {
+    if (hasUsableMediaUrl(sceneSetting.imageUrl) || hasUsableMediaUrl(activeTimeVariant?.imageUrl)) {
       readySceneIds.add(sceneSetting.id);
     }
   });
@@ -685,6 +1535,7 @@ function buildReadyReferenceIdsFromAssets(project: PersistedVideoProject | null 
     if (
       (item.kind === "character-reference" || item.kind === "costume-reference")
       && item.status === "ready"
+      && hasUsableMediaUrl(item.url)
       && item.sourceEntityId
     ) {
       readyCharacterIds.add(item.sourceEntityId);
@@ -693,6 +1544,7 @@ function buildReadyReferenceIdsFromAssets(project: PersistedVideoProject | null 
     if (
       (item.kind === "scene-reference" || item.kind === "time-variant")
       && item.status === "ready"
+      && hasUsableMediaUrl(item.url)
       && item.sourceEntityId
     ) {
       readySceneIds.add(item.sourceEntityId);
@@ -706,11 +1558,12 @@ function hasPrimaryCharacterReference(
   project: PersistedVideoProject | null | undefined,
   character: CharacterSetting,
 ): boolean {
-  if (character.imageUrl?.trim()) return true;
+  if (hasUsableMediaUrl(character.imageUrl)) return true;
   return Boolean(
     project?.assetManifest?.items.some((item) =>
       item.kind === "character-reference" &&
       item.status === "ready" &&
+      hasUsableMediaUrl(item.url) &&
       item.sourceEntityId === character.id,
     ),
   );
@@ -720,11 +1573,12 @@ function hasPrimarySceneReference(
   project: PersistedVideoProject | null | undefined,
   sceneSetting: SceneSetting,
 ): boolean {
-  if (sceneSetting.imageUrl?.trim()) return true;
+  if (hasUsableMediaUrl(sceneSetting.imageUrl)) return true;
   return Boolean(
     project?.assetManifest?.items.some((item) =>
       item.kind === "scene-reference" &&
       item.status === "ready" &&
+      hasUsableMediaUrl(item.url) &&
       item.sourceEntityId === sceneSetting.id,
     ),
   );
@@ -746,7 +1600,7 @@ export function listVideoReferenceAssetTargetIds(
 
     if (includeVariants) {
       for (const variant of character.costumes ?? []) {
-        if (includeReady || !variant.imageUrl?.trim()) {
+        if (includeReady || !hasUsableMediaUrl(variant.imageUrl)) {
           targetIds.push(`reference-character-variant:${character.id}:${variant.id}`);
         }
       }
@@ -761,7 +1615,7 @@ export function listVideoReferenceAssetTargetIds(
 
     if (includeVariants) {
       for (const variant of sceneSetting.timeVariants ?? []) {
-        if (includeReady || !variant.imageUrl?.trim()) {
+        if (includeReady || !hasUsableMediaUrl(variant.imageUrl)) {
           targetIds.push(`reference-scene-variant:${sceneSetting.id}:${variant.id}`);
         }
       }
@@ -777,7 +1631,6 @@ function buildCharacterVariantChildren(
   hasPrimaryReference: boolean,
 ): ComposerQuestionOption[] {
   const variants = character.costumes ?? [];
-  if (!variants.length) return [];
 
   const missingVariantCount = variants.filter((variant) => !variant.imageUrl?.trim()).length;
   const allVariantsReady = missingVariantCount === 0;
@@ -791,6 +1644,7 @@ function buildCharacterVariantChildren(
       hasPrimaryReference
         ? "角色主参考图已生成，可继续重新生成。"
         : "先补角色主参考图，再去生成或重生成下方变体。",
+      { menuSection: "main-image" },
     ),
     createVideoPanelOption(
       `${snapshot.projectId}-video-bridge-reference-assets-character-variants-${character.id}`,
@@ -799,7 +1653,10 @@ function buildCharacterVariantChildren(
       hasPrimaryReference
         ? (allVariantsReady ? "当前角色变体已齐，可整组重新生成。" : "只补当前缺图的角色变体。")
         : baseWarning,
-      { disabled: !hasPrimaryReference },
+      {
+        disabled: !hasPrimaryReference,
+        menuSection: "variants",
+      },
     ),
     ...variants.map((variant) =>
       createVideoPanelOption(
@@ -812,7 +1669,10 @@ function buildCharacterVariantChildren(
               variant.description?.trim() || "",
             ].filter(Boolean).join(" ")
           : baseWarning,
-        { disabled: !hasPrimaryReference },
+        {
+          disabled: !hasPrimaryReference,
+          menuSection: "variants",
+        },
       ),
     ),
   ];
@@ -824,7 +1684,6 @@ function buildSceneVariantChildren(
   hasPrimaryReference: boolean,
 ): ComposerQuestionOption[] {
   const variants = sceneSetting.timeVariants ?? [];
-  if (!variants.length) return [];
 
   const missingVariantCount = variants.filter((variant) => !variant.imageUrl?.trim()).length;
   const allVariantsReady = missingVariantCount === 0;
@@ -838,6 +1697,7 @@ function buildSceneVariantChildren(
       hasPrimaryReference
         ? "场景主参考图已生成，可继续重新生成。"
         : "先补场景主参考图，再去生成或重生成下方变体。",
+      { menuSection: "main-image" },
     ),
     createVideoPanelOption(
       `${snapshot.projectId}-video-bridge-reference-assets-scene-variants-${sceneSetting.id}`,
@@ -846,7 +1706,10 @@ function buildSceneVariantChildren(
       hasPrimaryReference
         ? (allVariantsReady ? "当前场景变体已齐，可整组重新生成。" : "只补当前缺图的场景变体。")
         : baseWarning,
-      { disabled: !hasPrimaryReference },
+      {
+        disabled: !hasPrimaryReference,
+        menuSection: "variants",
+      },
     ),
     ...variants.map((variant) =>
       createVideoPanelOption(
@@ -859,7 +1722,10 @@ function buildSceneVariantChildren(
               variant.description?.trim() || "",
             ].filter(Boolean).join(" ")
           : baseWarning,
-        { disabled: !hasPrimaryReference },
+        {
+          disabled: !hasPrimaryReference,
+          menuSection: "variants",
+        },
       ),
     ),
   ];
@@ -882,13 +1748,43 @@ function buildVideoCharacterReferenceChildrenV2(
       missingCharacters.length ? `补齐全部角色素材（${totalCount}）` : `刷新全部角色素材（${totalCount}）`,
       "video:bridge:reference-assets:characters",
       missingCharacters.length ? "只处理缺图角色。" : "批量刷新角色素材。",
+      { menuSection: "batch" },
     ),
-    ...characters.slice(0, 8).map((character) => {
+    ...characters.slice(0, 8).flatMap((character) => {
       const hasPrimaryReference = hasPrimaryCharacterReference(project, character);
-      const variants = buildCharacterVariantChildren(snapshot, character, hasPrimaryReference);
+      const assetChildren = buildCharacterVariantChildren(snapshot, character, hasPrimaryReference);
       const variantCount = character.costumes?.length ?? 0;
+      const characterName = character.name?.trim() || "Unnamed character";
+      const hasAudioReference = Boolean(character.audioUrl?.trim() || character.audioFileName?.trim());
+      const currentAudioFileLabel = character.audioFileName?.trim() || "音频参考";
+      const audioReferenceLabel = `${hasAudioReference ? "\u66f4\u65b0" : "\u4e0a\u4f20"}${characterName}\u97f3\u9891\u53c2\u8003`;
+      const audioReferenceOption = createVideoPanelOption(
+        `${snapshot.projectId}-video-bridge-reference-audio-character-${character.id}`,
+        audioReferenceLabel,
+        `video:bridge:reference-audio:character:${character.id}`,
+        hasAudioReference
+          ? `\u5f53\u524d\u5df2\u7ed1\u5b9a ${currentAudioFileLabel}\u3002\u91cd\u65b0\u4e0a\u4f20\u540e\u4f1a\u8986\u76d6\uff0c\u4ec5\u7528\u4e8e\u540e\u7eed\u51fa\u7247\u65f6\u7684\u89d2\u8272\u58f0\u97f3\u53c2\u8003\u3002`
+          : "\u4e0a\u4f20\u8be5\u89d2\u8272\u7684\u97f3\u9891\u53c2\u8003\uff0c\u4ec5\u7528\u4e8e\u540e\u7eed\u51fa\u7247\u65f6\u63d0\u4f9b\u58f0\u97f3 / \u97f3\u8272\u53c2\u8003\u3002",
+        { menuSection: "audio" },
+      );
+      const presetAudioReferenceOption = createVideoPanelOption(
+        `${snapshot.projectId}-video-bridge-reference-audio-preset-character-${character.id}`,
+        "\u4f7f\u7528\u9884\u8bbe\u53c2\u8003\u97f3\u9891",
+        buildCharacterAudioPresetPickerValue(character.id),
+        "\u6253\u5f00\u9884\u8bbe\u97f3\u8272\u5e93\uff0c\u6309\u57fa\u7840\u97f3\u8272\u3001\u89d2\u8272\u72b6\u6001\u6216\u8868\u6f14\u8d28\u611f\u9009\u62e9\u6210\u54c1\u97f3\u9891\u3002",
+        { menuSection: "audio" },
+      );
+      const characterChildren = assetChildren.length
+        ? [
+            assetChildren[0]!,
+            audioReferenceOption,
+            presetAudioReferenceOption,
+            ...(variantCount > 0 ? assetChildren.slice(1) : []),
+          ]
+        : [audioReferenceOption, presetAudioReferenceOption];
 
-      return createVideoPanelOption(
+      return [
+        createVideoPanelOption(
         `${snapshot.projectId}-video-bridge-reference-assets-character-${character.id}`,
         (hasPrimaryReference ? "重生成 " : "") + (character.name?.trim() || "Unnamed character"),
         `video:bridge:reference-assets:character:${character.id}`,
@@ -899,8 +1795,13 @@ function buildVideoCharacterReferenceChildrenV2(
           : hasPrimaryReference
             ? "角色主参考图已生成，可继续重新生成。"
             : (character.description?.trim() || "单独生成这个角色的主参考图。"),
-        variants.length ? { children: variants } : undefined,
-      );
+        {
+          children: characterChildren,
+          singlePanelPresentation: "floating-submenu",
+          menuSection: "single",
+        },
+        ),
+      ];
     }),
   ];
 }
@@ -922,11 +1823,14 @@ function buildVideoSceneReferenceChildrenV2(
       missingSceneSettings.length ? `补齐全部场景素材（${totalCount}）` : `刷新全部场景素材（${totalCount}）`,
       "video:bridge:reference-assets:scenes",
       missingSceneSettings.length ? "只处理缺图场景。" : "批量刷新场景素材。",
+      { menuSection: "batch" },
     ),
     ...sceneSettings.slice(0, 8).map((sceneSetting) => {
       const hasPrimaryReference = hasPrimarySceneReference(project, sceneSetting);
-      const variants = buildSceneVariantChildren(snapshot, sceneSetting, hasPrimaryReference);
+      const assetChildren = buildSceneVariantChildren(snapshot, sceneSetting, hasPrimaryReference);
       const variantCount = sceneSetting.timeVariants?.length ?? 0;
+      const sceneChildren =
+        variantCount > 0 ? assetChildren : assetChildren.slice(0, 1);
 
       return createVideoPanelOption(
         `${snapshot.projectId}-video-bridge-reference-assets-scene-${sceneSetting.id}`,
@@ -939,7 +1843,11 @@ function buildVideoSceneReferenceChildrenV2(
           : hasPrimaryReference
             ? "场景主参考图已生成，可继续重新生成。"
             : (sceneSetting.description?.trim() || "单独生成这个场景的主参考图。"),
-        variants.length ? { children: variants } : undefined,
+        {
+          children: sceneChildren,
+          singlePanelPresentation: "floating-submenu",
+          menuSection: "single",
+        },
       );
     }),
   ];
@@ -957,65 +1865,6 @@ function formatStoryboardSegmentLabel(segmentKey: string): string {
 }
 
 const EPISODE_SEGMENT_RE = /^(\d+)-(\d+)$/;
-
-function buildSegmentPromptChildren(
-  snapshot: ConversationProjectSnapshot,
-  project: PersistedVideoProject | null | undefined,
-): ComposerQuestionOption[] {
-  if (!project?.scenes.length) return [];
-
-  const segmentVideoPrompts = project.segmentVideoPrompts ?? {};
-
-  const episodeMap = new Map<string, string[]>();
-  const episodeOrder: string[] = [];
-
-  [...project.scenes].sort(compareSceneOrder).forEach((scene) => {
-    const segKey = scene.segmentLabel?.trim();
-    if (!segKey || !EPISODE_SEGMENT_RE.test(segKey)) return;
-    const episodeKey = EPISODE_SEGMENT_RE.exec(segKey)![1];
-    if (!episodeMap.has(episodeKey)) {
-      episodeMap.set(episodeKey, []);
-      episodeOrder.push(episodeKey);
-    }
-    const segs = episodeMap.get(episodeKey)!;
-    if (!segs.includes(segKey)) segs.push(segKey);
-  });
-
-  return episodeOrder.map((episodeKey) => {
-    const segKeys = episodeMap.get(episodeKey)!;
-    const encodedEpisode = encodeURIComponent(episodeKey);
-    const allDone = segKeys.every((k) => Boolean(segmentVideoPrompts[k]?.prompt?.trim()));
-
-    const segmentChildren: ComposerQuestionOption[] = [
-      {
-        id: `${snapshot.projectId}-seg-prompt-ep-${episodeKey}-all`,
-        label: `第 ${episodeKey} 集全部片段`,
-        value: `video:bridge:prompts:segment:episode:${encodedEpisode}`,
-        rationale: `生成第 ${episodeKey} 集所有片段的合并提示词。`,
-      },
-      ...segKeys.map((segKey) => {
-        const hasPrompt = Boolean(segmentVideoPrompts[segKey]?.prompt?.trim());
-        const sceneCount = project.scenes.filter((s) => s.segmentLabel?.trim() === segKey).length;
-        return {
-          id: `${snapshot.projectId}-seg-prompt-label-${segKey}`,
-          label: hasPrompt ? `片段 ${segKey}（重新生成）` : `片段 ${segKey}（${sceneCount} 个分镜）`,
-          value: `video:bridge:prompts:segment:label:${encodeURIComponent(segKey)}`,
-          rationale: hasPrompt
-            ? `重新生成片段 ${segKey} 的合并提示词。`
-            : `生成片段 ${segKey} 的合并提示词（含 ${sceneCount} 个分镜）。`,
-        };
-      }),
-    ];
-
-    return {
-      id: `${snapshot.projectId}-seg-prompt-ep-${episodeKey}`,
-      label: allDone ? `第 ${episodeKey} 集（已全部生成）` : `第 ${episodeKey} 集`,
-      value: `video:bridge:prompts:segment:ep-group:${encodedEpisode}`,
-      rationale: `展开查看第 ${episodeKey} 集的片段提示词生成选项。`,
-      children: segmentChildren,
-    };
-  });
-}
 
 function buildStoryboardSceneRequirementV2(
   scene: Scene,
@@ -1078,6 +1927,47 @@ export function listGeneratableStoryboardSceneIdsForSegment(
     .map((scene) => scene.id);
 }
 
+export function listGeneratableStoryboardSceneIdsForEpisode(
+  project: PersistedVideoProject | null | undefined,
+  episodeKey: string,
+): string[] {
+  if (!project?.scenes.length) return [];
+
+  const readyReferenceIds = buildReadyReferenceIdsFromAssets(project);
+  return [...project.scenes]
+    .filter((scene) => {
+      const segmentKey = getStoryboardSegmentKey(scene);
+      const match = EPISODE_SEGMENT_RE.exec(segmentKey);
+      return (match ? match[1] : segmentKey) === episodeKey;
+    })
+    .filter((scene) => !buildStoryboardSceneRequirementV2(
+      scene,
+      project.characters ?? [],
+      project.sceneSettings ?? [],
+      readyReferenceIds,
+    ).disabled)
+    .sort(compareSceneOrder)
+    .map((scene) => scene.id);
+}
+
+export function listSmartStoryboardFrameTargetIds(
+  project: PersistedVideoProject | null | undefined,
+): string[] {
+  if (!project?.scenes.length) return [];
+
+  const readyReferenceIds = buildReadyReferenceIdsFromAssets(project);
+  return [...project.scenes]
+    .filter((scene) => !scene.storyboardUrl?.trim())
+    .filter((scene) => !buildStoryboardSceneRequirementV2(
+      scene,
+      project.characters ?? [],
+      project.sceneSettings ?? [],
+      readyReferenceIds,
+    ).disabled)
+    .sort(compareSceneOrder)
+    .map((scene) => scene.id);
+}
+
 function buildStoryboardFrameSceneChildrenV2(
   snapshot: ConversationProjectSnapshot,
   project: PersistedVideoProject | null | undefined,
@@ -1130,7 +2020,7 @@ function buildStoryboardFrameSceneChildrenV2(
           : `第 ${episodeKey} 集暂无可生成分镜`,
         `video:bridge:storyboard-frames:episode:${encodedEpisode}`,
         episodeBlocked > 0 ? `缺素材 ${episodeBlocked} 个` : "",
-        { disabled: episodeSelectable.length === 0 },
+        { disabled: episodeSelectable.length === 0, menuSection: "batch" },
       ),
       ...segKeys.map((segmentKey) => {
         const scenes = segmentScenes.get(segmentKey) ?? [];
@@ -1161,16 +2051,17 @@ function buildStoryboardFrameSceneChildrenV2(
                   : "本片段暂无可生成分镜",
                 `video:bridge:storyboard-frames:segment:${encodeURIComponent(segmentKey)}`,
                 blockedCount > 0 ? `缺素材 ${blockedCount} 个` : "",
-                { disabled: selectableScenes.length === 0 },
+                { disabled: selectableScenes.length === 0, menuSection: "batch" },
               ),
               ...sceneRequirements.map(({ scene, requirement }) => createVideoPanelOption(
                 `${snapshot.projectId}-video-bridge-storyboard-frame-${scene.id}`,
                 `${scene.storyboardUrl?.trim() ? "重生成" : "生成"} ${formatSceneOptionLabel(scene)}`,
                 `video:bridge:storyboard-frame:scene:${scene.id}`,
                 requirement.disabled ? requirement.rationale : "",
-                { disabled: requirement.disabled },
+                { disabled: requirement.disabled, menuSection: "single" },
               )),
             ],
+            menuSection: "single",
           },
         );
       }),
@@ -1232,12 +2123,14 @@ function buildVideoSceneActionChildrenV2(
             params.segmentLabel(groupedScenes.length),
             `${params.segmentValuePrefix}${encodedSegmentKey}`,
             params.segmentRationale(groupedScenes.length),
+            { menuSection: "batch" },
           ),
           ...groupedScenes.map((scene) => createVideoPanelOption(
             `${snapshot.projectId}-${params.optionIdPrefix}-scene-${scene.id}`,
             `${params.sceneActionLabel} ${formatSceneOptionLabel(scene)}`,
             `${params.sceneValuePrefix}${scene.id}`,
             summarizeSceneOption(scene),
+            { menuSection: "single" },
           )),
         ],
       },
@@ -1388,7 +2281,7 @@ function buildTargetedVideoGenerationChildrenV2(
           : `第 ${episodeKey} 集暂无可出片镜头`,
         `video:generate:episode:${encodedEpisode}`,
         episodeBlocked > 0 ? `缺素材 ${episodeBlocked} 个` : "",
-        { disabled: episodeSelectable.length === 0 },
+        { disabled: episodeSelectable.length === 0, menuSection: "batch" },
       ),
       ...segKeys.map((segmentKey) => {
         const groupedScenes = segmentScenes.get(segmentKey) ?? [];
@@ -1420,7 +2313,7 @@ function buildTargetedVideoGenerationChildrenV2(
                   : "本片段暂无可出片镜头",
                 `video:generate:segment:${encodedSegmentKey}`,
                 blockedCount > 0 ? `缺素材 ${blockedCount} 个` : "",
-                { disabled: selectableScenes.length === 0 },
+                { disabled: selectableScenes.length === 0, menuSection: "batch" },
               ),
               createVideoPanelOption(
                 `${snapshot.projectId}-video-generate-segment-video-${segmentKey}`,
@@ -1431,7 +2324,7 @@ function buildTargetedVideoGenerationChildrenV2(
                     : `生成片段视频（${segmentKey}，需先生成片段提示词）`,
                 `video:generate:segment-video:${encodedSegmentKey}`,
                 !hasSegmentPrompt ? "缺片段提示词" : "",
-                { disabled: !hasSegmentPrompt },
+                { disabled: !hasSegmentPrompt, menuSection: "batch" },
               ),
               ...sceneRequirements.map(({ scene, requirement }) =>
                 createVideoPanelOption(
@@ -1439,10 +2332,11 @@ function buildTargetedVideoGenerationChildrenV2(
                   `${buildVideoGenerationActionLabel(scene)} ${formatSceneOptionLabel(scene)}`,
                   `video:generate:scene:${scene.id}`,
                   requirement.disabled ? requirement.rationale : "",
-                  { disabled: requirement.disabled },
+                  { disabled: requirement.disabled, menuSection: "single" },
                 ),
               ),
             ],
+            menuSection: "single",
           },
         );
       }),
@@ -1549,22 +2443,30 @@ function buildVideoStepSwitchOption(
     return null;
   }
 
-  const currentStep = VIDEO_VISIBLE_STAGE_FLOW.indexOf(resolveVisibleVideoStageName(snapshot.derivedStage)) + 1;
+  const targetStages: Record<3 | 4 | 5, VideoVisibleStage> = {
+    3: VIDEO_VISIBLE_STAGE_FLOW[2],
+    4: VIDEO_VISIBLE_STAGE_FLOW[3],
+    5: VIDEO_VISIBLE_STAGE_FLOW[4],
+  };
+  const currentStep = getVideoVisibleStepMeta(snapshot.derivedStage, mode).stepNumber;
   const stepLabels: Record<3 | 4 | 5, string> = {
     3: "分镜图生成",
     4: "视频生成",
     5: "预览与导出",
   };
+  const targetStage = targetStages[targetStep];
+  const targetStepNumber = getVideoVisibleStepMeta(targetStage, mode).stepNumber;
   const targetLabel = stepLabels[targetStep];
-  const actionLabel = targetStep < currentStep ? "切回" : "切到";
+  const actionLabel = targetStepNumber < currentStep ? "切回" : "切到";
   const targetValue =
     targetStep === 3 ? "video:step:storyboard" : targetStep === 4 ? "video:step:video" : "video:step:preview";
+  const nextLabel = formatVideoStepLabelWithCount(`${actionLabel}《${targetLabel}》`, targetStage, mode);
 
   return createVideoPanelOption(
     `${snapshot.projectId}-video-step-${targetStep}`,
-    `${actionLabel}《${targetLabel}》`,
+    nextLabel,
     targetValue,
-    `当前素材条件已满足，可直接${actionLabel}《${targetLabel}》继续处理。`,
+    `当前素材条件已满足，可直接${nextLabel}继续处理。`,
   );
 }
 
@@ -1574,6 +2476,7 @@ function createVideoPanelQuestion(params: {
   answerKey: string;
   title: string;
   description: string;
+  primary?: Array<ComposerQuestionOption | null | undefined>;
   recommended: Array<ComposerQuestionOption | null | undefined>;
   bulk: Array<ComposerQuestionOption | null | undefined>;
   single: Array<ComposerQuestionOption | null | undefined>;
@@ -1587,6 +2490,7 @@ function createVideoPanelQuestion(params: {
     answerKey,
     title,
     description,
+    primary,
     recommended,
     bulk,
     single,
@@ -1595,12 +2499,28 @@ function createVideoPanelQuestion(params: {
     mode,
   } = params;
   const layout = getVideoPanelLayout(stage, mode);
+  const seenActionValues = new Set<string>();
+  const primaryOptions = collectDistinctVideoPanelOptions(primary ?? [], seenActionValues);
+  const bulkOptions = collectDistinctVideoPanelOptions(
+    [...recommended, ...bulk],
+    seenActionValues,
+  );
+  const singleOptions = collectDistinctVideoPanelOptions(single, seenActionValues);
+  const automationOptions = collectDistinctVideoPanelOptions(automation, seenActionValues);
   const options = [
-    createVideoPanelGroup(snapshot, `${answerKey}-recommended`, "推荐动作", "优先从最应该立即推进的动作开始。", recommended),
-    createVideoPanelGroup(snapshot, `${answerKey}-bulk`, "批量执行", "适合一口气推进一批镜头、素材或状态刷新。", bulk),
-    createVideoPanelGroup(snapshot, `${answerKey}-single`, "单项处理", "先挑具体镜头或条目处理，避免一次动太多。", single),
-    createVideoPanelGroup(snapshot, `${answerKey}-automation`, "自动推进/导出", "让 Agent 继续推进，或直接做预览与导出。", automation),
+    ...primaryOptions,
+    createVideoPanelGroup(snapshot, `${answerKey}-bulk`, "批量执行", "适合一口气推进一批素材或状态刷新。", bulkOptions),
+    createVideoPanelGroup(snapshot, `${answerKey}-single`, "单项处理", "单独条目处理，避免一次动太多。", singleOptions),
+    createVideoPanelGroup(snapshot, `${answerKey}-automation`, "步骤切换/导出", "可以实时切换步骤，或直接做预览与导出。", automationOptions),
   ].filter((option): option is ComposerQuestionOption => Boolean(option));
+
+  options.forEach((option) => {
+    if (option.value === `video:panel:${answerKey}-bulk`) {
+      option.menuSection = "batch";
+    } else if (option.value === `video:panel:${answerKey}-single`) {
+      option.menuSection = "single";
+    }
+  });
 
   if (!options.length) return null;
 
@@ -1651,58 +2571,124 @@ function buildVideoBridgePanelQuestionV2(
   const missingStoryboardCount = project?.scenes.filter((scene) => !scene.storyboardUrl).length ?? 0;
   const storyboardedSceneCount = countStoryboardedScenes(project);
   const shotPacketCount = countShotPackets(project);
-  const advanceOption = buildVideoAdvanceOption(snapshot);
-  const advanceRoundOption = buildVideoAdvanceRoundOption(snapshot);
+  const breakdownPassed = hasConfirmedVideoScriptBreakdown(project);
   const hasIncompleteEpisodeCoverage = hasIncompleteVideoEpisodeCoverage(project);
+  const hasExtractedEntities = characterCount > 0 || sceneAssetCount > 0;
+  const preBreakdownLinearStage = resolveVideoPreBreakdownLinearStage(project);
+  const storedAnalyzeDuration =
+    typeof project?.preferredEpisodeDurationSeconds === "number" &&
+    Number.isFinite(project.preferredEpisodeDurationSeconds) &&
+    project.preferredEpisodeDurationSeconds > 0
+      ? project.preferredEpisodeDurationSeconds
+      : null;
+  const storedAnalyzePace = resolveStoredVideoAnalyzePace(project);
+  const resumeAnalyzeQuestion =
+    sceneCount > 0 && !breakdownPassed
+      ? buildVideoAnalyzeResumeQuestion(snapshot, project, {
+          retryMissingEpisodes: hasIncompleteEpisodeCoverage,
+        })
+      : null;
   const hasEntities = false;
   const characterReferenceChildren: ComposerQuestionOption[] = [];
   const sceneReferenceChildren: ComposerQuestionOption[] = [];
+  const roleSceneHasEntities = characterCount > 0 || sceneAssetCount > 0;
+  const roleSceneMissingReferenceCount = missingCharacterRefs + missingSceneRefs;
+  const roleSceneTotalReferenceCount = listVideoReferenceAssetTargetIds(project, {
+    includeReady: true,
+  }).length;
+  const roleSceneCharacterReferenceChildren = buildVideoCharacterReferenceChildrenV2(
+    snapshot,
+    project,
+    readyReferenceIds,
+  );
+  const roleSceneSceneReferenceChildren = buildVideoSceneReferenceChildrenV2(
+    snapshot,
+    project,
+    readyReferenceIds,
+  );
 
   if (effectiveStage === "脚本拆解") {
-    return createVideoPanelQuestion({
+    const extractEntitiesOption = createVideoPanelOption(
+      `${snapshot.projectId}-video-bridge-entities`,
+      "提取角色与场景",
+      "video:bridge:entities",
+      sceneCount > 0
+        ? "继续抽取角色与场景实体，避免后续参考图和分镜图缺资产。"
+        : "也可以先直接从整本剧本里提取角色与场景实体，提前整理后续资产底稿。",
+    );
+    const analyzeOption = createVideoPanelOption(
+      `${snapshot.projectId}-video-bridge-analyze`,
+      resumeAnalyzeQuestion
+        ? "继续剧本拆解"
+        : sceneCount
+          ? (breakdownPassed ? "刷新拆解结果" : "继续完成剧本拆解")
+          : "完成剧本拆解",
+      preBreakdownLinearStage === "analyze" && storedAnalyzeDuration && storedAnalyzePace
+        ? `video:bridge:analyze:execute:${storedAnalyzePace}:${storedAnalyzeDuration}`
+        : resumeAnalyzeQuestion?.options[0]?.value || "video:bridge:analyze",
+      preBreakdownLinearStage === "analyze"
+        ? "两项关键参数已经确认，现在可以正式提交剧本拆解。"
+        : resumeAnalyzeQuestion
+          ? "两项关键参数已记录，可以直接恢复到当前拆解任务。"
+          : "把剧本整理成稳定的镜头序列，给后续实体、分镜和视频生成打底。",
+    );
+    const nextStepOption = createVideoPanelOption(
+      `${snapshot.projectId}-video-bridge-next-step`,
+      "下一步",
+      "video:bridge:next-step",
+      "先确认这次视频生成模式，再衔接后续角色、场景和视频工作流。",
+    );
+
+    const shouldOfferModeHandoff = breakdownPassed && project?.kickoffModeConfirmed !== true;
+    const stageHandoffOption = shouldOfferModeHandoff ? nextStepOption : extractEntitiesOption;
+    if (shouldOfferModeHandoff && preBreakdownLinearStage === "__legacy__") {
+      return createVideoPanelQuestion({
+        snapshot,
+        stage: effectiveStage,
+        answerKey: "video-bridge-panel",
+        title: `《${snapshot.title}》已完成脚本拆解`,
+        description:
+          sceneCount > 0
+            ? `当前已整理 ${sceneCount} 个镜头草案。下一步先确认视频生成模式，再继续后续视频工作流。`
+            : "脚本拆解已经通过，下一步先确认视频生成模式，再继续后续视频工作流。",
+        primary: [nextStepOption],
+        recommended: [],
+        bulk: [],
+        single: [],
+        automation: [],
+        statusBadges: [
+          ...(sceneCount > 0
+            ? [{ label: "镜头草案", value: sceneCount, tone: "default" as const }]
+            : []),
+        ],
+        mode,
+      });
+    }
+
+    const question = createVideoPanelQuestion({
       snapshot,
       stage: effectiveStage,
       answerKey: "video-bridge-panel",
       title: `《${snapshot.title}》正在完成脚本拆解`,
-      description: sceneCount
-        ? `当前已有 ${sceneCount} 个镜头草案，可以继续补角色与场景信息。`
-        : "先把脚本拆成可执行的镜头序列，再继续后面的角色、场景和分镜资产。",
-      recommended: [
-        hasIncompleteEpisodeCoverage
-          ? createVideoPanelOption(
-              `${snapshot.projectId}-video-bridge-analyze-retry-missing`,
-              "继续补拆缺失集",
-              "video:bridge:analyze:retry-missing",
-              "保留已经拆好的集数，只重试脚本里尚未覆盖的集数，再合并成完整分镜。",
-            )
+      description: breakdownPassed
+        ? `当前已有 ${sceneCount} 个镜头草案，内部检查已通过，可以继续补角色与场景信息。`
+        : sceneCount
+          ? `当前拆解结果还在内部检查中，通过前不会放到主页，也不会放出后续步骤。`
+          : "先把脚本拆成可执行的镜头序列，再继续后面的角色、场景和分镜资产。",
+      primary: [
+        preBreakdownLinearStage === "entities"
+          ? stageHandoffOption
           : null,
-        createVideoPanelOption(
-          `${snapshot.projectId}-video-bridge-analyze`,
-          sceneCount ? "刷新拆解结果" : "完成剧本拆解",
-          "video:bridge:analyze",
-          "把剧本整理成稳定的镜头序列，给后续实体、分镜和视频生成打底。",
-        ),
-        createVideoPanelOption(
-          `${snapshot.projectId}-video-bridge-entities`,
-          "提取角色与场景",
-          "video:bridge:entities",
-          "继续抽取角色与场景实体，避免后续参考图和分镜图缺资产。",
-        ),
+        preBreakdownLinearStage === "analyze" || preBreakdownLinearStage === null
+          ? analyzeOption
+          : null,
+        preBreakdownLinearStage === null &&
+        (shouldOfferModeHandoff || (!hasExtractedEntities && (sceneCount === 0 || breakdownPassed)))
+          ? stageHandoffOption
+          : null,
       ],
-      bulk: [
-        createVideoPanelOption(
-          `${snapshot.projectId}-video-bridge-entities-bulk`,
-          "批量抽取角色与场景",
-          "video:bridge:entities",
-          "把拆好的镜头继续推进到角色与场景层，形成后续生图输入。",
-        ),
-        createVideoPanelOption(
-          `${snapshot.projectId}-video-bridge-platform`,
-          "补平台与镜头偏好",
-          "video:bridge:platform",
-          "补齐平台、风格和目标约束，减少后续镜头语言漂移。",
-        ),
-      ],
+      recommended: [],
+      bulk: [],
       single: [
         hasEntities && characterReferenceChildren.length
           ? createVideoPanelOption(
@@ -1723,38 +2709,44 @@ function buildVideoBridgePanelQuestionV2(
             )
           : null,
       ],
-      automation: [advanceOption, advanceRoundOption],
+      automation: [
+        breakdownPassed ? buildStoryboardXlsxExportOption(snapshot, project) : null,
+      ],
       statusBadges: [
-        ...(sceneCount > 0 ? [{ label: "镜头草案", value: sceneCount, tone: "default" as const }] : []),
+        ...(breakdownPassed && sceneCount > 0 ? [{ label: "镜头草案", value: sceneCount, tone: "default" as const }] : []),
       ],
       mode,
     });
+    return project?.storyboardPlan?.trim()
+      ? withoutQuestionActionValue(question, "video:bridge:storyboard")
+      : question;
   }
 
   if (effectiveStage === "角色与场景") {
-    const hasEntities = characterCount > 0 || sceneAssetCount > 0;
-    const missingReferenceCount = missingCharacterRefs + missingSceneRefs;
-    const characterReferenceChildren = buildVideoCharacterReferenceChildrenV2(snapshot, project, readyReferenceIds);
-    const sceneReferenceChildren = buildVideoSceneReferenceChildrenV2(snapshot, project, readyReferenceIds);
+    const hasEntities = roleSceneHasEntities;
+    const missingReferenceCount = roleSceneMissingReferenceCount;
+    const totalReferenceCount = roleSceneTotalReferenceCount;
+    const characterReferenceChildren = roleSceneCharacterReferenceChildren;
+    const sceneReferenceChildren = roleSceneSceneReferenceChildren;
+    const missingFullReferenceTargetIds = listVideoReferenceAssetTargetIds(project);
+    const allFullReferenceTargetIds = listVideoReferenceAssetTargetIds(project, { includeReady: true });
+    const fullReferenceBatchLimit = getVideoImageGenerationBatchLimit(project?.imageGenerationPrefs);
+    const missingFullReferenceBatchCount = Math.min(missingFullReferenceTargetIds.length, fullReferenceBatchLimit);
+    const allFullReferenceBatchCount = Math.min(allFullReferenceTargetIds.length, fullReferenceBatchLimit);
+    const fullReferenceAssetOption = hasEntities && allFullReferenceTargetIds.length
+      ? createVideoPanelOption(
+          `${snapshot.projectId}-video-bridge-reference-assets-full`,
+          missingFullReferenceTargetIds.length
+            ? `智能补图 ${missingFullReferenceBatchCount}/${missingFullReferenceTargetIds.length}`
+            : `刷新素材 ${allFullReferenceBatchCount}/${allFullReferenceTargetIds.length}`,
+          "video:bridge:reference-assets:full",
+          missingFullReferenceTargetIds.length
+            ? "按当前生图模型上限分批补齐；重复点击同一个按钮会继续下一批，主参考图优先于对应变体图。"
+            : "所有主参考图和变体图都已齐备，可按当前生图模型上限分批刷新。",
+        )
+      : null;
 
     if (isTextToVideo) {
-      const missingFullReferenceTargetIds = listVideoReferenceAssetTargetIds(project);
-      const allFullReferenceTargetIds = listVideoReferenceAssetTargetIds(project, { includeReady: true });
-      const fullReferenceBatchLimit = getVideoImageGenerationBatchLimit(project?.imageGenerationPrefs);
-      const missingFullReferenceBatchCount = Math.min(missingFullReferenceTargetIds.length, fullReferenceBatchLimit);
-      const allFullReferenceBatchCount = Math.min(allFullReferenceTargetIds.length, fullReferenceBatchLimit);
-      const fullReferenceAssetOption = hasEntities && allFullReferenceTargetIds.length
-        ? createVideoPanelOption(
-            `${snapshot.projectId}-video-bridge-reference-assets-full-t2v`,
-            missingFullReferenceTargetIds.length
-              ? `智能补图 ${missingFullReferenceBatchCount}/${missingFullReferenceTargetIds.length}`
-              : `刷新素材 ${allFullReferenceBatchCount}/${allFullReferenceTargetIds.length}`,
-            "video:bridge:reference-assets:full",
-            missingFullReferenceTargetIds.length
-              ? "按当前生图模型上限分批补齐；重复点击同一个按钮会继续下一批，主参考图优先于对应变体图。"
-              : "所有主参考图和变体图都已齐备，可按当前生图模型上限分批刷新。",
-          )
-        : null;
       const t2vAllSegmentLabels = [
         ...new Set(
           (project?.scenes ?? [])
@@ -1765,6 +2757,37 @@ function buildVideoBridgePanelQuestionV2(
       const t2vMissingSegmentLabels = t2vAllSegmentLabels.filter(
         (label) => !project?.segmentVideoPrompts?.[label]?.prompt?.trim(),
       );
+      const t2vSegmentPromptCount = t2vAllSegmentLabels.filter(
+        (label) => !!project?.segmentVideoPrompts?.[label]?.prompt?.trim(),
+      ).length;
+      const t2vAllSegmentPromptsReady =
+        t2vAllSegmentLabels.length > 0 && t2vMissingSegmentLabels.length === 0;
+      const segmentPromptEntryOptions: ComposerQuestionOption[] = [];
+      if (t2vAllSegmentLabels.length) {
+        segmentPromptEntryOptions.push(
+          t2vSegmentPromptCount === 0
+            ? {
+                id: `${snapshot.projectId}-video-bridge-prompts-segment-all`,
+                label: `全部片段生成（${t2vAllSegmentLabels.length}）`,
+                value: "video:bridge:prompts:segment:all",
+                rationale: "按片段顺序生成当前全部片段的合并提示词，适合第一轮从零开始准备。",
+              }
+            : {
+                id: `${snapshot.projectId}-video-bridge-prompts-segment-regenerate-all`,
+                label: `重新生成全部片段（${t2vAllSegmentLabels.length}）`,
+                value: "video:bridge:prompts:segment:all",
+                rationale: "按片段顺序重新生成当前全部片段的合并提示词，会覆盖已有片段提示词。",
+              },
+        );
+        if (t2vSegmentPromptCount > 0 && t2vMissingSegmentLabels.length) {
+          segmentPromptEntryOptions.push({
+            id: `${snapshot.projectId}-video-bridge-prompts-segment-remaining`,
+            label: `补齐剩余片段（${t2vMissingSegmentLabels.length}）`,
+            value: "video:bridge:prompts:segment:remaining",
+            rationale: "按片段顺序自动补齐尚未生成的合并提示词，并参考前后片段保持内容连贯。",
+          });
+        }
+      }
       // 文生视频分支：第2步显示编译+提示词，跳过分镜图
       const promptSubChildren: ComposerQuestionOption[] = [
         {
@@ -1773,21 +2796,16 @@ function buildVideoBridgePanelQuestionV2(
           value: "video:bridge:prompts:segment",
           rationale: "将同一片段内的所有分镜合并成一个连贯的商业化视频提示词（最高 15s 规格，自动适配当前模型时长）。",
           children: [
-            t2vMissingSegmentLabels.length
-              ? {
-                  id: `${snapshot.projectId}-video-bridge-prompts-segment-remaining`,
-                  label: `补齐剩余片段（${t2vMissingSegmentLabels.length}）`,
-                  value: "video:bridge:prompts:segment:remaining",
-                  rationale: "按片段顺序自动补齐尚未生成的合并提示词，并参考前后片段保持内容连贯。",
-                }
-              : null,
+            ...segmentPromptEntryOptions,
             {
               id: `${snapshot.projectId}-video-bridge-prompts-segment-batch`,
-              label: "分批生成片段",
+              label: t2vAllSegmentPromptsReady ? "重新分批生成片段" : "分批生成片段",
               value: "video:bridge:prompts:segment:batch",
-              rationale: "每次按顺序生成下一个未完成片段，适合长项目逐步推进，已生成片段不会被覆盖。",
+              rationale: t2vAllSegmentPromptsReady
+                ? "从第一个片段开始按顺序逐个刷新合并提示词，每次只重刷一个片段；重复点击会继续处理下一个片段，并同步更新当前重刷进度。"
+                : "每次按顺序生成下一个未完成片段，适合长项目逐步推进，已生成片段不会被覆盖。",
             },
-            ...buildSegmentPromptChildren(snapshot, project),
+            ...buildSegmentPromptSingleListChildren(snapshot, project),
           ].filter(Boolean) as ComposerQuestionOption[],
         },
         {
@@ -1795,30 +2813,17 @@ function buildVideoBridgePanelQuestionV2(
           label: "镜头提示词生成",
           value: "video:bridge:prompts",
           rationale: "为单个镜头生成视频提示词，支持按集或按片段顺序分批推进。",
-          children: [
-            {
-              id: `${snapshot.projectId}-video-bridge-prompts-all`,
-              label: "按集分批生成",
-              value: "video:bridge:prompts:all",
-              rationale: "生成当前集内所有镜头的视频提示词，后续点击每次补齐一集。",
-            },
-            {
-              id: `${snapshot.projectId}-video-bridge-prompts-batch`,
-              label: "按片段分批生成",
-              value: "video:bridge:prompts:batch",
-              rationale: "每次按顺序生成一个片段内的所有分镜提示词，已覆盖的镜头持续叠加更新，点击一次推进一个片段。",
-            },
-          ],
+          children: buildShotLevelVideoPromptModeChildren(snapshot),
         },
       ];
       const promptsWithSubMenu = createVideoPanelOption(
         `${snapshot.projectId}-video-bridge-prompts-t2v`,
-        shotPacketCount ? "准备视频提示词" : "准备视频提示词（先编译镜头包）",
+        shotPacketCount ? "视频提示词生成方式" : "视频提示词生成方式（先编译镜头包）",
         "video:bridge:prompts",
         "选择生成方式：片段提示词生成或镜头提示词生成。",
         { children: promptSubChildren, disabled: !shotPacketCount },
       );
-      const compileShotPacketsOption = hasEntities
+      const compileShotPacketsOption = hasEntities && !shotPacketCount
         ? createVideoPanelOption(
             `${snapshot.projectId}-video-bridge-shots-t2v`,
             shotPacketCount ? "刷新镜头指令包" : "编译镜头指令包",
@@ -1826,14 +2831,11 @@ function buildVideoBridgePanelQuestionV2(
             "文生视频模式：直接从角色与场景实体编译镜头指令包，跳过分镜图生成。",
           )
         : null;
-      const t2vSegmentPromptCount = t2vAllSegmentLabels.filter(
-        (label) => !!project?.segmentVideoPrompts?.[label]?.prompt?.trim(),
-      ).length;
       const t2vShotPromptCount = (project?.scenes ?? []).filter((s) => !!s.enhancedVideoPrompt?.trim()).length;
       const t2vBaseDescription = !hasEntities
         ? "先把角色与场景实体整理出来，再编译镜头指令包，最后准备视频提示词进入出片。"
         : shotPacketCount
-          ? "镜头指令包已就绪，选择生成范围准备视频提示词批次。"
+          ? "镜头指令包已就绪，选择视频提示词生成方式后即可继续出片。"
           : "角色和场景实体已就绪，先编译镜头指令包，再准备视频提示词。";
       return createVideoPanelQuestion({
         snapshot,
@@ -1862,14 +2864,6 @@ function buildVideoBridgePanelQuestionV2(
             : null,
         ],
         bulk: [
-          createVideoPanelOption(
-            `${snapshot.projectId}-video-bridge-entities-refresh-t2v`,
-            hasEntities ? "刷新角色与场景提取" : "批量提取角色与场景",
-            "video:bridge:entities",
-            hasEntities
-              ? "重新整理角色、场景和关联信息，确保主资产和剧情实体一致。"
-              : "先把这批镜头里的角色、场景和关联关系一起抽出来，形成后续资产入口。",
-          ),
           fullReferenceAssetOption,
           shotPacketCount ? compileShotPacketsOption : null,
           shotPacketCount ? promptsWithSubMenu : null,
@@ -1897,8 +2891,6 @@ function buildVideoBridgePanelQuestionV2(
         automation: [
           buildVideoStepSwitchOption(snapshot, project, 4, readyReferenceIds, mode),
           buildVideoStepSwitchOption(snapshot, project, 5, readyReferenceIds, mode),
-          advanceOption,
-          advanceRoundOption,
         ],
         statusBadges: [
           ...(characterCount > 0 ? [{ label: "角色", value: characterCount, tone: "default" as const }] : []),
@@ -1929,50 +2921,32 @@ function buildVideoBridgePanelQuestionV2(
     // 图生视频模式：正常主链路
     const switchToStoryboardOption = createVideoPanelOption(
       `${snapshot.projectId}-video-step-storyboard`,
-      "切到《生成分镜图》",
+      formatVideoStepLabelWithCount("切到《生成分镜图》", VIDEO_VISIBLE_STAGE_FLOW[2], mode),
       "video:step:storyboard",
-      "快速切到分镜图步骤，继续查看缺口、指定镜头和推进状态。",
+      `快速${formatVideoStepLabelWithCount("切到《生成分镜图》", VIDEO_VISIBLE_STAGE_FLOW[2], mode)}，继续查看缺口、指定镜头和推进状态。`,
     );
-    return createVideoPanelQuestion({
+    const question = createVideoPanelQuestion({
       snapshot,
       stage: effectiveStage,
       answerKey: "video-bridge-panel",
       title: `《${snapshot.title}》正在补角色与场景`,
-      description: !hasEntities
+      description: !roleSceneHasEntities
         ? "平台和镜头偏好已经写回，下一步先把角色与场景实体整理出来，再继续后面的镜头包和出片。"
         : shotPacketCount
-          ? "镜头指令包已就绪，可以直接准备视频提示词批次进入出片。"
+          ? "镜头指令包已就绪，可以直接选择视频提示词生成方式进入出片。"
           : "角色和场景实体已就绪，可以继续生成参考图和分镜图。",
       recommended: [
-        !hasEntities
+        !roleSceneHasEntities
           ? createVideoPanelOption(
               `${snapshot.projectId}-video-bridge-entities-primary`,
               "先整理角色和场景资产",
               "video:bridge:entities",
               "先把镜头里的角色和场景实体抽出来，后续镜头包和出片才会稳定。",
             )
-          : createVideoPanelOption(
-              `${snapshot.projectId}-video-bridge-reference-assets-primary`,
-              "批量补参考图",
-              "video:bridge:reference-assets",
-              "把缺失的角色主参考图、场景主参考图一次补齐，为分镜图生成打底。",
-            ),
+          : fullReferenceAssetOption,
       ],
       bulk: [
-        createVideoPanelOption(
-          `${snapshot.projectId}-video-bridge-entities-refresh`,
-          hasEntities ? "刷新角色与场景提取" : "批量提取角色与场景",
-          "video:bridge:entities",
-          hasEntities
-            ? "重新整理角色、场景和关联信息，确保主资产和剧情实体一致。"
-            : "先把这批镜头里的角色、场景和关联关系一起抽出来，形成后续资产入口。",
-        ),
-        createVideoPanelOption(
-          `${snapshot.projectId}-video-bridge-reference-assets-bulk`,
-          "批量补参考图",
-          "video:bridge:reference-assets",
-          "把缺失的角色主参考图、场景主参考图一次补齐。",
-        ),
+        fullReferenceAssetOption,
         createVideoPanelOption(
           `${snapshot.projectId}-video-bridge-storyboard-bulk`,
           "推进到分镜批次",
@@ -1981,22 +2955,22 @@ function buildVideoBridgePanelQuestionV2(
         ),
       ],
       single: [
-        hasEntities && characterReferenceChildren.length
+        roleSceneHasEntities && roleSceneCharacterReferenceChildren.length
           ? createVideoPanelOption(
               `${snapshot.projectId}-video-bridge-reference-assets-characters-single`,
               "单独整理角色资产",
               "video:bridge:reference-assets:characters",
               "把角色资产拆成单独入口，可只生成或刷新指定角色。",
-              { children: characterReferenceChildren },
+              { children: roleSceneCharacterReferenceChildren },
             )
           : null,
-        hasEntities && sceneReferenceChildren.length
+        roleSceneHasEntities && roleSceneSceneReferenceChildren.length
           ? createVideoPanelOption(
               `${snapshot.projectId}-video-bridge-reference-assets-scenes-single`,
               "单独整理场景资产",
               "video:bridge:reference-assets:scenes",
               "把场景资产拆成单独入口，可只生成或刷新指定场景。",
-              { children: sceneReferenceChildren },
+              { children: roleSceneSceneReferenceChildren },
             )
           : null,
       ],
@@ -2004,39 +2978,63 @@ function buildVideoBridgePanelQuestionV2(
         switchToStoryboardOption,
         buildVideoStepSwitchOption(snapshot, project, 4, readyReferenceIds, mode),
         buildVideoStepSwitchOption(snapshot, project, 5, readyReferenceIds, mode),
-        advanceOption,
-        advanceRoundOption,
       ],
       statusBadges: [
         ...(characterCount > 0 ? [{ label: "角色", value: characterCount, tone: "default" as const }] : []),
         ...(sceneAssetCount > 0 ? [{ label: "场景", value: sceneAssetCount, tone: "default" as const }] : []),
         ...(missingReferenceCount > 0
-          ? [{ label: "缺参考图", value: missingReferenceCount, tone: "warning" as const }]
+          ? [{ label: "缺参考图", value: totalReferenceCount, tone: "warning" as const }]
           : []),
       ],
     });
+    return project?.storyboardPlan?.trim()
+      ? withoutQuestionActionValue(question, "video:bridge:storyboard")
+      : question;
   }
 
   const storyboardFrameChildren = buildStoryboardFrameSceneChildrenV2(snapshot, project, readyReferenceIds);
-  const targetedStoryboardOption = storyboardFrameChildren.length
-    ? createVideoPanelOption(
-        `${snapshot.projectId}-video-bridge-storyboard-frames-single`,
-        "指定生成分镜图",
-        "video:bridge:storyboard-frames:list",
-        "按片段目录展开单个镜头，缺素材的镜头会置灰并在右侧直接说明缺什么。",
-        { children: storyboardFrameChildren },
-      )
-    : null;
   const switchToEntitiesOption = createVideoPanelOption(
     `${snapshot.projectId}-video-step-entities`,
-    "切回《角色和场景》",
+    formatVideoStepLabelWithCount("切回《角色和场景》", VIDEO_VISIBLE_STAGE_FLOW[1], mode),
     "video:step:entities",
-    "需要补角色或场景基础素材时，可以直接切回去继续补齐。",
+    `需要补角色或场景基础素材时，可以直接${formatVideoStepLabelWithCount("切回《角色和场景》", VIDEO_VISIBLE_STAGE_FLOW[1], mode)}继续补齐。`,
   );
   const switchToVideoOption = buildVideoStepSwitchOption(snapshot, project, 4, readyReferenceIds, mode);
   const switchToPreviewOption = buildVideoStepSwitchOption(snapshot, project, 5, readyReferenceIds, mode);
-
-  return createVideoPanelQuestion({
+  const smartStoryboardTargetIds = listSmartStoryboardFrameTargetIds(project);
+  const storyboardBatchCount = getStoryboardFrameBatchCount(
+    smartStoryboardTargetIds.length || missingStoryboardCount,
+    project?.imageGenerationPrefs,
+  );
+  const blockedStoryboardCount = Math.max(missingStoryboardCount - smartStoryboardTargetIds.length, 0);
+  const storyboardSmartFillOption = createVideoPanelOption(
+    `${snapshot.projectId}-video-bridge-storyboard-frames`,
+    smartStoryboardTargetIds.length
+      ? buildStoryboardFrameBatchLabel(smartStoryboardTargetIds.length, project?.imageGenerationPrefs)
+      : missingStoryboardCount
+        ? `智能补图 0/${missingStoryboardCount}`
+        : "刷新分镜图",
+    "video:bridge:storyboard-frames",
+    smartStoryboardTargetIds.length
+      ? [
+          `按当前生图模型上限分批补齐；本轮先处理 ${storyboardBatchCount}/${smartStoryboardTargetIds.length} 张，重复点击同一个按钮会继续下一批，直到自动补齐。`,
+          blockedStoryboardCount > 0
+            ? `另有 ${blockedStoryboardCount} 个镜头还缺基础素材，暂时不会进入这一批。`
+            : "",
+        ].filter(Boolean).join(" ")
+      : missingStoryboardCount
+        ? "当前缺分镜图的镜头里，还没有可直接生成的目标；先补齐角色或场景参考图后，再回来继续自动补齐。"
+        : "分镜图已齐备，如需重做可到下方按镜头单独重生成。",
+    { disabled: missingStoryboardCount > 0 && smartStoryboardTargetIds.length === 0 },
+  );
+  const imageToVideoPromptModeOption = createVideoPanelOption(
+    `${snapshot.projectId}-video-bridge-prompts-bulk`,
+    "视频提示词生成方式",
+    "video:bridge:prompts",
+    "选择生成方式：按集分批生成或按片段分批生成，系统会根据已有分镜图自动识别当前可生成的镜头。",
+    { children: buildShotLevelVideoPromptModeChildren(snapshot), disabled: shotPacketCount === 0 },
+  );
+  const question = createVideoPanelQuestion({
     snapshot,
     stage,
     answerKey: "video-bridge-panel",
@@ -2045,12 +3043,7 @@ function buildVideoBridgePanelQuestionV2(
       ? `当前还有 ${missingStoryboardCount} 个镜头缺真正的分镜图，补齐后再进入视频生成会更稳。`
       : "分镜图已基本齐备，可以继续编译镜头包和视频提示词。",
     recommended: [
-      createVideoPanelOption(
-        `${snapshot.projectId}-video-bridge-storyboard-frames`,
-        missingStoryboardCount ? "补齐分镜图" : "刷新分镜图",
-        "video:bridge:storyboard-frames",
-        "真正落地 scene.storyboardUrl，而不是只停留在文本分镜计划。",
-      ),
+      storyboardSmartFillOption,
       createVideoPanelOption(
         `${snapshot.projectId}-video-bridge-shots-next`,
         shotPacketCount ? "刷新镜头指令包" : "编译镜头指令包",
@@ -2065,27 +3058,17 @@ function buildVideoBridgePanelQuestionV2(
         "video:bridge:storyboard",
         "先整理分镜文本计划，再决定是否需要重生成分镜图。",
       ),
-      createVideoPanelOption(
-        `${snapshot.projectId}-video-bridge-storyboard-frames-bulk`,
-        "批量生成分镜图",
-        "video:bridge:storyboard-frames",
-        "把缺失的 scene.storyboardUrl 一次补齐，避免后续卡在文本分镜阶段。",
-      ),
+      storyboardSmartFillOption,
       createVideoPanelOption(
         `${snapshot.projectId}-video-bridge-shots-bulk`,
         shotPacketCount ? "重建镜头指令包" : "编译镜头指令包",
         "video:bridge:shots",
         "统一刷新镜头指令包，让后续视频提示词建立在最新分镜之上。",
       ),
-      createVideoPanelOption(
-        `${snapshot.projectId}-video-bridge-prompts-bulk`,
-        "准备视频提示词批次",
-        "video:bridge:prompts",
-        "把镜头包继续推进到视频提示词阶段，准备开始出片。",
-      ),
+      imageToVideoPromptModeOption,
     ],
-    single: [targetedStoryboardOption],
-    automation: [switchToEntitiesOption, switchToVideoOption, switchToPreviewOption, advanceOption, advanceRoundOption],
+    single: storyboardFrameChildren,
+    automation: [switchToEntitiesOption, switchToVideoOption, switchToPreviewOption],
     statusBadges: [
       ...(storyboardedSceneCount > 0
         ? [{ label: "已出分镜图", value: storyboardedSceneCount, tone: "default" as const }]
@@ -2097,6 +3080,14 @@ function buildVideoBridgePanelQuestionV2(
     ],
     mode,
   });
+
+  const withoutStoryboardRefresh = project?.storyboardPlan?.trim()
+    ? withoutQuestionActionValue(question, "video:bridge:storyboard")
+    : question;
+
+  return shotPacketCount > 0
+    ? withoutQuestionActionValue(withoutStoryboardRefresh, "video:bridge:shots")
+    : withoutStoryboardRefresh;
 }
 
 function buildVideoGenerationPanelQuestionV2(
@@ -2126,8 +3117,6 @@ function buildVideoGenerationPanelQuestionV2(
   const failedScenes = listFailedVideoScenes(project);
   const runningScenes = listRunningVideoScenes(project);
   const completedScenes = listCompletedVideoScenes(project);
-  const advanceOption = buildVideoAdvanceOption(snapshot);
-  const advanceRoundOption = buildVideoAdvanceRoundOption(snapshot);
   const productionBundleOption = buildVideoProductionBundleOption(snapshot);
   const productionFollowups = buildVideoProductionBundleFollowupOptions(snapshot);
   const readyReferenceIds = buildReadyReferenceIdsFromAssets(project);
@@ -2140,9 +3129,9 @@ function buildVideoGenerationPanelQuestionV2(
   const switchToEntitiesOption = isTextToVideo
     ? createVideoPanelOption(
         `${snapshot.projectId}-video-step-entities-t2v`,
-        "切回《角色和场景》",
+        formatVideoStepLabelWithCount("切回《角色和场景》", VIDEO_VISIBLE_STAGE_FLOW[1], mode),
         "video:step:entities",
-        "返回补齐角色场景资产或继续准备视频提示词批次。",
+        `${formatVideoStepLabelWithCount("返回《角色和场景》", VIDEO_VISIBLE_STAGE_FLOW[1], mode)}补齐角色场景资产，或继续选择视频提示词生成方式。`,
       )
     : null;
 
@@ -2160,8 +3149,12 @@ function buildVideoGenerationPanelQuestionV2(
     return null;
   }
 
-  const firstBatchSize = Math.min(3, candidates.length);
-  const firstSegmentBatchSize = Math.min(3, segmentVideoCandidates.length);
+  const videoBatchLimit = getHomeAgentVideoGenerationBatchLimit(project?.videoGenerationPrefs);
+  const firstBatchSize = getVideoGenerationBatchCount(candidates.length, project?.videoGenerationPrefs);
+  const firstSegmentBatchSize = getVideoGenerationBatchCount(
+    segmentVideoCandidates.length,
+    project?.videoGenerationPrefs,
+  );
   const targetedGenerationChildren = buildTargetedVideoGenerationChildrenV2(snapshot, project);
 
   return createVideoPanelQuestion({
@@ -2192,7 +3185,7 @@ function buildVideoGenerationPanelQuestionV2(
       failedSegmentVideoCandidates.length
         ? createVideoPanelOption(
             `${snapshot.projectId}-video-generate-segments-failed`,
-            `补发 ${Math.min(failedSegmentVideoCandidates.length, 3)} 个失败片段`,
+            `补发 ${Math.min(failedSegmentVideoCandidates.length, videoBatchLimit)} 个失败片段`,
             "video:generate:segments:failed",
             "优先回补失败片段，保持片段成片队列连续。",
           )
@@ -2200,29 +3193,27 @@ function buildVideoGenerationPanelQuestionV2(
       segmentVideoCandidates.length
         ? createVideoPanelOption(
             `${snapshot.projectId}-video-generate-segments-first`,
-            segmentVideoCandidates.length === 1
-              ? `生成片段视频（${segmentVideoCandidates[0]}）`
-              : `先生成前 ${firstSegmentBatchSize} 个片段`,
+            buildVideoGenerationBatchLabel("segment", segmentVideoCandidates.length, project?.videoGenerationPrefs),
+
             "video:generate:segments:first",
-            segmentVideoCandidates.length === 1
-              ? "直接把当前最靠前的片段提示词送去生成片段视频。"
-              : `优先验证最靠前的 ${firstSegmentBatchSize} 个片段，快速拿到第一批片段视频结果。`,
+            `\u6309\u5f53\u524d\u89c6\u9891\u6279\u6b21\u4e0a\u9650\u5206\u6279\u751f\u6210\uff1b\u672c\u8f6e\u5148\u5904\u7406 ${firstSegmentBatchSize}/${segmentVideoCandidates.length} \u4e2a\u7247\u6bb5\uff0c\u91cd\u590d\u70b9\u51fb\u540c\u4e00\u4e2a\u6309\u94ae\u4f1a\u7ee7\u7eed\u4e0b\u4e00\u6279\uff0c\u76f4\u5230\u81ea\u52a8\u8865\u9f50\u3002`,
+
           )
         : null,
       candidates.length
         ? createVideoPanelOption(
             `${snapshot.projectId}-video-generate-first`,
-            candidates.length === 1 ? `生成 ${formatSceneOptionLabel(candidates[0])}` : `先生成前 ${firstBatchSize} 个镜头`,
+            buildVideoGenerationBatchLabel("scene", candidates.length, project?.videoGenerationPrefs),
+
             "video:generate:first",
-            candidates.length === 1
-              ? "直接把当前最靠前的镜头送去生成。"
-              : `优先验证最靠前的 ${firstBatchSize} 个镜头，快速拿到第一批视频结果。`,
+            `\u6309\u5f53\u524d\u89c6\u9891\u6279\u6b21\u4e0a\u9650\u5206\u6279\u751f\u6210\uff1b\u672c\u8f6e\u5148\u5904\u7406 ${firstBatchSize}/${candidates.length} \u4e2a\u955c\u5934\uff0c\u91cd\u590d\u70b9\u51fb\u540c\u4e00\u4e2a\u6309\u94ae\u4f1a\u7ee7\u7eed\u4e0b\u4e00\u6279\uff0c\u76f4\u5230\u81ea\u52a8\u8865\u9f50\u3002`,
+
           )
         : null,
       failedScenes.length
         ? createVideoPanelOption(
             `${snapshot.projectId}-video-generate-failed`,
-            `补发 ${Math.min(failedScenes.length, 3)} 个失败镜头`,
+            `补发 ${Math.min(failedScenes.length, videoBatchLimit)} 个失败镜头`,
             "video:generate:failed",
             "优先回补失败镜头，避免导出被缺口卡住。",
           )
@@ -2248,17 +3239,21 @@ function buildVideoGenerationPanelQuestionV2(
       segmentVideoCandidates.length
         ? createVideoPanelOption(
             `${snapshot.projectId}-video-generate-segments-first-bulk`,
-            segmentVideoCandidates.length === 1 ? "生成当前片段" : `批量生成前 ${firstSegmentBatchSize} 个片段`,
+            buildVideoGenerationBatchLabel("segment", segmentVideoCandidates.length, project?.videoGenerationPrefs),
+
             "video:generate:segments:first",
-            "按当前片段顺序直接发起第一批片段视频生成。",
+            `\u6309\u5f53\u524d\u89c6\u9891\u6279\u6b21\u4e0a\u9650\u5206\u6279\u751f\u6210\uff1b\u672c\u8f6e\u5148\u5904\u7406 ${firstSegmentBatchSize}/${segmentVideoCandidates.length} \u4e2a\u7247\u6bb5\uff0c\u91cd\u590d\u70b9\u51fb\u540c\u4e00\u4e2a\u6309\u94ae\u4f1a\u7ee7\u7eed\u4e0b\u4e00\u6279\uff0c\u76f4\u5230\u81ea\u52a8\u8865\u9f50\u3002`,
+
           )
         : null,
       candidates.length
         ? createVideoPanelOption(
             `${snapshot.projectId}-video-generate-first-bulk`,
-            candidates.length === 1 ? "生成当前镜头" : `批量生成前 ${firstBatchSize} 个镜头`,
+            buildVideoGenerationBatchLabel("scene", candidates.length, project?.videoGenerationPrefs),
+
             "video:generate:first",
-            "按当前排序直接发起第一批视频生成。",
+            `\u6309\u5f53\u524d\u89c6\u9891\u6279\u6b21\u4e0a\u9650\u5206\u6279\u751f\u6210\uff1b\u672c\u8f6e\u5148\u5904\u7406 ${firstBatchSize}/${candidates.length} \u4e2a\u955c\u5934\uff0c\u91cd\u590d\u70b9\u51fb\u540c\u4e00\u4e2a\u6309\u94ae\u4f1a\u7ee7\u7eed\u4e0b\u4e00\u6279\uff0c\u76f4\u5230\u81ea\u52a8\u8865\u9f50\u3002`,
+
           )
         : null,
       failedScenes.length
@@ -2271,24 +3266,12 @@ function buildVideoGenerationPanelQuestionV2(
         : null,
     ],
     single: [
-      targetedGenerationChildren.length
-        ? createVideoPanelOption(
-            `${snapshot.projectId}-video-generate-list`,
-            isTextToVideo && segmentVideoCandidates.length ? "指定片段或镜头出片" : "指定镜头出片",
-            "video:generate:list",
-            isTextToVideo && segmentVideoCandidates.length
-              ? "先挑具体片段或镜头，再只提交这一小批。"
-              : "先挑具体镜头，再只提交这一小批。",
-            { children: targetedGenerationChildren },
-          )
-        : null,
+      ...targetedGenerationChildren,
     ],
     automation: [
       switchToEntitiesOption,
       switchToStoryboardOption,
       switchToPreviewOption,
-      advanceOption,
-      advanceRoundOption,
       productionBundleOption,
       ...productionFollowups,
     ],
@@ -2327,9 +3310,9 @@ function buildVideoPreviewExportPanelQuestionV2(
   const switchToEntitiesOption = isTextToVideo
     ? createVideoPanelOption(
         `${snapshot.projectId}-preview-step-entities-t2v`,
-        "切回《角色和场景》",
+        formatVideoStepLabelWithCount("切回《角色和场景》", VIDEO_VISIBLE_STAGE_FLOW[1], mode),
         "video:step:entities",
-        "返回补齐角色场景资产或继续准备视频提示词批次。",
+        `${formatVideoStepLabelWithCount("返回《角色和场景》", VIDEO_VISIBLE_STAGE_FLOW[1], mode)}补齐角色场景资产，或继续选择视频提示词生成方式。`,
       )
     : null;
 
@@ -2348,24 +3331,14 @@ function buildVideoPreviewExportPanelQuestionV2(
       !runningScenes.length && candidates.length
         ? createVideoPanelOption(
             `${snapshot.projectId}-preview-generate-first`,
-            "继续补生成剩余镜头",
+            buildVideoGenerationBatchLabel("scene", candidates.length, project?.videoGenerationPrefs),
             "video:generate:first",
-            "如果还有未出片镜头，可以继续补发。",
+            `\u6309\u5f53\u524d\u89c6\u9891\u6279\u6b21\u4e0a\u9650\u5206\u6279\u751f\u6210\uff1b\u672c\u8f6e\u5148\u5904\u7406 ${getVideoGenerationBatchCount(candidates.length, project?.videoGenerationPrefs)}/${candidates.length} \u4e2a\u955c\u5934\uff0c\u91cd\u590d\u70b9\u51fb\u540c\u4e00\u4e2a\u6309\u94ae\u4f1a\u7ee7\u7eed\u4e0b\u4e00\u6279\uff0c\u76f4\u5230\u81ea\u52a8\u8865\u9f50\u3002`,
           )
         : null,
     ],
     bulk: [],
-    single: [
-      targetedGenerationChildren.length
-        ? createVideoPanelOption(
-            `${snapshot.projectId}-preview-generate-list-single`,
-            "指定镜头继续出片",
-            "video:generate:list",
-            "如果还有未出片镜头，可以先补最关键的那几个。",
-            { children: targetedGenerationChildren },
-          )
-        : null,
-    ],
+    single: targetedGenerationChildren,
     automation: [
       switchToEntitiesOption,
       switchToStoryboardOption,
@@ -2381,37 +3354,156 @@ function buildVideoPreviewExportPanelQuestionV2(
   });
 }
 
+function buildVideoRefreshPanelQuestion(
+  snapshot: ConversationProjectSnapshot,
+  project: PersistedVideoProject | null | undefined,
+): ComposerQuestion | null {
+  if (snapshot.projectKind !== "video") return null;
+
+  const mode = project?.videoGenerationPrefs?.mode ?? "image-to-video";
+  const isTextToVideo = mode === "text-to-video";
+  const allCandidates = listGeneratableVideoScenes(project);
+  const candidates = isTextToVideo
+    ? allCandidates.filter((scene) => !!scene.enhancedVideoPrompt?.trim())
+    : allCandidates;
+  const segmentVideoCandidates = isTextToVideo
+    ? listGeneratableSegmentVideoLabels(project)
+    : [];
+  const failedSegmentVideoCandidates = isTextToVideo
+    ? listFailedSegmentVideoLabels(project)
+    : [];
+  const runningSegmentVideoCandidates = isTextToVideo
+    ? listRunningSegmentVideoLabels(project)
+    : [];
+  const failedScenes = listFailedVideoScenes(project);
+  const runningScenes = listRunningVideoScenes(project);
+  const completedScenes = listCompletedVideoScenes(project);
+
+  const hasRunningWork =
+    runningSegmentVideoCandidates.length > 0 || runningScenes.length > 0;
+  const hasOtherImmediateWork =
+    segmentVideoCandidates.length > 0 ||
+    failedSegmentVideoCandidates.length > 0 ||
+    candidates.length > 0 ||
+    failedScenes.length > 0;
+
+  if (!hasRunningWork || hasOtherImmediateWork) return null;
+
+  const readyReferenceIds = buildReadyReferenceIdsFromAssets(project);
+  const switchToPreviewOption = buildVideoStepSwitchOption(snapshot, project, 5, readyReferenceIds, mode);
+
+  return createVideoPanelQuestion({
+    snapshot,
+    stage: "视频生成",
+    answerKey: "video-refresh-panel",
+    title: `《${snapshot.title}》还有进行中的出片任务`,
+    description: [
+      runningSegmentVideoCandidates.length ? `片段生成中 ${runningSegmentVideoCandidates.length} 个` : null,
+      runningScenes.length ? `镜头生成中 ${runningScenes.length} 个` : null,
+      completedScenes.length ? `已出片 ${completedScenes.length} 个` : null,
+      "等待任务完成后，再刷新结果并继续推进。",
+    ]
+      .filter(Boolean)
+      .join("，"),
+    recommended: [
+      switchToPreviewOption,
+      runningSegmentVideoCandidates.length
+        ? createVideoPanelOption(
+            `${snapshot.projectId}-video-refresh-segments-recommended`,
+            `刷新 ${runningSegmentVideoCandidates.length} 个进行中片段`,
+            "video:generate:segments:refresh",
+            "回收当前片段任务的最新状态，避免重复提交。",
+          )
+        : null,
+    ],
+    bulk: [
+      runningSegmentVideoCandidates.length
+        ? createVideoPanelOption(
+            `${snapshot.projectId}-video-refresh-segments-bulk-panel`,
+            "批量刷新进行中片段",
+            "video:generate:segments:refresh",
+            "统一刷新片段视频任务状态，完成的会直接写入片段视频。",
+          )
+        : null,
+    ],
+    single: [],
+    automation: [],
+    statusBadges: [
+      ...(runningSegmentVideoCandidates.length
+        ? [{ label: "片段生成中", value: runningSegmentVideoCandidates.length, tone: "warning" as const }]
+        : []),
+      ...(runningScenes.length
+        ? [{ label: "镜头生成中", value: runningScenes.length, tone: "warning" as const }]
+        : []),
+      ...(completedScenes.length
+        ? [{ label: "已出片", value: completedScenes.length, tone: "default" as const }]
+        : []),
+    ],
+    mode,
+  });
+}
+
 function buildVideoContinuationQuestionV2(
   snapshot: ConversationProjectSnapshot,
   project: PersistedVideoProject | null | undefined,
 ): ComposerQuestion | null {
   if (snapshot.projectKind !== "video") return null;
 
-  const stage = resolveVisibleVideoStageName(snapshot.derivedStage);
+  const preBreakdownLinearStage = resolveVideoPreBreakdownLinearStage(project);
+  if (preBreakdownLinearStage) {
+    const linearSnapshot =
+      resolveVisibleVideoStageName(snapshot.derivedStage) === "脚本拆解"
+        ? snapshot
+        : { ...snapshot, derivedStage: "脚本拆解" };
+
+    if (preBreakdownLinearStage === "params") {
+      return buildVideoPreBreakdownParamsQuestion(linearSnapshot, project);
+    }
+
+    return buildVideoBridgeQuestion(linearSnapshot, project);
+  }
+
+  if (hasConfirmedVideoScriptBreakdown(project) && project?.kickoffModeConfirmed !== true) {
+    const handoffSnapshot =
+      resolveVisibleVideoStageName(snapshot.derivedStage) === "脚本拆解"
+        ? snapshot
+        : { ...snapshot, derivedStage: "脚本拆解" };
+    return buildVideoBridgeQuestion(handoffSnapshot, project);
+  }
+
+  const stage = resolveVideoContinuationStage(snapshot, project);
+  const stageSnapshot =
+    resolveVisibleVideoStageName(snapshot.derivedStage) === stage
+      ? snapshot
+      : { ...snapshot, derivedStage: stage };
 
   switch (stage) {
-    case "脚本拆解":
+    case "脚本拆解": {
+      return buildVideoBridgeQuestion(stageSnapshot, project);
+    }
     case "角色与场景":
     case "分镜图生成":
-      return buildVideoBridgeQuestion(snapshot, project);
+      return buildVideoBridgeQuestion(stageSnapshot, project);
     case "视频生成": {
-      const genPanel = buildVideoGenerationPanelQuestionV2(snapshot, project);
+      const refreshPanel = buildVideoRefreshPanelQuestion(stageSnapshot, project);
+      if (refreshPanel) return refreshPanel;
+      const genPanel = buildVideoGenerationPanelQuestionV2(stageSnapshot, project);
       if (genPanel) return genPanel;
       // 文生视频模式：没有可出片镜头时，回退到角色与场景面板（引导准备视频提示词）
       const videoMode = project?.videoGenerationPrefs?.mode ?? "image-to-video";
       if (videoMode === "text-to-video") {
         const bridgePanel = buildVideoBridgeQuestion(
-          { ...snapshot, derivedStage: "角色与场景" },
+          { ...stageSnapshot, derivedStage: "角色与场景" },
           project,
         );
         if (bridgePanel) return bridgePanel;
       }
-      return buildVideoPreviewExportPanelQuestionV2(snapshot, project);
+      return buildVideoPreviewExportPanelQuestionV2(stageSnapshot, project);
     }
     case "预览与导出":
       return (
-        buildVideoPreviewExportPanelQuestionV2(snapshot, project) ??
-        buildVideoGenerationPanelQuestionV2(snapshot, project)
+        buildVideoPreviewExportPanelQuestionV2(stageSnapshot, project) ??
+        buildVideoGenerationPanelQuestionV2(stageSnapshot, project)
       );
     default:
       return null;
@@ -2423,7 +3515,14 @@ export function buildVideoBridgePrefixQuestion(
   project: PersistedVideoProject | null | undefined,
 ): ComposerQuestion | null {
   if (snapshot.projectKind !== "video") return null;
-  if (resolveVisibleVideoStageName(snapshot.derivedStage) !== VIDEO_VISIBLE_STAGE_FLOW[0]) return null;
+  const mode = project?.videoGenerationPrefs?.mode ?? "image-to-video";
+  const visibleStage = resolveVisibleVideoStageName(snapshot.derivedStage);
+  if (
+    visibleStage !== VIDEO_VISIBLE_STAGE_FLOW[0] &&
+    visibleStage !== VIDEO_VISIBLE_STAGE_FLOW[1]
+  ) {
+    return null;
+  }
 
   const targetPlatform = project?.targetPlatform?.trim() ?? "";
   const shotStyle = project?.shotStyle?.trim() ?? "";
@@ -2432,51 +3531,23 @@ export function buildVideoBridgePrefixQuestion(
 
   if (completedCount >= 3) return null;
 
-  const layout = getVideoPanelLayout(snapshot.derivedStage);
-  const options: ComposerQuestionOption[] = [];
-
-  if (!targetPlatform) {
-    options.push({
-      id: `${snapshot.projectId}-video-bridge-prefix-target-platform`,
-      label: "\u8865\u9f50\u76ee\u6807\u5e73\u53f0",
-      value: "video:bridge:prefix:target-platform",
-      rationale: "\u70b9\u51fb\u540e\u76f4\u63a5\u5728\u540e\u53f0\u8865\u9f50\u5e73\u53f0\u504f\u597d\uff0c\u5199\u5165 `targetPlatform`\u3002",
-    });
-  }
-
-  if (!shotStyle) {
-    options.push({
-      id: `${snapshot.projectId}-video-bridge-prefix-shot-style`,
-      label: "\u8865\u9f50\u955c\u5934\u98ce\u683c",
-      value: "video:bridge:prefix:shot-style",
-      rationale: "\u70b9\u51fb\u540e\u76f4\u63a5\u5728\u540e\u53f0\u8865\u9f50\u955c\u5934\u8bed\u8a00\uff0c\u5199\u5165 `shotStyle`\u3002",
-    });
-  }
-
-  if (!outputGoal) {
-    options.push({
-      id: `${snapshot.projectId}-video-bridge-prefix-output-goal`,
-      label: "\u8865\u9f50\u51fa\u7247\u76ee\u6807",
-      value: "video:bridge:prefix:output-goal",
-      rationale: "\u70b9\u51fb\u540e\u76f4\u63a5\u5728\u540e\u53f0\u8865\u9f50\u51fa\u7247\u76ee\u6807\uff0c\u5199\u5165 `outputGoal`\u3002",
-    });
-  }
-
-  if (completedCount === 0) {
-    options.push({
-      id: `${snapshot.projectId}-video-bridge-prefix-auto`,
-      label: "\u4e00\u952e\u8865\u9f50\u5e73\u53f0\u4e0e\u955c\u5934\u504f\u597d",
-      value: "video:bridge:platform",
-      rationale: "\u76f4\u63a5\u5728\u540e\u53f0\u4e00\u6b21\u8865\u9f50\u4e09\u4e2a\u5b57\u6bb5\uff0c\u5199\u5165\u540e\u7acb\u5373\u8fdb\u5165\u5267\u672c\u62c6\u89e3\u3002",
-    });
-  }
+  const layout = getVideoPanelLayout(snapshot.derivedStage, mode);
+  const options: ComposerQuestionOption[] = [{
+    id: `${snapshot.projectId}-video-bridge-prefix-auto`,
+    label: completedCount > 0 ? "\u7ee7\u7eed\u8865\u9f50\u5e73\u53f0\u4e0e\u955c\u5934\u504f\u597d" : "\u8865\u9f50\u5e73\u53f0\u4e0e\u955c\u5934\u504f\u597d",
+    value: "video:bridge:platform",
+    rationale:
+      completedCount > 0
+        ? "\u63a5\u7740\u628a\u5269\u4f59\u7684\u5e73\u53f0\u3001\u955c\u5934\u98ce\u683c\u548c\u51fa\u7247\u76ee\u6807\u8865\u9f50\uff0c\u518d\u7ee7\u7eed\u89c6\u9891\u5de5\u4f5c\u6d41\u3002"
+        : "\u5148\u5728\u540e\u53f0\u628a\u5e73\u53f0\u3001\u955c\u5934\u98ce\u683c\u548c\u51fa\u7247\u76ee\u6807\u8865\u9f50\uff0c\u7136\u540e\u518d\u7ee7\u7eed\u89c6\u9891\u5de5\u4f5c\u6d41\u3002",
+  }];
 
   return {
     id: `video-bridge-prefix-${snapshot.projectId}`,
     title: "\u5148\u8865\u9f50\u89c6\u9891\u5de5\u4f5c\u6d41\u524d\u7f6e\u53c2\u6570",
     description:
       completedCount > 0
-        ? `\u5df2\u5199\u5165 ${completedCount}/3 \u9879\u3002\u8865\u9f50\u5269\u4f59\u5b57\u6bb5\u540e\uff0c\u5c31\u4f1a\u6b63\u5f0f\u8fdb\u5165\u89c6\u9891\u5267\u672c\u5de5\u4f5c\u6d41\u3002`
+        ? `\u5df2\u5199\u5165 ${completedCount}/3 \u9879\u3002\u8865\u9f50\u5269\u4f59\u5b57\u6bb5\u540e\uff0c\u5c31\u4f1a\u7ee7\u7eed\u5f53\u524d\u89c6\u9891\u5de5\u4f5c\u6d41\u3002`
         : "\u8bf7\u5148\u8865\u9f50\u76ee\u6807\u5e73\u53f0\u3001\u955c\u5934\u98ce\u683c\u548c\u51fa\u7247\u76ee\u6807\u3002\u4e5f\u53ef\u4ee5\u76f4\u63a5\u70b9\u51fb\u4e00\u952e\u8865\u9f50\u3002",
     options,
     presentation: "card",
@@ -2516,6 +3587,128 @@ export function buildVideoBridgeRetryQuestion(
     stepIndex: 0,
     totalSteps: 1,
     answerKey: "video-bridge-retry",
+  };
+}
+
+function localizeVideoAnalyzePaceLabel(
+  pace: PersistedVideoProject["preferredScriptBreakdownPace"],
+): string {
+  switch (pace) {
+    case "slow":
+      return "慢速";
+    case "fast":
+      return "快速";
+    default:
+      return "中等";
+  }
+}
+
+function hasStoredVideoAnalyzeDuration(project: PersistedVideoProject | null | undefined): boolean {
+  return Boolean(
+    typeof project?.preferredEpisodeDurationSeconds === "number" &&
+      Number.isFinite(project.preferredEpisodeDurationSeconds) &&
+      project.preferredEpisodeDurationSeconds > 0,
+  );
+}
+
+function buildVideoPreBreakdownParamsQuestion(
+  snapshot: ConversationProjectSnapshot,
+  project: PersistedVideoProject | null | undefined,
+): ComposerQuestion | null {
+  if (hasConfirmedVideoScriptBreakdown(project)) return null;
+  if ((project?.scenes.length ?? 0) > 0) return null;
+  if (hasStoredVideoAnalyzeDuration(project) && resolveStoredVideoAnalyzePace(project)) return null;
+  return buildVideoAnalyzeDurationEntryQuestion(snapshot);
+}
+
+type VideoPreBreakdownLinearStage = "entities" | "params" | "analyze";
+
+function resolveVideoPreBreakdownLinearStage(
+  project: PersistedVideoProject | null | undefined,
+): VideoPreBreakdownLinearStage | null {
+  if (hasConfirmedVideoScriptBreakdown(project)) return null;
+  if ((project?.scenes.length ?? 0) > 0) return null;
+
+  const hasExtractedEntities =
+    (project?.characters.length ?? 0) > 0 || (project?.sceneSettings.length ?? 0) > 0;
+  if (!hasExtractedEntities) return "entities";
+
+  return hasStoredVideoAnalyzeDuration(project) && resolveStoredVideoAnalyzePace(project)
+    ? "analyze"
+    : "params";
+}
+
+function resolveStoredVideoAnalyzePace(
+  project: PersistedVideoProject | null | undefined,
+  pace?: string | null,
+): PersistedVideoProject["preferredScriptBreakdownPace"] {
+  const candidate = typeof pace === "string" ? pace.trim().toLowerCase() : "";
+  if (candidate === "slow" || candidate === "medium" || candidate === "fast") {
+    return candidate;
+  }
+  return project?.preferredScriptBreakdownPace === "slow" ||
+    project?.preferredScriptBreakdownPace === "medium" ||
+    project?.preferredScriptBreakdownPace === "fast"
+    ? project.preferredScriptBreakdownPace
+    : null;
+}
+
+export function buildVideoAnalyzeResumeQuestion(
+  snapshot: ConversationProjectSnapshot | null | undefined,
+  project: PersistedVideoProject | null | undefined,
+  options?: {
+    episodeDurationSeconds?: number | null;
+    videoPace?: string | null;
+    retryMissingEpisodes?: boolean;
+  },
+): ComposerQuestion | null {
+  if (!snapshot || snapshot.projectKind !== "video") return null;
+
+  const episodeDuration =
+    typeof options?.episodeDurationSeconds === "number" &&
+    Number.isFinite(options.episodeDurationSeconds) &&
+    options.episodeDurationSeconds > 0
+      ? options.episodeDurationSeconds
+      : typeof project?.preferredEpisodeDurationSeconds === "number" &&
+          Number.isFinite(project.preferredEpisodeDurationSeconds) &&
+          project.preferredEpisodeDurationSeconds > 0
+        ? project.preferredEpisodeDurationSeconds
+        : null;
+  const videoPace = resolveStoredVideoAnalyzePace(project, options?.videoPace);
+  if (!episodeDuration || !videoPace) return null;
+
+  const retryMissingEpisodes = options?.retryMissingEpisodes === true;
+  const paceLabel = localizeVideoAnalyzePaceLabel(videoPace);
+  const resumeValue = retryMissingEpisodes
+    ? `video:bridge:analyze:resume:${videoPace}:${episodeDuration}:retry-missing`
+    : `video:bridge:analyze:resume:${videoPace}:${episodeDuration}`;
+
+  return {
+    id: `video-analyze-resume-${snapshot.projectId}-${videoPace}-${episodeDuration}${retryMissingEpisodes ? "-retry-missing" : ""}`,
+    title: "继续剧本拆解",
+    description: retryMissingEpisodes
+      ? `已记录单集时长 ${episodeDuration} 秒和${paceLabel}节奏。点击后继续补拆缺失集数。`
+      : `已记录单集时长 ${episodeDuration} 秒和${paceLabel}节奏。点击后继续执行剧本拆解。`,
+    options: [
+      {
+        id: `${snapshot.projectId}-video-analyze-resume`,
+        label: "继续剧本拆解",
+        value: resumeValue,
+        rationale: retryMissingEpisodes
+          ? "沿用已记录的拆解参数，只继续补齐当前还没覆盖的集数。"
+          : "沿用已记录的单集时长与节奏，继续完成当前剧本拆解。",
+      },
+    ],
+    presentation: "card",
+    allowCustomInput: false,
+    submissionMode: "immediate",
+    multiSelect: false,
+    stepIndex: 0,
+    totalSteps: 1,
+    answerKey: "video-analyze-resume",
+    statusBadges: [
+      { label: "已记录参数", value: `${episodeDuration} 秒 / ${paceLabel}`, tone: "default" },
+    ],
   };
 }
 
@@ -2602,19 +3795,19 @@ export function buildCharacterCardQuestion(snapshot: ConversationProjectSnapshot
   const cards = listUnlockedCharacterCards(snapshot);
   if (!cards.length) return null;
   const nextCard = cards[0];
-  return { id: `script-character-${snapshot.projectId}`, title: `《${snapshot.title}》还有 ${cards.length} 张角色状态卡待收口。`, description: nextCard ? `建议先锁定 ${nextCard.name}。` : "也可以直接输入要求。", options: [{ id: `${snapshot.projectId}-character-next`, label: nextCard ? `锁定 ${nextCard.name}` : "锁定下一张角色卡", value: "script:character-lock-next", rationale: "先锁定最关键的角色状态卡，保持人物关系稳定。" }, { id: `${snapshot.projectId}-character-list`, label: "逐张检查角色卡", value: "script:character-list", rationale: "展开逐张入口，再决定锁定或继续完善。" }], allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-character" };
+  return compactScriptQuestion({ id: `script-character-${snapshot.projectId}`, title: `《${snapshot.title}》还有 ${cards.length} 张角色状态卡待收口。`, description: nextCard ? `建议先锁定 ${nextCard.name}。` : "也可以直接输入要求。", options: [{ id: `${snapshot.projectId}-character-next`, label: nextCard ? `锁定 ${nextCard.name}` : "锁定下一张角色卡", value: "script:character-lock-next", rationale: "先锁定最关键的角色状态卡，保持人物关系稳定。" }, { id: `${snapshot.projectId}-character-list`, label: "逐张检查角色卡", value: "script:character-list", rationale: "展开逐张入口，再决定锁定或继续完善。" }], allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-character" });
 }
 
 export function buildCharacterCardListQuestion(snapshot: ConversationProjectSnapshot): ComposerQuestion | null {
   const cards = listUnlockedCharacterCards(snapshot);
   if (!cards.length) return null;
-  return { id: `script-character-list-${snapshot.projectId}`, title: `先处理《${snapshot.title}》里的哪张角色状态卡？`, description: "选中后可直接锁定或继续深化。", options: cards.slice(0, 5).map((card) => ({ id: card.id, label: card.name, value: `script:character-item:${card.id}`, rationale: `${card.role} · ${card.coreConflict}` })), allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-character-list" };
+  return compactScriptQuestion({ id: `script-character-list-${snapshot.projectId}`, title: `先处理《${snapshot.title}》里的哪张角色状态卡？`, description: "选中后可直接锁定或继续深化。", options: cards.slice(0, 5).map((card) => ({ id: card.id, label: card.name, value: `script:character-item:${card.id}`, rationale: `${card.role} · ${card.coreConflict}` })), allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-character-list" });
 }
 
 export function buildCharacterCardDecisionQuestion(snapshot: ConversationProjectSnapshot, cardId: string): ComposerQuestion | null {
   const card = findCharacterCard(snapshot, cardId);
   if (!card) return null;
-  return { id: `script-character-item-${snapshot.projectId}-${cardId}`, title: `《${card.name}》这张角色状态卡怎么处理？`, description: `${card.coreConflict} / 目标：${card.desire}`, options: [{ id: `${cardId}-lock`, label: "锁定这张角色卡", value: `script:character-lock:${cardId}`, rationale: "确认这张角色卡已经稳定，后续剧情按它推进。" }, { id: `${cardId}-refine`, label: "继续深化这个角色", value: `script:character-refine:${cardId}`, rationale: "继续围绕这张角色卡补充人物动机、冲突和关系。" }], allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-character-decision" };
+  return compactScriptQuestion({ id: `script-character-item-${snapshot.projectId}-${cardId}`, title: `《${card.name}》这张角色状态卡怎么处理？`, description: `${card.coreConflict} / 目标：${card.desire}`, options: [{ id: `${cardId}-lock`, label: "锁定这张角色卡", value: `script:character-lock:${cardId}`, rationale: "确认这张角色卡已经稳定，后续剧情按它推进。" }, { id: `${cardId}-refine`, label: "继续深化这个角色", value: `script:character-refine:${cardId}`, rationale: "继续围绕这张角色卡补充人物动机、冲突和关系。" }], allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-character-decision" });
 }
 
 export function listPendingCompliancePackets(snapshot: ConversationProjectSnapshot) {
@@ -2672,7 +3865,7 @@ function buildEpisodeDurationHint(durationSeconds?: number | null): string | nul
 export function buildEpisodeDurationGateQuestion(snapshot: ConversationProjectSnapshot): ComposerQuestion | null {
   if (snapshot.projectKind === "video") return null;
 
-  return {
+  return compactScriptQuestion({
     id: `script-episode-duration-gate-${snapshot.projectId}`,
     title: `先确认《${snapshot.title}》的单集目标时长`,
     description:
@@ -2719,7 +3912,7 @@ export function buildEpisodeDurationGateQuestion(snapshot: ConversationProjectSn
     stepIndex: 0,
     totalSteps: 1,
     answerKey: "script-episode-duration-gate",
-  };
+  });
 }
 
 function buildEpisodeReviewOptions(snapshot: ConversationProjectSnapshot, doneEpisodeNumbers: number[]) {
@@ -2813,6 +4006,20 @@ export function buildVideoProductionBundleOption(snapshot: ConversationProjectSn
   };
 }
 
+function buildStoryboardXlsxExportOption(
+  snapshot: ConversationProjectSnapshot,
+  project: PersistedVideoProject | null | undefined,
+): ComposerQuestionOption | null {
+  if (snapshot.projectKind !== "video") return null;
+  if (!(project?.scenes.length ?? 0)) return null;
+  return createVideoPanelOption(
+    `${snapshot.projectId}-video-export-storyboard-xlsx`,
+    "导出分镜 xlsx",
+    "video:bridge:export-xlsx",
+    "把当前镜头拆解、角色、场景、对白和分镜字段整理成 xlsx，方便外部统筹、审阅或继续排期。",
+  );
+}
+
 export function buildVideoProductionBundleFollowupOptions(snapshot: ConversationProjectSnapshot) {
   const previewAction = findRecommendedAction(snapshot, (action) => action.includes("预览生产状态摘要"));
   const openAction = findRecommendedAction(snapshot, (action) => action.includes("打开生产状态目录"));
@@ -2840,12 +4047,14 @@ function buildVideoAssetExportGroupOption(
   snapshot: ConversationProjectSnapshot,
   project: PersistedVideoProject | null | undefined,
 ): ComposerQuestionOption {
+  const storyboardXlsxOption = buildStoryboardXlsxExportOption(snapshot, project);
   return createVideoPanelGroup(
     snapshot,
     "review-stage-panel-export",
     "导出",
     "把当前素材库里的图片和视频归档导出到本地，方便继续整理或导入剪辑软件。",
     [
+      storyboardXlsxOption,
       hasAutoExportableVideoSegments(project) &&
         createVideoPanelOption(
         `${snapshot.projectId}-video-export-ai-auto`,
@@ -2859,13 +4068,14 @@ function buildVideoAssetExportGroupOption(
         "video:export:all",
         "按“剧本名 / 图片 / 视频”目录结构导出当前素材库里的本地图片和视频文件。",
       ),
+      snapshot.projectId.startsWith("__never__") &&
       createVideoPanelOption(
         `${snapshot.projectId}-video-export-nle-placeholder`,
         "导入到剪辑软件",
         "video:export:nle-placeholder",
         "预留入口，后续可直接桥接剪辑软件；当前可以先使用“全部导出”。",
       ),
-    ],
+    ].filter((option): option is ComposerQuestionOption => Boolean(option)),
   ) as ComposerQuestionOption;
 }
 
@@ -2919,7 +4129,7 @@ export function buildComplianceQuestion(snapshot: ConversationProjectSnapshot): 
     },
   ].filter((option): option is NonNullable<typeof option> => Boolean(option));
 
-  return {
+  return compactScriptQuestion({
     id: `script-compliance-${snapshot.projectId}`,
     title: packets.length
       ? `《${snapshot.title}》还有 ${packets.length} 条合规修订包待处理。`
@@ -2934,38 +4144,38 @@ export function buildComplianceQuestion(snapshot: ConversationProjectSnapshot): 
     stepIndex: 0,
     totalSteps: 1,
     answerKey: "script-compliance",
-  };
+  });
 }
 
 export function buildComplianceListQuestion(snapshot: ConversationProjectSnapshot): ComposerQuestion | null {
   const packets = listPendingCompliancePackets(snapshot);
   if (!packets.length) return null;
-  return { id: `script-compliance-list-${snapshot.projectId}`, title: `先处理《${snapshot.title}》里的哪条修订包？`, description: "选中后可直接处理或继续改写。", options: packets.slice(0, 5).map((packet) => ({ id: packet.id, label: packet.issueTitle, value: `script:compliance-item:${packet.id}`, rationale: `风险：${packet.riskLevel} · ${packet.recommendation}` })), allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-compliance-list" };
+  return compactScriptQuestion({ id: `script-compliance-list-${snapshot.projectId}`, title: `先处理《${snapshot.title}》里的哪条修订包？`, description: "选中后可直接处理或继续改写。", options: packets.slice(0, 5).map((packet) => ({ id: packet.id, label: packet.issueTitle, value: `script:compliance-item:${packet.id}`, rationale: `风险：${packet.riskLevel} · ${packet.recommendation}` })), allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-compliance-list" });
 }
 
 export function buildComplianceDecisionQuestion(snapshot: ConversationProjectSnapshot, packetId: string): ComposerQuestion | null {
   const packet = findCompliancePacket(snapshot, packetId);
   if (!packet) return null;
-  return { id: `script-compliance-item-${snapshot.projectId}-${packetId}`, title: `《${packet.issueTitle}》这条修订包怎么处理？`, description: packet.recommendation, options: [{ id: `${packetId}-resolve`, label: "标记已处理", value: `script:compliance-resolve:${packetId}`, rationale: "确认这条修订已经落地，不再反复提示。" }, { id: `${packetId}-rewrite`, label: "继续按这条改写", value: `script:compliance-rewrite:${packetId}`, rationale: "让 Agent 继续围绕这条修订推进文本改写。" }], allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-compliance-decision" };
+  return compactScriptQuestion({ id: `script-compliance-item-${snapshot.projectId}-${packetId}`, title: `《${packet.issueTitle}》这条修订包怎么处理？`, description: packet.recommendation, options: [{ id: `${packetId}-resolve`, label: "标记已处理", value: `script:compliance-resolve:${packetId}`, rationale: "确认这条修订已经落地，不再反复提示。" }, { id: `${packetId}-rewrite`, label: "继续按这条改写", value: `script:compliance-rewrite:${packetId}`, rationale: "让 Agent 继续围绕这条修订推进文本改写。" }], allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-compliance-decision" });
 }
 
 export function buildBeatPacketQuestion(snapshot: ConversationProjectSnapshot): ComposerQuestion | null {
   const packets = listUnlockedBeatPackets(snapshot);
   if (!packets.length) return null;
   const nextPacket = packets[0];
-  return { id: `script-beat-${snapshot.projectId}`, title: `《${snapshot.title}》还有 ${packets.length} 条剧情 beat 可以继续收口。`, description: nextPacket ? `建议先处理第 ${nextPacket.episodeNumber} 集。` : "也可以直接输入推进要求。", options: [{ id: `${snapshot.projectId}-beat-next`, label: nextPacket ? `锁定第 ${nextPacket.episodeNumber} 集 beat` : "锁定下一条 beat", value: "script:beat-lock-next", rationale: "先把最靠前的一条剧情 beat 收口，保持节奏连续。" }, { id: `${snapshot.projectId}-beat-drafted`, label: "批量锁定已成型 beat", value: "script:beat-lock-drafted", rationale: "把已有细纲支撑的 beat 先锁住，减少反复。" }, { id: `${snapshot.projectId}-beat-list`, label: "逐条检查剧情 beat", value: "script:beat-list", rationale: "展开逐条入口，再决定锁定或继续扩写。" }], allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-beat" };
+  return compactScriptQuestion({ id: `script-beat-${snapshot.projectId}`, title: `《${snapshot.title}》还有 ${packets.length} 条剧情 beat 可以继续收口。`, description: nextPacket ? `建议先处理第 ${nextPacket.episodeNumber} 集。` : "也可以直接输入推进要求。", options: [{ id: `${snapshot.projectId}-beat-next`, label: nextPacket ? `锁定第 ${nextPacket.episodeNumber} 集 beat` : "锁定下一条 beat", value: "script:beat-lock-next", rationale: "先把最靠前的一条剧情 beat 收口，保持节奏连续。" }, { id: `${snapshot.projectId}-beat-drafted`, label: "批量锁定已成型 beat", value: "script:beat-lock-drafted", rationale: "把已有细纲支撑的 beat 先锁住，减少反复。" }, { id: `${snapshot.projectId}-beat-list`, label: "逐条检查剧情 beat", value: "script:beat-list", rationale: "展开逐条入口，再决定锁定或继续扩写。" }], allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-beat" });
 }
 
 export function buildBeatPacketListQuestion(snapshot: ConversationProjectSnapshot): ComposerQuestion | null {
   const packets = listUnlockedBeatPackets(snapshot);
   if (!packets.length) return null;
-  return { id: `script-beat-list-${snapshot.projectId}`, title: `先处理《${snapshot.title}》里的哪条剧情 beat？`, description: "选中后可直接锁定或继续写。", options: packets.slice(0, 5).map((packet) => ({ id: packet.id, label: `第 ${packet.episodeNumber} 集 · ${packet.title}`, value: `script:beat-item:${packet.id}`, rationale: packet.beatSummary })), allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-beat-list" };
+  return compactScriptQuestion({ id: `script-beat-list-${snapshot.projectId}`, title: `先处理《${snapshot.title}》里的哪条剧情 beat？`, description: "选中后可直接锁定或继续写。", options: packets.slice(0, 5).map((packet) => ({ id: packet.id, label: `第 ${packet.episodeNumber} 集 · ${packet.title}`, value: `script:beat-item:${packet.id}`, rationale: packet.beatSummary })), allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-beat-list" });
 }
 
 export function buildBeatPacketDecisionQuestion(snapshot: ConversationProjectSnapshot, packetId: string): ComposerQuestion | null {
   const packet = findBeatPacket(snapshot, packetId);
   if (!packet) return null;
-  return { id: `script-beat-item-${snapshot.projectId}-${packetId}`, title: `第 ${packet.episodeNumber} 集 · ${packet.title} 这条 beat 怎么处理？`, description: packet.beatSummary, options: [{ id: `${packetId}-lock`, label: "锁定这条 beat", value: `script:beat-lock:${packetId}`, rationale: "确认这条剧情节点已经成型，后续按它推进。" }, { id: `${packetId}-write`, label: `继续写第 ${packet.episodeNumber} 集`, value: `script:beat-write:${packet.episodeNumber}`, rationale: "直接用当前 beat 去推进这一集正文。" }], allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-beat-decision" };
+  return compactScriptQuestion({ id: `script-beat-item-${snapshot.projectId}-${packetId}`, title: `第 ${packet.episodeNumber} 集 · ${packet.title} 这条 beat 怎么处理？`, description: packet.beatSummary, options: [{ id: `${packetId}-lock`, label: "锁定这条 beat", value: `script:beat-lock:${packetId}`, rationale: "确认这条剧情节点已经成型，后续按它推进。" }, { id: `${packetId}-write`, label: `继续写第 ${packet.episodeNumber} 集`, value: `script:beat-write:${packet.episodeNumber}`, rationale: "直接用当前 beat 去推进这一集正文。" }], allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-beat-decision" });
 }
 
 export function buildCreativePlanWorkflowQuestion(snapshot: ConversationProjectSnapshot): ComposerQuestion | null {
@@ -2992,7 +4202,7 @@ export function buildCreativePlanWorkflowQuestion(snapshot: ConversationProjectS
   if (!resolvedEnterCharactersAction && !modifyConflictAction && !resolvedGeneratePlanAction) return null;
 
   if (resolvedEnterCharactersAction || modifyConflictAction) {
-    return {
+    return compactScriptQuestion({
       id: `script-creative-plan-${snapshot.projectId}`,
       title: `《${snapshot.title}》创作方案已生成，下一步怎么走？`,
       description: "可以直接进入角色开发，或先调整创作方案中的核心冲突。",
@@ -3015,10 +4225,10 @@ export function buildCreativePlanWorkflowQuestion(snapshot: ConversationProjectS
       multiSelect: false,
       ...getScriptFlowLayout(snapshot, "creative-plan"),
       answerKey: "script-creative-plan",
-    };
+    });
   }
 
-  return {
+  return compactScriptQuestion({
     id: `script-creative-plan-${snapshot.projectId}`,
     title: `下一步：${resolvedGeneratePlanAction}`,
     description: "确认后直接生成创作方案。",
@@ -3033,7 +4243,7 @@ export function buildCreativePlanWorkflowQuestion(snapshot: ConversationProjectS
     multiSelect: false,
     ...getScriptFlowLayout(snapshot, "creative-plan"),
     answerKey: "script-creative-plan",
-  };
+  });
 }
 
 export function buildCharactersWorkflowQuestion(snapshot: ConversationProjectSnapshot): ComposerQuestion | null {
@@ -3053,7 +4263,7 @@ export function buildCharactersWorkflowQuestion(snapshot: ConversationProjectSna
     const directoryAction = findRecommendedAction(snapshot, (a) =>
       a.includes("生成分集目录") || a.includes("完善分集目录"),
     ) ?? "生成分集目录";
-    return {
+    return compactScriptQuestion({
       id: `script-characters-${snapshot.projectId}`,
       title: `《${snapshot.title}》角色设定已完成，下一步生成分集目录？`,
       description: "角色设定已就绪，可以直接推进到分集目录阶段。",
@@ -3068,7 +4278,7 @@ export function buildCharactersWorkflowQuestion(snapshot: ConversationProjectSna
       multiSelect: false,
       ...getScriptFlowLayout(snapshot, "characters"),
       answerKey: "script-characters",
-    };
+    });
   }
 
   // 角色未生成 → 提示生成角色
@@ -3081,7 +4291,7 @@ export function buildCharactersWorkflowQuestion(snapshot: ConversationProjectSna
       a.includes("继续角色设定") ||
       a.includes("继续角色开发"),
   ) ?? "进入角色开发";
-  return {
+  return compactScriptQuestion({
     id: `script-characters-${snapshot.projectId}`,
     title: `下一步：${generateCharactersAction}`,
     description: "确认后直接开始角色开发。",
@@ -3096,7 +4306,7 @@ export function buildCharactersWorkflowQuestion(snapshot: ConversationProjectSna
     multiSelect: false,
     ...getScriptFlowLayout(snapshot, "characters"),
     answerKey: "script-characters",
-  };
+  });
 }
 
 export function buildDirectoryWorkflowQuestion(snapshot: ConversationProjectSnapshot): ComposerQuestion | null {
@@ -3107,7 +4317,7 @@ export function buildDirectoryWorkflowQuestion(snapshot: ConversationProjectSnap
   );
 
   if (hasDirectoryArtifact) {
-    return {
+    return compactScriptQuestion({
       id: `script-directory-${snapshot.projectId}`,
       title: `《${snapshot.title}》分集目录已完成，进入单集细纲？`,
       description: "先创建单集细纲的 0% 预览卡，再选择具体的细纲生成方式。",
@@ -3122,13 +4332,13 @@ export function buildDirectoryWorkflowQuestion(snapshot: ConversationProjectSnap
       multiSelect: false,
       ...getScriptFlowLayout(snapshot, "directory"),
       answerKey: "script-directory",
-    };
+    });
   }
 
   // 目录未生成 → 提示生成目录
   const generateDirAction = findRecommendedAction(snapshot, (a) => a.includes("生成分集目录") || a === "生成分集目录");
   if (!generateDirAction) return null;
-  return {
+  return compactScriptQuestion({
     id: `script-directory-${snapshot.projectId}`,
     title: `下一步：${generateDirAction}`,
     description: "确认后直接生成分集目录。",
@@ -3143,7 +4353,7 @@ export function buildDirectoryWorkflowQuestion(snapshot: ConversationProjectSnap
     multiSelect: false,
     ...getScriptFlowLayout(snapshot, "directory"),
     answerKey: "script-directory",
-  };
+  });
 }
 
 export function buildOutlinesWorkflowQuestion(snapshot: ConversationProjectSnapshot): ComposerQuestion | null {
@@ -3222,6 +4432,16 @@ export function buildOutlinesWorkflowQuestion(snapshot: ConversationProjectSnaps
       }
     }
 
+    if (hasAnyOutline) {
+      options.push({
+        id: `${snapshot.projectId}-fill-missing-outlines`,
+        label: "自动补齐细纲",
+        value: "script:outline-fill-missing",
+        rationale:
+          "智能识别当前未完成的细纲，按集数顺序补齐，并参考前后已生成内容保持衔接。",
+      });
+    }
+
     // 生成全部 / 重新生成全部
     options.push({
       id: `${snapshot.projectId}-generate-all-outlines`,
@@ -3252,7 +4472,7 @@ export function buildOutlinesWorkflowQuestion(snapshot: ConversationProjectSnaps
       devOnly: true,
     });
 
-    return {
+    return compactScriptQuestion({
       id: `script-outlines-${snapshot.projectId}`,
       title: `《${snapshot.title}》单集细纲预览已创建，选择生成方式`,
       description:
@@ -3265,11 +4485,11 @@ export function buildOutlinesWorkflowQuestion(snapshot: ConversationProjectSnaps
       multiSelect: false,
       ...getScriptFlowLayout(snapshot, "outlines"),
       answerKey: "script-outlines",
-    };
+    });
   }
 
   if (hasOutlineArtifact) {
-    return {
+    return compactScriptQuestion({
       id: `script-outlines-${snapshot.projectId}`,
       title: `《${snapshot.title}》单集细纲已完成，进入分集撰写？`,
       description: "先创建分集撰写的 0% 预览卡，再选择分集生成方式。",
@@ -3292,7 +4512,7 @@ export function buildOutlinesWorkflowQuestion(snapshot: ConversationProjectSnaps
       multiSelect: false,
       ...getScriptFlowLayout(snapshot, "outlines"),
       answerKey: "script-outlines",
-    };
+    });
   }
 
   // 细纲未生成 → 提示生成细纲
@@ -3302,7 +4522,7 @@ export function buildOutlinesWorkflowQuestion(snapshot: ConversationProjectSnaps
   if (!generateOutlineAction) return null;
   const episodeMatch = generateOutlineAction.match(/第\s*(\d+)\s*集/);
   const episodeNum = episodeMatch ? episodeMatch[1] : null;
-  return {
+  return compactScriptQuestion({
     id: `script-outlines-${snapshot.projectId}`,
     title: `下一步：${generateOutlineAction}`,
     description: episodeNum ? `先生成第 ${episodeNum} 集细纲，再推进正文。` : "确认后直接生成单集细纲。",
@@ -3317,7 +4537,7 @@ export function buildOutlinesWorkflowQuestion(snapshot: ConversationProjectSnaps
     multiSelect: false,
     ...getScriptFlowLayout(snapshot, "outlines"),
     answerKey: "script-outlines",
-  };
+  });
 }
 
 export function buildEpisodeWorkflowQuestion(snapshot: ConversationProjectSnapshot): ComposerQuestion | null {
@@ -3352,7 +4572,7 @@ export function buildEpisodeWorkflowQuestion(snapshot: ConversationProjectSnapsh
     const durationHint = buildEpisodeDurationHint(episodePayload.durationSeconds);
     const nextPendingEntry = pendingEntries[0] ?? null;
 
-    return {
+    return compactScriptQuestion({
       id: `script-episode-${snapshot.projectId}`,
       title: pendingEntries.length
         ? `《${snapshot.title}》分集撰写预览已创建，选择生成方式`
@@ -3404,37 +4624,26 @@ export function buildEpisodeWorkflowQuestion(snapshot: ConversationProjectSnapsh
         },
         pendingEntries.length && nextPendingEntry
           ? {
-              id: `${snapshot.projectId}-episode-write`,
-              label: "开始撰写",
-              value: "script:episode-write",
-              rationale: "选择撰写方式，逐集推进或批量自动撰写。",
-              children: [
-                {
-                  id: `${snapshot.projectId}-episode-next-fixed`,
-                  label: `续写第 ${nextPendingEntry.number} 集`,
-                  value: `script:episode-generate:${nextPendingEntry.number}`,
-                  rationale: truncateCopy(
-                    [nextPendingEntry.title, nextPendingEntry.summary]
-                      .filter(Boolean)
-                      .join(" · ") || `继续按顺序补齐第 ${nextPendingEntry.number} 集正文。`,
-                    72,
-                  ),
-                },
-                {
-                  id: `${snapshot.projectId}-episode-batch`,
-                  label: "批量自动撰写",
-                  value: "script:episode-generate-batch",
-                  rationale: "按目录顺序从前到后自动生成剩余集数。为保证上下文连贯，累计正文超过 15000 字时会自动分批，每批不超过 15000 字，以此类推。",
-                },
-                doneEpisodes > 0 && pendingEntries.length > 0
-                  ? {
-                      id: `${snapshot.projectId}-episode-fill-missing`,
-                      label: "批量自动撰写补齐",
-                      value: "script:episode-fill-missing",
-                      rationale: "自动识别剩余未撰写正文，按集数顺序补齐，并沿用已完成正文作为上下文，保持前后连贯和质量稳定。",
-                    }
-                  : null,
-              ].filter((option): option is NonNullable<typeof option> => Boolean(option)),
+              id: `${snapshot.projectId}-episode-next-fixed`,
+              label: `续写第 ${nextPendingEntry.number} 集`,
+              value: `script:episode-generate:${nextPendingEntry.number}`,
+              rationale: truncateCopy(
+                [nextPendingEntry.title, nextPendingEntry.summary]
+                  .filter(Boolean)
+                  .join(" · ") || `继续按顺序补齐第 ${nextPendingEntry.number} 集正文。`,
+                72,
+              ),
+            }
+          : null,
+        pendingEntries.length && nextPendingEntry
+          ? {
+              id: `${snapshot.projectId}-episode-batch`,
+              label: doneEpisodes > 0 ? "自动批量补齐" : "自动批量续写",
+              value: "script:episode-generate-batch",
+              rationale:
+                doneEpisodes > 0
+                  ? "检测到当前已有部分正文，会自动承接已完成前文并补齐剩余集数；如正文累计过长也会自动分批推进。"
+                  : "按目录顺序从前到后自动生成剩余集数。为保证上下文连贯，累计正文超过 15000 字时会自动分批，每批不超过 15000 字，以此类推。",
             }
           : null,
         doneEpisodes > 0
@@ -3469,7 +4678,7 @@ export function buildEpisodeWorkflowQuestion(snapshot: ConversationProjectSnapsh
       multiSelect: false,
       ...getScriptFlowLayout(snapshot, "episodes"),
       answerKey: "script-episode",
-    };
+    });
   }
 
   if (!nextEpisodeAction && !reviewAction && !complianceAction) return null;
@@ -3481,7 +4690,7 @@ export function buildEpisodeWorkflowQuestion(snapshot: ConversationProjectSnapsh
     directoryArtifact?.payload?.type === "directory+stats"
       ? directoryArtifact.payload.stats.writtenEpisodes
       : 0;
-  return {
+  return compactScriptQuestion({
     id: `script-episode-${snapshot.projectId}`,
     title: `《${snapshot.title}》已经进入正文推进阶段。`,
     description: nextEpisodeNumber
@@ -3529,7 +4738,7 @@ export function buildEpisodeWorkflowQuestion(snapshot: ConversationProjectSnapsh
     multiSelect: false,
     ...getScriptFlowLayout(snapshot, "episodes"),
     answerKey: "script-episode",
-  };
+  });
 }
 
 export function buildExportWorkflowQuestion(snapshot: ConversationProjectSnapshot): ComposerQuestion | null {
@@ -3539,7 +4748,7 @@ export function buildExportWorkflowQuestion(snapshot: ConversationProjectSnapsho
   const patchAction = findRecommendedAction(snapshot, (action) => action.includes("补写"));
   if (!exportAction && !videoAction && !patchAction) return null;
   const hasExportArtifact = snapshot.artifacts.some((artifact) => artifact.kind === "export");
-  return { id: `script-export-${snapshot.projectId}`, title: `《${snapshot.title}》已经进入导出与出片阶段。`, description: hasExportArtifact ? "导出稿已在当前会话里。" : "可先导出，再接视频工作流。", options: [exportAction ? { id: `${snapshot.projectId}-export-document`, label: exportAction, value: exportAction.includes("修改导出稿") ? "script:export-refine" : "script:export-document", rationale: exportAction.includes("修改导出稿") ? "继续围绕当前导出稿润色结构、语气和交付格式。" : "先整理一份完整导出稿，方便后续交付和出片。" } : null, videoAction ? { id: `${snapshot.projectId}-export-video`, label: videoAction, value: "script:export-video", rationale: "把当前剧本直接桥接到首页视频工作流，不再跳出当前会话。" } : null, patchAction ? { id: `${snapshot.projectId}-export-patch`, label: patchAction, value: "script:export-patch", rationale: "先定位缺失章节或集数，再决定补写哪一块。" } : null].filter((option): option is NonNullable<typeof option> => Boolean(option)), allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-export" };
+  return compactScriptQuestion({ id: `script-export-${snapshot.projectId}`, title: `《${snapshot.title}》已经进入导出与出片阶段。`, description: hasExportArtifact ? "导出稿已在当前会话里。" : "可先导出，再接视频工作流。", options: [exportAction ? { id: `${snapshot.projectId}-export-document`, label: exportAction, value: exportAction.includes("修改导出稿") ? "script:export-refine" : "script:export-document", rationale: exportAction.includes("修改导出稿") ? "继续围绕当前导出稿润色结构、语气和交付格式。" : "先整理一份完整导出稿，方便后续交付和出片。" } : null, videoAction ? { id: `${snapshot.projectId}-export-video`, label: videoAction, value: "script:export-video", rationale: "把当前剧本直接桥接到首页视频工作流，不再跳出当前会话。" } : null, patchAction ? { id: `${snapshot.projectId}-export-patch`, label: patchAction, value: "script:export-patch", rationale: "先定位缺失章节或集数，再决定补写哪一块。" } : null].filter((option): option is NonNullable<typeof option> => Boolean(option)), allowCustomInput: true, submissionMode: "immediate", multiSelect: false, stepIndex: 0, totalSteps: 1, answerKey: "script-export" });
 }
 
 function resolveScriptWorkflowStageLegacy(stage: string): "creative-plan" | "characters" | "directory" | "outlines" | "episodes" | "compliance" | "export" | null {
@@ -3649,8 +4858,35 @@ function createStepQuestionOption(
     id,
     label,
     value,
-    rationale,
+    rationale: compactScriptRationale(rationale),
     ...extras,
+  };
+}
+
+const SCRIPT_OPTION_RATIONALE_MAX = 30;
+
+function compactScriptRationale(rationale: string | undefined, max = SCRIPT_OPTION_RATIONALE_MAX) {
+  if (typeof rationale !== "string") return rationale;
+  const normalized = rationale.replace(/\s+/g, " ").trim();
+  if (!normalized) return normalized;
+  return truncateCopy(normalized, max);
+}
+
+function compactScriptOption(option: ComposerQuestion["options"][number]): ComposerQuestion["options"][number] {
+  const hasChildren = Array.isArray(option.children);
+  const children = hasChildren ? option.children.map((child) => compactScriptOption(child)) : option.children;
+  return {
+    ...option,
+    rationale: compactScriptRationale(option.rationale),
+    ...(hasChildren ? { children } : {}),
+  };
+}
+
+function compactScriptQuestion(question: ComposerQuestion | null): ComposerQuestion | null {
+  if (!question) return null;
+  return {
+    ...question,
+    options: question.options.map((option) => compactScriptOption(option)),
   };
 }
 
@@ -3679,17 +4915,19 @@ function createScriptWorkflowQuestion(
   if (!options.length) return null;
   const layout = getScriptFlowLayout(snapshot, step);
   return {
-    id: `${answerKey}-${snapshot.projectId}`,
-    title,
-    description,
-    options,
-    allowCustomInput: true,
-    submissionMode: "immediate",
-    multiSelect: false,
-    stepIndex: layout.stepIndex,
-    totalSteps: layout.totalSteps,
-    answerKey,
-    ...extra,
+    ...compactScriptQuestion({
+      id: `${answerKey}-${snapshot.projectId}`,
+      title,
+      description,
+      options,
+      allowCustomInput: true,
+      submissionMode: "immediate",
+      multiSelect: false,
+      stepIndex: layout.stepIndex,
+      totalSteps: layout.totalSteps,
+      answerKey,
+      ...extra,
+    })!,
   };
 }
 
@@ -3698,6 +4936,29 @@ function getSetupPayload(snapshot: ConversationProjectSnapshot) {
     (artifact) => artifact.kind === "setup" && artifact.payload?.type === "setup",
   );
   return setupArtifact?.payload?.type === "setup" ? setupArtifact.payload : null;
+}
+
+function hasReadyOriginalSetupPayload(snapshot: ConversationProjectSnapshot): boolean {
+  const setupPayload = getSetupPayload(snapshot);
+  if (!setupPayload) return false;
+
+  const hasTopicSeed =
+    setupPayload.genres.length > 0 ||
+    Boolean(setupPayload.customTopic?.trim()) ||
+    Boolean(setupPayload.creativeInput?.trim());
+
+  return Boolean(
+    setupPayload.targetMarket?.trim() &&
+      setupPayload.audience.trim() &&
+      setupPayload.tone.trim() &&
+      setupPayload.ending.trim() &&
+      setupPayload.totalEpisodes > 0 &&
+      hasTopicSeed,
+  );
+}
+
+function hasReadyAdaptationSetupPayload(snapshot: ConversationProjectSnapshot): boolean {
+  return hasReferenceTextArtifact(snapshot) || hasReferenceStructureArtifact(snapshot);
 }
 
 function hasReferenceTextArtifact(snapshot: ConversationProjectSnapshot): boolean {
@@ -3730,6 +4991,12 @@ function hasStructureTransformArtifact(snapshot: ConversationProjectSnapshot): b
 
 function buildSetupWorkflowQuestionV2(snapshot: ConversationProjectSnapshot): ComposerQuestion | null {
   if (snapshot.projectKind === "video" || resolveScriptWorkflowStage(snapshot.derivedStage) !== "setup") {
+    return null;
+  }
+
+  if (snapshot.projectKind === "adaptation") {
+    if (!hasReadyAdaptationSetupPayload(snapshot)) return null;
+  } else if (!hasReadyOriginalSetupPayload(snapshot)) {
     return null;
   }
 
@@ -3868,7 +5135,7 @@ function buildAdaptationEpisodeCountQuestion(snapshot: ConversationProjectSnapsh
     title: "请选择改编集数",
     description: "参考剧本已经分析完成。先确认改编后的总集数，再确认目标市场，然后进入结构转换。",
     options,
-    allowCustomInput: false,
+    allowCustomInput: true,
     submissionMode: "immediate",
     multiSelect: false,
     ...layout,
@@ -4067,7 +5334,12 @@ function buildComplianceWorkflowQuestionV2(snapshot: ConversationProjectSnapshot
   const paletteLength = workspace?.paletteText.trim().length ?? 0;
   const importedFileName = workspace?.lastImportedFileName;
   const exportedFormat = workspace?.exportMeta?.lastExportFormat;
-  const pendingRiskCount = workspace?.riskPhrases.filter((p) => p.status !== "resolved").length ?? 0;
+  const pendingRiskPhrases = workspace?.riskPhrases.filter((p) => p.status !== "resolved") ?? [];
+  const pendingRiskCount = pendingRiskPhrases.length;
+  const pendingRedLineCount = pendingRiskPhrases.filter((phrase) => phrase.level === "red").length;
+  const pendingHighRiskCount = pendingRiskPhrases.filter((phrase) => phrase.level === "high").length;
+  const pendingSuggestionCount = pendingRiskPhrases.filter((phrase) => phrase.level === "info").length;
+  const canShowWorkspaceShortcuts = Boolean(latestReview);
 
   const options = [
     createStepQuestionOption(
@@ -4078,6 +5350,19 @@ function buildComplianceWorkflowQuestionV2(snapshot: ConversationProjectSnapshot
         ? "保留当前工作台状态，重新跑完整审核并继续更新风险定位。"
         : "从首页直接运行完整版合规审查，产出风险报告、调色盘与修订包。",
       {
+        statusBadges: latestReview
+          ? [
+              ...(pendingRedLineCount > 0
+                ? [{ label: "红线", value: pendingRedLineCount, tone: "danger" as const }]
+                : []),
+              ...(pendingHighRiskCount > 0
+                ? [{ label: "高风险", value: pendingHighRiskCount, tone: "warning" as const }]
+                : []),
+              ...(pendingSuggestionCount > 0
+                ? [{ label: "提示", value: pendingSuggestionCount, tone: "notice" as const }]
+                : []),
+            ]
+          : undefined,
         children: [
           createStepQuestionOption(
             `${snapshot.projectId}-compliance-run-text`,
@@ -4100,6 +5385,14 @@ function buildComplianceWorkflowQuestionV2(snapshot: ConversationProjectSnapshot
       `script:compliance-set-strictness:${workspace?.strictness ?? "standard"}`,
       "标准、严格、极限三档都会持久化保存到当前项目。",
       {
+        statusLabel: workspace
+          ? workspace.dialogueReviewEnabled
+            ? "已开启对话审查"
+            : "已关闭对话审查"
+          : undefined,
+        statusTone: workspace
+          ? (workspace.dialogueReviewEnabled ? "active" : "inactive")
+          : undefined,
         children: [
           createStepQuestionOption(
             `${snapshot.projectId}-compliance-strictness-standard`,
@@ -4119,15 +5412,29 @@ function buildComplianceWorkflowQuestionV2(snapshot: ConversationProjectSnapshot
             "script:compliance-set-strictness:extreme",
             "最保守口径，优先扩大风险覆盖范围。",
           ),
+          ...(workspace
+            ? [
+                createStepQuestionOption(
+                  `${snapshot.projectId}-compliance-toggle-dialogue`,
+                  workspace.dialogueReviewEnabled ? "关闭对话审查" : "开启对话审查",
+                  workspace.dialogueReviewEnabled
+                    ? "script:compliance-toggle-dialogue:off"
+                    : "script:compliance-toggle-dialogue:on",
+                  workspace.dialogueReviewEnabled
+                    ? "保留当前风险结果，关闭对话长度超限复核。"
+                    : "把对话审查纳入下一次完整合规审查。",
+                ),
+              ]
+            : []),
         ],
       },
     ),
-    workspace
+    canShowWorkspaceShortcuts && workspace
       ? createStepQuestionOption(
           `${snapshot.projectId}-compliance-ops`,
           "工作台快捷操作",
           "script:compliance-auto-adjust",
-          "批量自动改写、台词超限复核和调色盘导出都在这里继续。",
+          "批量自动改写和调色盘导出都在这里继续。",
           {
             children: [
               ...(latestReview && pendingRiskCount > 0
@@ -4140,16 +5447,6 @@ function buildComplianceWorkflowQuestionV2(snapshot: ConversationProjectSnapshot
                     ),
                   ]
                 : []),
-              createStepQuestionOption(
-                `${snapshot.projectId}-compliance-toggle-dialogue`,
-                workspace.dialogueReviewEnabled ? "关闭台词超限审查" : "开启台词超限审查",
-                workspace.dialogueReviewEnabled
-                  ? "script:compliance-toggle-dialogue:off"
-                  : "script:compliance-toggle-dialogue:on",
-                workspace.dialogueReviewEnabled
-                  ? "保留当前风险结果，关闭台词长度超限复核。"
-                  : "把台词超限审查纳入下一次完整合规审查。",
-              ),
               ...(paletteLength > 0
                 ? [
                     createStepQuestionOption(
@@ -4195,7 +5492,7 @@ function buildComplianceWorkflowQuestionV2(snapshot: ConversationProjectSnapshot
     importedFileName ? `已导入文件：${importedFileName}。` : null,
     workspace?.tableSnapshot ? `当前表格快照 ${workspace.tableSnapshot.rows.length} 行。` : null,
     workspace?.dialogueOverLimitLineIndexes.length
-      ? `台词超限命中 ${workspace.dialogueOverLimitLineIndexes.length} 处。`
+      ? `对话审查命中 ${workspace.dialogueOverLimitLineIndexes.length} 处。`
       : null,
     payload?.skippedAt ? `本轮曾跳过合规：${payload.skippedAt}。` : null,
   ]
@@ -4338,7 +5635,8 @@ export function resolveScriptWorkflowStage(stage: string): ScriptWorkflowStep | 
 }
 
 export function buildScriptPacketQuestion(snapshot: ConversationProjectSnapshot): ComposerQuestion | null {
-  switch (resolveScriptWorkflowStage(snapshot.derivedStage)) {
+  const question = (() => {
+    switch (resolveScriptWorkflowStage(snapshot.derivedStage)) {
     case "setup":
       return buildSetupWorkflowQuestionV2(snapshot);
     case "reference-script":
@@ -4366,7 +5664,9 @@ export function buildScriptPacketQuestion(snapshot: ConversationProjectSnapshot)
       return buildExportWorkflowQuestionV2(snapshot) ?? buildExportWorkflowQuestion(snapshot);
     default:
       return buildScriptPacketQuestionLegacy(snapshot);
-  }
+    }
+  })();
+  return compactScriptQuestion(question);
 }
 
 export const brief = (snapshot: ConversationProjectSnapshot) =>
@@ -4381,6 +5681,28 @@ export const brief = (snapshot: ConversationProjectSnapshot) =>
     .filter(Boolean)
     .join("\n\n");
 
+function hasAnyVideoBridgePrefs(project?: PersistedVideoProject | null): boolean {
+  if (!project) return false;
+  return Boolean(
+    project.targetPlatform?.trim() ||
+    project.shotStyle?.trim() ||
+    project.outputGoal?.trim() ||
+    project.productionNotes?.trim(),
+  );
+}
+
+function hasConfirmedVideoKickoffMode(project?: PersistedVideoProject | null): boolean {
+  return Boolean(project?.kickoffModeConfirmed);
+}
+
+function hasConfirmedVideoKickoffStyle(project?: PersistedVideoProject | null): boolean {
+  return Boolean(
+    project?.kickoffStyleConfirmed ||
+    project?.referenceStyleSummary?.trim() ||
+    hasAnyVideoBridgePrefs(project),
+  );
+}
+
 export const recQuestion = (snapshot: ConversationProjectSnapshot, videoProject?: PersistedVideoProject | null): ComposerQuestion | null => {
   const setupArtifact = snapshot.artifacts.find((a) => a.label === "项目设定");
   const setupSummary = setupArtifact?.summary?.trim();
@@ -4389,12 +5711,17 @@ export const recQuestion = (snapshot: ConversationProjectSnapshot, videoProject?
       ? resolveScriptWorkflowStage(snapshot.derivedStage)
       : null;
   const scriptPacketQuestion = buildScriptPacketQuestion(snapshot);
+  const hasKickoffMode = hasConfirmedVideoKickoffMode(videoProject);
+  const hasKickoffStyle = hasConfirmedVideoKickoffStyle(videoProject);
 
   if (scriptWorkflowStage) {
     return scriptPacketQuestion;
   }
 
-  return buildVideoContinuationQuestion(snapshot, videoProject) ??
+  return (hasKickoffMode && hasKickoffStyle
+    ? buildVideoBridgePrefixQuestion(snapshot, videoProject)
+    : null) ??
+  buildVideoContinuationQuestion(snapshot, videoProject) ??
   scriptPacketQuestion ??
   ((snapshot.projectKind === "script" || snapshot.projectKind === "adaptation") && resolveScriptWorkflowStage(snapshot.derivedStage)
     ? null
@@ -4433,16 +5760,7 @@ export function isVideoIntentPrompt(prompt: string, snapshot?: ConversationProje
   if (snapshot?.projectKind === "video") return true;
   const lowered = prompt.trim().toLowerCase();
   if (!lowered) return false;
-  return ["视频", "分镜", "镜头", "出片", "提示词批次", "seedance", "dreamina", "即梦", "text2video", "image2video"].some((keyword) => lowered.includes(keyword));
-}
-
-export function buildDreaminaCapabilityOverlay(message?: string): string {
-  const capabilitySummary = message?.trim() || "已检测到本机 Dreamina CLI 登录态";
-  return [
-    "当前运行环境附加能力：",
-    `${capabilitySummary}，可直接使用官方 Dreamina CLI 继续 Seedance 2.0 / Seedance 2.0 Fast 视频生成。`,
-    "当用户进入视频工作流、镜头出片、提示词批次或资产续接时，你应把这项能力纳入分析，并优先给出基于当前本机能力可直接执行的建议。",
-  ].join("\n");
+  return ["视频", "分镜", "镜头", "出片", "提示词批次", "seedance", "即梦", "text2video", "image2video"].some((keyword) => lowered.includes(keyword));
 }
 
 export function listPendingSkillDrafts(drafts: SkillDraft[]): SkillDraft[] {

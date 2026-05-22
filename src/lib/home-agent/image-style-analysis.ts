@@ -154,7 +154,7 @@ export function buildHomeAgentImageAnalysisContext(
 
 export async function analyzeHomeAgentImageStyleFiles(
   files: File[],
-  options: { userPrompt?: string } = {},
+  options: { userPrompt?: string; signal?: AbortSignal } = {},
 ): Promise<HomeAgentImageStyleRecognitionResult> {
   const imageFiles = files.filter(isSupportedImageFile).slice(0, MAX_ANALYSIS_IMAGES);
   if (!imageFiles.length) {
@@ -198,6 +198,7 @@ export async function analyzeHomeAgentImageStyleFiles(
       maxOutputTokens: 1400,
       responseMimeType: "application/json",
     },
+    options.signal,
   );
 
   const payload = parseRecognitionPayload(extractText(response));

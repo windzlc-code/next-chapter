@@ -5,7 +5,7 @@ import {
   writeSkillDrafts,
 } from "./project-store";
 import { upsertStoredVideoProject } from "@/hooks/use-local-persistence";
-import { isExpiredRemoteSignedMediaUrl } from "./media-url";
+import { doesUsableMediaAssetExist } from "./media-url";
 import {
   buildVideoProductionBundlePreviewMessage,
   exportVideoProductionBundle,
@@ -86,6 +86,7 @@ import {
   prepareSegmentVideoPromptAction,
   generateSegmentVideoAction,
 } from "./services/video-workflow-service";
+import { maybeRunWorkflowTestOverride } from "./workflow-test-overrides";
 
 function buildContextSummary(runtime: StudioRuntimeState): string {
   const snapshot = runtime.currentProjectSnapshot;
@@ -471,6 +472,7 @@ async function exportVideoProductionBundleAction(
  * - 其他（本地文件路径）→ 通过 Electron readBase64 验证磁盘文件是否存在
  */
 async function exportVideoAssetBundleAction(
+  input: Record<string, unknown>,
   runtime: StudioRuntimeState,
 ): Promise<WorkflowActionResult> {
   const project = runtime.currentVideoProject;
@@ -479,7 +481,11 @@ async function exportVideoAssetBundleAction(
   }
 
   const manifest = runtime.currentProjectSnapshot?.memory?.assetManifest ?? project.assetManifest;
-  const exported = await exportVideoAssetBundle(project, manifest);
+  const preferredDirectory =
+    typeof input.directoryPath === "string" && input.directoryPath.trim()
+      ? input.directoryPath.trim()
+      : undefined;
+  const exported = await exportVideoAssetBundle(project, manifest, preferredDirectory);
   const summary = buildVideoAssetBundleExportSummary(project.title || project.id, exported);
 
   return {
@@ -493,18 +499,13 @@ async function exportVideoAssetBundleAction(
 }
 
 async function assetExists(url: string | undefined): Promise<boolean> {
-  if (!url) return false;
-  if (isExpiredRemoteSignedMediaUrl(url)) return false;
+  const readBase64 = true;
+  return doesUsableMediaAssetExist(url);
   // 内联数据或远端 URL：字段有值即视为存在
-  if (url.startsWith("data:") || url.startsWith("http://") || url.startsWith("https://")) return true;
   // blob: 是浏览器临时对象 URL，无法持久化验证，字段有值即视为存在
-  if (url.startsWith("blob:")) return true;
   // 其余均视为本地绝对文件路径（Electron 写入后返回的路径，如 D:/files/projects/.../xxx.jpg）
   // 通过 Electron IPC readBase64 调用 fs.existsSync 做真实磁盘验证
-  const readBase64 = window.electronAPI?.storage?.readBase64;
   if (!readBase64) return true; // 非 Electron 环境无法验证，保守视为存在
-  const result = await readBase64(url);
-  return !!result?.exists;
 }
 
 async function queryAssetStatusAction(runtime: StudioRuntimeState): Promise<WorkflowActionResult> {
@@ -954,8 +955,8 @@ const workflowActions: WorkflowAction[] = [
   {
     id: "export-video-asset-bundle",
     kind: "export_video_asset_bundle",
-    async run(_input, runtime) {
-      return exportVideoAssetBundleAction(runtime);
+    async run(input, runtime) {
+      return exportVideoAssetBundleAction(input, runtime);
     },
   },
   {
@@ -1008,6 +1009,16 @@ export async function runWorkflowAction(
   runtime: StudioRuntimeState,
   onProgress?: import("./types").WorkflowActionProgressCallback,
 ): Promise<WorkflowActionResult> {
+  const overrideResult = await maybeRunWorkflowTestOverride({
+    actionKind,
+    input,
+    runtime,
+    onProgress,
+  });
+  if (overrideResult) {
+    return overrideResult;
+  }
+
   const action = workflowActions.find((item) => item.kind === actionKind);
   if (!action) {
     throw new Error(`Unsupported workflow action: ${actionKind}`);

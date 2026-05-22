@@ -14,8 +14,50 @@ function collapseSpacing(text: string): string {
   return text.replace(/\n{3,}/g, "\n\n").trim();
 }
 
+function getMarkdownDecoratorToken(line: string): string | null {
+  const trimmed = line.trim();
+  return trimmed === "**" || trimmed === "__" ? trimmed : null;
+}
+
+function collapseSplitMarkdownDecoratorLines(lines: string[]): string[] {
+  const collapsed: string[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const decorator = getMarkdownDecoratorToken(lines[index]);
+    const middle = lines[index + 1];
+    const closing = lines[index + 2];
+
+    if (
+      decorator &&
+      typeof middle === "string" &&
+      middle.trim() &&
+      !BULLET_PATTERN.test(middle.trim()) &&
+      getMarkdownDecoratorToken(closing) === decorator
+    ) {
+      collapsed.push(`${decorator}${middle.trim()}${decorator}`);
+      index += 2;
+      continue;
+    }
+
+    collapsed.push(lines[index]);
+  }
+
+  return collapsed;
+}
+
+function sanitizeStructuredCleanedText(text: string): string {
+  return collapseSpacing(
+    text
+      .replace(/\r\n?/g, "\n")
+      .split("\n")
+      .filter((line) => !getMarkdownDecoratorToken(line))
+      .join("\n"),
+  );
+}
+
 function stripMarkdownDecorators(value: string): string {
   let result = value.trim();
+  if (getMarkdownDecoratorToken(result)) return "";
   result = result.replace(/^#{1,6}\s*/, "").replace(/^>\s*/, "").trim();
 
   const wrappers = [
@@ -487,6 +529,28 @@ function parseQuestionHeader(line: string): { index: number; total?: number; tit
   };
 }
 
+function collapseSplitQuestionHeaderLines(lines: string[]): string[] {
+  const collapsed: string[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const current = lines[index];
+    const next = lines[index + 1];
+    const nextTrimmed = next?.trimStart() ?? "";
+    if (nextTrimmed.startsWith("- ")) {
+      const combined = `${current.trimEnd()} ${nextTrimmed}`;
+      if (parseQuestionHeader(combined)) {
+        collapsed.push(combined);
+        index += 1;
+        continue;
+      }
+    }
+
+    collapsed.push(current);
+  }
+
+  return collapsed;
+}
+
 function parseOptionLine(line: string): {
   label: string;
   rationale?: string;
@@ -576,7 +640,11 @@ function detectNumberedQuestionHeader(
 }
 
 function buildMarkdownRequest(text: string): StructuredQuestionExtraction | null {
-  const lines = expandCollapsedOptionLines(text).replace(/\r\n?/g, "\n").split("\n");
+  const lines = collapseSplitQuestionHeaderLines(
+    collapseSplitMarkdownDecoratorLines(
+      expandCollapsedOptionLines(text).replace(/\r\n?/g, "\n").split("\n"),
+    ),
+  );
   const keptLines: string[] = [];
   const questions: AskUserQuestionRequest["questions"] = [];
   let inferredTotal: number | undefined;
@@ -657,7 +725,7 @@ function buildMarkdownRequest(text: string): StructuredQuestionExtraction | null
   }
 
   return {
-    cleanedText: collapseSpacing(keptLines.join("\n")),
+    cleanedText: sanitizeStructuredCleanedText(keptLines.join("\n")),
     request: {
       id: crypto.randomUUID(),
       title: inferredTotal && inferredTotal > 1 ? `先确认 ${questions.length} 个关键问题` : undefined,
@@ -868,7 +936,7 @@ function buildInlinePromptRequest(text: string): StructuredQuestionExtraction | 
   });
 
   return {
-    cleanedText: collapseSpacing(keptLines.join("\n")),
+    cleanedText: sanitizeStructuredCleanedText(keptLines.join("\n")),
     request: {
       id: crypto.randomUUID(),
       allowCustomInput: true,
@@ -957,7 +1025,7 @@ function buildPlainLineSelectionRequest(text: string): StructuredQuestionExtract
     const keptLines = lines.filter((_, index) => !consumed.has(index));
 
     return {
-      cleanedText: collapseSpacing(keptLines.join("\n")),
+      cleanedText: sanitizeStructuredCleanedText(keptLines.join("\n")),
       request: {
         id: crypto.randomUUID(),
         title: title || undefined,
@@ -1043,7 +1111,7 @@ export function extractStructuredQuestion(text: string): StructuredQuestionExtra
   }
 
   return {
-    cleanedText: collapseSpacing(workingText),
+    cleanedText: request ? sanitizeStructuredCleanedText(workingText) : collapseSpacing(workingText),
     request,
     workflowCall,
   };

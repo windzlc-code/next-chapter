@@ -5,12 +5,18 @@ import type {
   SceneSetting,
   ArtStyle,
   ProductionAssetManifest,
+  VideoAuditPacket,
+  VideoAutomationState,
+  VideoAutomationReferenceTargetState,
+  VideoRepairTask,
   VideoShotPacket,
   VideoProductionBundleMeta,
   VideoStyleLock,
   VideoWorldModel,
   VideoGenerationPrefs,
   VideoImageGenerationPrefs,
+  SegmentContinuityGridImage,
+  ArchivedSegmentVideoCandidate,
   SegmentVideoPrompt,
   SegmentVideoStatus,
 } from "@/types/project";
@@ -21,7 +27,7 @@ import {
   normalizeVideoImageGenerationPrefs,
   resolveVideoImageProjectArtStyle,
 } from "@/lib/home-agent/image-models";
-import { isExpiredRemoteSignedMediaUrl } from "@/lib/home-agent/media-url";
+import { isExpiredRemoteSignedMediaUrl, isKnownPlaceholderMediaUrl } from "@/lib/home-agent/media-url";
 import { normalizeVideoGenerationPrefs } from "@/lib/home-agent/video-models";
 
 interface ProjectData {
@@ -31,6 +37,9 @@ interface ProjectData {
   shotStyle?: string;
   outputGoal?: string;
   productionNotes?: string;
+  referenceStyleSummary?: string;
+  kickoffModeConfirmed?: boolean;
+  kickoffStyleConfirmed?: boolean;
   scenes: Scene[];
   characters: CharacterSetting[];
   sceneSettings: SceneSetting[];
@@ -38,11 +47,20 @@ interface ProjectData {
   currentStep: number;
   systemPrompt: string;
   analysisSummary?: string;
+  scriptBreakdownPassed?: boolean;
   storyboardPlan?: string;
   videoPromptBatch?: string;
   segmentVideoPrompts?: Record<string, SegmentVideoPrompt>;
+  segmentPromptRefreshCursor?: string | null;
   segmentVideos?: Record<string, string>; // segmentLabel → localPath/url
+  segmentContinuityFrames?: Record<string, string>;
+  segmentContinuityFrameSets?: Record<string, string[]>;
+  segmentContinuityGridImages?: Record<string, SegmentContinuityGridImage>;
+  archivedSegmentVideos?: Record<string, ArchivedSegmentVideoCandidate[]>;
   segmentVideoStatuses?: Record<string, SegmentVideoStatus>;
+  videoAuditPackets?: VideoAuditPacket[];
+  videoRepairTasks?: VideoRepairTask[];
+  automationState?: VideoAutomationState | null;
   sourceProjectId?: string;
   styleLock?: VideoStyleLock | null;
   worldModel?: VideoWorldModel | null;
@@ -60,7 +78,14 @@ interface ProjectData {
   productionStateBundle?: VideoProductionBundleMeta | null;
   imageGenerationPrefs?: VideoImageGenerationPrefs;
   videoGenerationPrefs?: VideoGenerationPrefs;
+  videoGenerationModeNotice?: {
+    message: string;
+    activeMode: VideoGenerationPrefs["mode"];
+    reason: string;
+    updatedAt: string;
+  } | null;
   preferredEpisodeDurationSeconds?: number | null;
+  preferredScriptBreakdownPace?: "slow" | "medium" | "fast" | null;
   /** 用户通过步骤切换手动跳到的目标步骤（>自然进度步骤时生效），用于阻止自动推进 */
   manualStepOverride?: number | null;
 }
@@ -83,6 +108,66 @@ interface StoredProject extends ProjectData {
 }
 
 export type PersistedVideoProject = StoredProject;
+
+function normalizeStoredScriptBreakdownPace(
+  value: unknown,
+): ProjectData["preferredScriptBreakdownPace"] {
+  return value === "slow" || value === "medium" || value === "fast" ? value : null;
+}
+
+function normalizeReferenceTargetAutomationState(
+  value: unknown,
+): Record<string, VideoAutomationReferenceTargetState> {
+  if (!value || typeof value !== "object") return {};
+  const entries = Object.entries(value as Record<string, unknown>);
+  return Object.fromEntries(
+    entries.map(([targetId, rawValue]) => {
+      const state = (rawValue && typeof rawValue === "object" ? rawValue : {}) as Partial<VideoAutomationReferenceTargetState>;
+      return [
+        targetId,
+        {
+          targetId,
+          targetType:
+            state.targetType === "character-primary" ||
+            state.targetType === "character-variant" ||
+            state.targetType === "scene-primary" ||
+            state.targetType === "scene-variant"
+              ? state.targetType
+              : "character-primary",
+          entityId: typeof state.entityId === "string" ? state.entityId : "",
+          variantId: typeof state.variantId === "string" ? state.variantId : undefined,
+          status:
+            state.status === "ready" ||
+            state.status === "retryable" ||
+            state.status === "blocked" ||
+            state.status === "exhausted"
+              ? state.status
+              : "pending",
+          attemptCount: Number.isFinite(state.attemptCount) ? Number(state.attemptCount) : 0,
+          retryBudget: Number.isFinite(state.retryBudget) ? Number(state.retryBudget) : 0,
+          dependencyTargetIds: Array.isArray(state.dependencyTargetIds)
+            ? state.dependencyTargetIds.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+            : undefined,
+          lastError: typeof state.lastError === "string" ? state.lastError : undefined,
+          lastTriedAt: typeof state.lastTriedAt === "string" ? state.lastTriedAt : undefined,
+          lastSucceededAt: typeof state.lastSucceededAt === "string" ? state.lastSucceededAt : undefined,
+          generatedUrl: typeof state.generatedUrl === "string" ? state.generatedUrl : undefined,
+          qualityScore: Number.isFinite(state.qualityScore) ? Number(state.qualityScore) : undefined,
+          sourceRefs: Array.isArray(state.sourceRefs)
+            ? state.sourceRefs.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+            : undefined,
+          lastQaSummary: typeof state.lastQaSummary === "string" ? state.lastQaSummary : undefined,
+          lastQaScore: Number.isFinite(state.lastQaScore) ? Number(state.lastQaScore) : undefined,
+          lastQaPassed: typeof state.lastQaPassed === "boolean" ? state.lastQaPassed : undefined,
+          lastQaIssues: Array.isArray(state.lastQaIssues)
+            ? state.lastQaIssues.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+            : undefined,
+          lastQaAt: typeof state.lastQaAt === "string" ? state.lastQaAt : undefined,
+        } satisfies VideoAutomationReferenceTargetState,
+      ];
+    }),
+  );
+}
 
 function generateId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2);
@@ -110,6 +195,250 @@ function matchesHistoricalVideoUrl(historyUrls: Set<string>, candidateUrl: strin
     if (historyUrls.has(key)) return true;
   }
   return false;
+}
+
+function stripKnownPlaceholderMediaFromProject(project: StoredProject): StoredProject {
+  const sanitizeUrl = (url?: string | null): string | undefined => {
+    if (typeof url !== "string") return undefined;
+    const trimmed = url.trim();
+    if (!trimmed || isKnownPlaceholderMediaUrl(trimmed)) return undefined;
+    return url;
+  };
+  const sanitizeImageHistory = (
+    history?: Array<{ imageUrl: string; description: string; createdAt: string }>,
+  ) => {
+    if (!history?.length) return history;
+    const nextHistory = history.filter((entry) => !isKnownPlaceholderMediaUrl(entry.imageUrl?.trim()));
+    return nextHistory.length ? nextHistory : undefined;
+  };
+  const sanitizeVideoHistory = (history?: Array<{ videoUrl: string; createdAt: string }>) => {
+    if (!history?.length) return history;
+    const nextHistory = history.filter((entry) => !isKnownPlaceholderMediaUrl(entry.videoUrl?.trim()));
+    return nextHistory.length ? nextHistory : undefined;
+  };
+
+  const characters = (project.characters ?? []).map((character) => {
+    const nextThreeViewUrls = character.threeViewUrls
+      ? Object.fromEntries(
+          Object.entries(character.threeViewUrls).filter(([, url]) => !isKnownPlaceholderMediaUrl(url?.trim())),
+        )
+      : undefined;
+    return {
+      ...character,
+      imageUrl: sanitizeUrl(character.imageUrl),
+      audioUrl: sanitizeUrl(character.audioUrl),
+      imageHistory: sanitizeImageHistory(character.imageHistory),
+      ...(nextThreeViewUrls && Object.keys(nextThreeViewUrls).length
+        ? { threeViewUrls: nextThreeViewUrls }
+        : character.threeViewUrls
+          ? { threeViewUrls: undefined }
+          : {}),
+      ...(character.costumes
+        ? {
+            costumes: character.costumes.map((costume) => ({
+              ...costume,
+              imageUrl: sanitizeUrl(costume.imageUrl),
+              imageHistory: sanitizeImageHistory(costume.imageHistory),
+            })),
+          }
+        : {}),
+    };
+  });
+
+  const sceneSettings = (project.sceneSettings ?? []).map((sceneSetting) => ({
+    ...sceneSetting,
+    imageUrl: sanitizeUrl(sceneSetting.imageUrl),
+    imageHistory: sanitizeImageHistory(sceneSetting.imageHistory),
+    ...(sceneSetting.timeVariants
+      ? {
+          timeVariants: sceneSetting.timeVariants.map((variant) => ({
+            ...variant,
+            imageUrl: sanitizeUrl(variant.imageUrl),
+            imageHistory: sanitizeImageHistory(variant.imageHistory),
+          })),
+        }
+      : {}),
+  }));
+
+  const scenes = (project.scenes ?? []).map((scene) => ({
+    ...scene,
+    storyboardUrl: sanitizeUrl(scene.storyboardUrl),
+    storyboardHistory: scene.storyboardHistory?.filter((url) => !isKnownPlaceholderMediaUrl(url?.trim())),
+    videoUrl: sanitizeUrl(scene.videoUrl),
+    videoHistory: sanitizeVideoHistory(scene.videoHistory),
+  }));
+
+  const segmentVideos = project.segmentVideos
+    ? Object.fromEntries(
+        Object.entries(project.segmentVideos).filter(([, url]) => !isKnownPlaceholderMediaUrl(url?.trim())),
+      )
+    : project.segmentVideos;
+  const segmentContinuityFrames = project.segmentContinuityFrames
+    ? Object.fromEntries(
+        Object.entries(project.segmentContinuityFrames).filter(
+          ([, url]) => !isKnownPlaceholderMediaUrl(url?.trim()),
+        ),
+      )
+    : project.segmentContinuityFrames;
+  const segmentContinuityFrameSets = project.segmentContinuityFrameSets
+    ? Object.fromEntries(
+        Object.entries(project.segmentContinuityFrameSets)
+          .map(([label, urls]) => [
+            label,
+            Array.isArray(urls)
+              ? urls
+                  .map((url) => String(url || "").trim())
+                  .filter((url) => url && !isKnownPlaceholderMediaUrl(url))
+              : [],
+          ])
+          .filter(([, urls]) => urls.length > 0),
+      )
+    : project.segmentContinuityFrameSets;
+  const segmentContinuityGridImages = project.segmentContinuityGridImages
+    ? Object.fromEntries(
+        Object.entries(project.segmentContinuityGridImages)
+          .map(([label, value]) => {
+            const imageUrl = sanitizeUrl(value?.imageUrl);
+            const recapText = typeof value?.recapText === "string" ? value.recapText.trim() : "";
+            const frameUrls = Array.isArray(value?.frameUrls)
+              ? value.frameUrls
+                  .map((url) => String(url || "").trim())
+                  .filter((url) => url && !isKnownPlaceholderMediaUrl(url))
+              : undefined;
+            if (!imageUrl) return null;
+            return [
+              label,
+              {
+                imageUrl,
+                ...(recapText ? { recapText } : {}),
+                ...(frameUrls?.length ? { frameUrls } : {}),
+                createdAt:
+                  typeof value?.createdAt === "string" && value.createdAt.trim()
+                    ? value.createdAt
+                    : new Date().toISOString(),
+                ...(typeof value?.updatedAt === "string" && value.updatedAt.trim()
+                  ? { updatedAt: value.updatedAt }
+                  : {}),
+              } satisfies SegmentContinuityGridImage,
+            ] as const;
+          })
+          .filter((entry): entry is readonly [string, SegmentContinuityGridImage] => Boolean(entry)),
+      )
+    : project.segmentContinuityGridImages;
+  const archivedSegmentVideos = project.archivedSegmentVideos
+    ? Object.fromEntries(
+        Object.entries(project.archivedSegmentVideos)
+          .map(([segmentLabel, entries]) => [
+            segmentLabel,
+            (Array.isArray(entries) ? entries : [])
+              .map((entry, index) => {
+                const videoUrl = sanitizeUrl(entry?.videoUrl);
+                if (!videoUrl) return null;
+                const failureReason = typeof entry?.failureReason === "string"
+                  ? entry.failureReason.trim()
+                  : "";
+                return {
+                  id:
+                    typeof entry?.id === "string" && entry.id.trim()
+                      ? entry.id.trim()
+                      : `archived-segment-video:${segmentLabel}:${index + 1}`,
+                  segmentLabel,
+                  videoUrl,
+                  failureReason: failureReason || "自动 QA 拦截了这条历史候选视频。",
+                  ...(typeof entry?.provider === "string" && entry.provider.trim()
+                    ? { provider: entry.provider.trim() }
+                    : {}),
+                  ...(typeof entry?.taskId === "string" && entry.taskId.trim()
+                    ? { taskId: entry.taskId.trim() }
+                    : {}),
+                  ...(typeof entry?.submittedPrompt === "string" && entry.submittedPrompt.trim()
+                    ? { submittedPrompt: entry.submittedPrompt.trim() }
+                    : {}),
+                  ...(Array.isArray(entry?.referenceImageUrls) && entry.referenceImageUrls.length
+                    ? {
+                        referenceImageUrls: entry.referenceImageUrls
+                          .map((url) => sanitizeUrl(String(url || "")))
+                          .filter((url): url is string => Boolean(url)),
+                      }
+                    : {}),
+                  ...(typeof entry?.usedContinuityFrame === "boolean"
+                    ? { usedContinuityFrame: entry.usedContinuityFrame }
+                    : {}),
+                  ...(typeof entry?.usedRelayVideo === "boolean"
+                    ? { usedRelayVideo: entry.usedRelayVideo }
+                    : {}),
+                  ...(entry?.route ? { route: entry.route } : {}),
+                  ...(typeof entry?.auditId === "string" && entry.auditId.trim()
+                    ? { auditId: entry.auditId.trim() }
+                    : {}),
+                  ...(typeof entry?.qaSummary === "string" && entry.qaSummary.trim()
+                    ? { qaSummary: entry.qaSummary.trim() }
+                    : {}),
+                  ...(Array.isArray(entry?.issues) && entry.issues.length
+                    ? {
+                        issues: entry.issues
+                          .map((issue) => String(issue || "").trim())
+                          .filter(Boolean),
+                      }
+                    : {}),
+                  ...(entry?.qualityTier ? { qualityTier: entry.qualityTier } : {}),
+                  archivedAt:
+                    typeof entry?.archivedAt === "string" && entry.archivedAt.trim()
+                      ? entry.archivedAt
+                      : new Date().toISOString(),
+                  ...(typeof entry?.promotedAt === "string" && entry.promotedAt.trim()
+                    ? { promotedAt: entry.promotedAt }
+                    : {}),
+                } satisfies ArchivedSegmentVideoCandidate;
+              })
+              .filter((entry): entry is ArchivedSegmentVideoCandidate => Boolean(entry)),
+          ])
+          .filter(([, entries]) => entries.length > 0),
+      )
+    : project.archivedSegmentVideos;
+
+  return {
+    ...project,
+    characters,
+    sceneSettings,
+    scenes,
+    assetManifest: project.assetManifest
+      ? {
+          ...project.assetManifest,
+          items: project.assetManifest.items.filter((item) => !isKnownPlaceholderMediaUrl(item.url?.trim())),
+        }
+      : project.assetManifest,
+    segmentVideos:
+      segmentVideos && Object.keys(segmentVideos).length
+        ? segmentVideos
+        : project.segmentVideos
+          ? undefined
+          : project.segmentVideos,
+    segmentContinuityFrames:
+      segmentContinuityFrames && Object.keys(segmentContinuityFrames).length
+        ? segmentContinuityFrames
+        : project.segmentContinuityFrames
+          ? undefined
+          : project.segmentContinuityFrames,
+    segmentContinuityFrameSets:
+      segmentContinuityFrameSets && Object.keys(segmentContinuityFrameSets).length
+        ? segmentContinuityFrameSets
+        : project.segmentContinuityFrameSets
+          ? undefined
+          : project.segmentContinuityFrameSets,
+    segmentContinuityGridImages:
+      segmentContinuityGridImages && Object.keys(segmentContinuityGridImages).length
+        ? segmentContinuityGridImages
+        : project.segmentContinuityGridImages
+          ? undefined
+          : project.segmentContinuityGridImages,
+    archivedSegmentVideos:
+      archivedSegmentVideos && Object.keys(archivedSegmentVideos).length
+        ? archivedSegmentVideos
+        : project.archivedSegmentVideos
+          ? undefined
+          : project.archivedSegmentVideos,
+  };
 }
 
 function normalizeNestedVariantIds<T extends { id: string }>(
@@ -209,23 +538,130 @@ export function pruneExpiredVideoReferencesFromProject(
     changed = true;
   }
 
+  const nextSegmentContinuityFrames = project.segmentContinuityFrames
+    ? Object.fromEntries(
+        Object.entries(project.segmentContinuityFrames).filter(
+          ([, url]) => !isExpiredRemoteSignedMediaUrl(url, now),
+        ),
+      )
+    : project.segmentContinuityFrames;
+  const nextSegmentContinuityFrameSets = project.segmentContinuityFrameSets
+    ? Object.fromEntries(
+        Object.entries(project.segmentContinuityFrameSets)
+          .map(([label, urls]) => [
+            label,
+            Array.isArray(urls)
+              ? urls.filter((url) => !isExpiredRemoteSignedMediaUrl(url, now))
+              : [],
+          ])
+          .filter(([, urls]) => urls.length > 0),
+      )
+    : project.segmentContinuityFrameSets;
+  const nextSegmentContinuityGridImages = project.segmentContinuityGridImages
+    ? Object.fromEntries(
+        Object.entries(project.segmentContinuityGridImages)
+          .map(([label, value]) => {
+            if (!value?.imageUrl || isExpiredRemoteSignedMediaUrl(value.imageUrl, now)) return null;
+            const frameUrls = Array.isArray(value.frameUrls)
+              ? value.frameUrls.filter((url) => !isExpiredRemoteSignedMediaUrl(url, now))
+              : undefined;
+            return [
+              label,
+              {
+                ...value,
+                ...(frameUrls?.length ? { frameUrls } : {}),
+              } satisfies SegmentContinuityGridImage,
+            ] as const;
+          })
+          .filter((entry): entry is readonly [string, SegmentContinuityGridImage] => Boolean(entry)),
+      )
+    : project.segmentContinuityGridImages;
+  const nextArchivedSegmentVideos = project.archivedSegmentVideos
+    ? Object.fromEntries(
+        Object.entries(project.archivedSegmentVideos)
+          .map(([segmentLabel, entries]) => [
+            segmentLabel,
+            (Array.isArray(entries) ? entries : []).filter(
+              (entry) => !isExpiredRemoteSignedMediaUrl(entry?.videoUrl, now),
+            ),
+          ])
+          .filter(([, entries]) => entries.length > 0),
+      )
+    : project.archivedSegmentVideos;
+  if (
+    nextSegmentContinuityFrames &&
+    project.segmentContinuityFrames &&
+    Object.keys(nextSegmentContinuityFrames).length !== Object.keys(project.segmentContinuityFrames).length
+  ) {
+    changed = true;
+  }
+  if (
+    nextSegmentContinuityFrameSets &&
+    project.segmentContinuityFrameSets &&
+    Object.keys(nextSegmentContinuityFrameSets).length !== Object.keys(project.segmentContinuityFrameSets).length
+  ) {
+    changed = true;
+  }
+  if (
+    nextSegmentContinuityGridImages &&
+    project.segmentContinuityGridImages &&
+    Object.keys(nextSegmentContinuityGridImages).length !== Object.keys(project.segmentContinuityGridImages).length
+  ) {
+    changed = true;
+  }
+  if (
+    nextArchivedSegmentVideos &&
+    project.archivedSegmentVideos &&
+    Object.keys(nextArchivedSegmentVideos).length !== Object.keys(project.archivedSegmentVideos).length
+  ) {
+    changed = true;
+  } else if (project.archivedSegmentVideos) {
+    for (const [segmentLabel, entries] of Object.entries(project.archivedSegmentVideos)) {
+      if ((nextArchivedSegmentVideos?.[segmentLabel]?.length ?? 0) !== (entries?.length ?? 0)) {
+        changed = true;
+        break;
+      }
+    }
+  }
+
   return changed
     ? {
         ...project,
         scenes,
         assetManifest: nextAssetManifest,
+        segmentContinuityFrames: nextSegmentContinuityFrames,
+        segmentContinuityFrameSets: nextSegmentContinuityFrameSets,
+        segmentContinuityGridImages: nextSegmentContinuityGridImages,
+        archivedSegmentVideos: nextArchivedSegmentVideos,
       }
     : project;
 }
 
 export function normalizeStoredVideoProject(project: StoredProject): StoredProject {
-  const artStyle = project.artStyle || "live-action";
+  const sanitizedProject = stripKnownPlaceholderMediaFromProject(project);
+  const artStyle = sanitizedProject.artStyle || "live-action";
   const imageGenerationPrefs = normalizeVideoImageGenerationPrefs({
     ...buildLegacyVideoImageStylePrefs(artStyle),
-    ...project.imageGenerationPrefs,
+    ...sanitizedProject.imageGenerationPrefs,
   });
-  const videoGenerationPrefs = normalizeVideoGenerationPrefs(project.videoGenerationPrefs);
-  const characters = (project.characters ?? []).map((character, index) => {
+  const referenceStyleSummary =
+    typeof sanitizedProject.referenceStyleSummary === "string" &&
+      sanitizedProject.referenceStyleSummary.trim()
+      ? sanitizedProject.referenceStyleSummary.trim()
+      : undefined;
+  const videoGenerationPrefs = normalizeVideoGenerationPrefs(sanitizedProject.videoGenerationPrefs);
+  const preferredScriptBreakdownPace = normalizeStoredScriptBreakdownPace(
+    sanitizedProject.preferredScriptBreakdownPace,
+  );
+  const automationState = sanitizedProject.automationState
+    ? {
+        ...sanitizedProject.automationState,
+        referenceTargets: normalizeReferenceTargetAutomationState(
+          sanitizedProject.automationState.referenceTargets,
+        ),
+      }
+    : sanitizedProject.automationState;
+  const characters = (sanitizedProject.characters ?? []).map((character, index) => {
     const characterId = typeof character.id === "string" && character.id.trim()
       ? character.id.trim()
       : `character-${index + 1}`;
@@ -244,7 +680,7 @@ export function normalizeStoredVideoProject(project: StoredProject): StoredProje
           : {}),
     };
   });
-  const sceneSettings = (project.sceneSettings ?? []).map((sceneSetting, index) => {
+  const sceneSettings = (sanitizedProject.sceneSettings ?? []).map((sceneSetting, index) => {
     const sceneSettingId = typeof sceneSetting.id === "string" && sceneSetting.id.trim()
       ? sceneSetting.id.trim()
       : `scene-setting-${index + 1}`;
@@ -269,12 +705,17 @@ export function normalizeStoredVideoProject(project: StoredProject): StoredProje
   });
 
   return {
-    ...project,
+    ...sanitizedProject,
     characters,
     sceneSettings,
     artStyle: resolveVideoImageProjectArtStyle(imageGenerationPrefs, artStyle),
     imageGenerationPrefs,
+    referenceStyleSummary,
+    kickoffModeConfirmed: sanitizedProject.kickoffModeConfirmed === true,
+    kickoffStyleConfirmed: sanitizedProject.kickoffStyleConfirmed === true,
     videoGenerationPrefs,
+    preferredScriptBreakdownPace,
+    automationState,
   };
 }
 
@@ -308,23 +749,50 @@ async function remapProjectPaths(project: StoredProject): Promise<StoredProject>
     if (!/^[A-Za-z]:[\\/]/.test(url)) return url;
     return remap(url);
   };
+  const latestImageHistoryUrl = (history?: Array<{ imageUrl: string }>) =>
+    [...(history ?? [])]
+      .map((entry) => entry.imageUrl?.trim())
+      .filter((value): value is string => Boolean(value))
+      .at(-1);
+  const latestStoryboardHistoryUrl = (history?: string[]) =>
+    [...(history ?? [])]
+      .map((entry) => entry?.trim())
+      .filter((value): value is string => Boolean(value))
+      .at(-1);
 
   const characters = await Promise.all(
     (project.characters || []).map(async (c) => ({
       ...c,
-      imageUrl: await remapUrl(c.imageUrl) ?? c.imageUrl,
+      imageUrl: await remapUrl(c.imageUrl || latestImageHistoryUrl(c.imageHistory)) ?? c.imageUrl,
+      audioUrl: await remapUrl(c.audioUrl) ?? c.audioUrl,
+      costumes: c.costumes
+        ? await Promise.all(
+            c.costumes.map(async (costume) => ({
+              ...costume,
+              imageUrl: await remapUrl(costume.imageUrl || latestImageHistoryUrl(costume.imageHistory)) ?? costume.imageUrl,
+            })),
+          )
+        : c.costumes,
     })),
   );
   const sceneSettings = await Promise.all(
     (project.sceneSettings || []).map(async (s) => ({
       ...s,
-      imageUrl: await remapUrl(s.imageUrl) ?? s.imageUrl,
+      imageUrl: await remapUrl(s.imageUrl || latestImageHistoryUrl(s.imageHistory)) ?? s.imageUrl,
+      timeVariants: s.timeVariants
+        ? await Promise.all(
+            s.timeVariants.map(async (variant) => ({
+              ...variant,
+              imageUrl: await remapUrl(variant.imageUrl || latestImageHistoryUrl(variant.imageHistory)) ?? variant.imageUrl,
+            })),
+          )
+        : s.timeVariants,
     })),
   );
   const scenes = await Promise.all(
     (project.scenes || []).map(async (s) => ({
       ...s,
-      storyboardUrl: await remapUrl(s.storyboardUrl) ?? s.storyboardUrl,
+      storyboardUrl: await remapUrl(s.storyboardUrl || latestStoryboardHistoryUrl(s.storyboardHistory)) ?? s.storyboardUrl,
       videoUrl: await remapUrl(s.videoUrl) ?? s.videoUrl,
     })),
   );
@@ -338,7 +806,101 @@ async function remapProjectPaths(project: StoredProject): Promise<StoredProject>
         ),
       )
     : project.segmentVideos;
-  return { ...project, characters, sceneSettings, scenes, segmentVideos };
+  const segmentContinuityFrames = project.segmentContinuityFrames
+    ? Object.fromEntries(
+        await Promise.all(
+          Object.entries(project.segmentContinuityFrames).map(async ([label, url]) => [
+            label,
+            await remapUrl(url) ?? url,
+          ]),
+        ),
+      )
+    : project.segmentContinuityFrames;
+  const segmentContinuityFrameSets = project.segmentContinuityFrameSets
+    ? Object.fromEntries(
+        await Promise.all(
+          Object.entries(project.segmentContinuityFrameSets).map(async ([label, urls]) => [
+            label,
+            (
+              await Promise.all(
+                (Array.isArray(urls) ? urls : []).map(async (url) => (await remapUrl(url)) ?? url),
+              )
+            ).filter((url) => String(url || "").trim()),
+          ]),
+        ),
+      )
+    : project.segmentContinuityFrameSets;
+  const segmentContinuityGridImages = project.segmentContinuityGridImages
+    ? Object.fromEntries(
+        await Promise.all(
+          Object.entries(project.segmentContinuityGridImages).map(async ([label, value]) => {
+            const imageUrl = (await remapUrl(value?.imageUrl)) ?? value?.imageUrl;
+            const frameUrls = (
+              await Promise.all(
+                (Array.isArray(value?.frameUrls) ? value.frameUrls : []).map(
+                  async (url) => (await remapUrl(url)) ?? url,
+                ),
+              )
+            ).filter((url) => String(url || "").trim());
+            return [
+              label,
+              {
+                imageUrl,
+                ...(typeof value?.recapText === "string" && value.recapText.trim()
+                  ? { recapText: value.recapText.trim() }
+                  : {}),
+                ...(frameUrls.length ? { frameUrls } : {}),
+                createdAt:
+                  typeof value?.createdAt === "string" && value.createdAt.trim()
+                    ? value.createdAt
+                    : new Date().toISOString(),
+                ...(typeof value?.updatedAt === "string" && value.updatedAt.trim()
+                  ? { updatedAt: value.updatedAt }
+                  : {}),
+              } satisfies SegmentContinuityGridImage,
+            ] as const;
+          }),
+        ),
+      )
+    : project.segmentContinuityGridImages;
+  const archivedSegmentVideos = project.archivedSegmentVideos
+    ? Object.fromEntries(
+        await Promise.all(
+          Object.entries(project.archivedSegmentVideos).map(async ([segmentLabel, entries]) => [
+            segmentLabel,
+            (
+              await Promise.all(
+                (Array.isArray(entries) ? entries : []).map(async (entry) => ({
+                  ...entry,
+                  segmentLabel,
+                  videoUrl: (await remapUrl(entry?.videoUrl)) ?? entry?.videoUrl,
+                  referenceImageUrls: Array.isArray(entry?.referenceImageUrls)
+                    ? (
+                        await Promise.all(
+                          entry.referenceImageUrls.map(
+                            async (url) => (await remapUrl(url)) ?? url,
+                          ),
+                        )
+                      ).filter((url) => String(url || "").trim())
+                    : entry?.referenceImageUrls,
+                })),
+              )
+            ).filter((entry) => String(entry.videoUrl || "").trim()),
+          ]),
+        ),
+      )
+    : project.archivedSegmentVideos;
+  return {
+    ...project,
+    characters,
+    sceneSettings,
+    scenes,
+    segmentVideos,
+    segmentContinuityFrames,
+    segmentContinuityFrameSets,
+    segmentContinuityGridImages,
+    archivedSegmentVideos,
+  };
 }
 
 async function getProjects(): Promise<StoredProject[]> {
@@ -446,12 +1008,13 @@ async function saveProjects(projects: StoredProject[]): Promise<boolean> {
   const sanitizedProjects = projects.map((project) =>
     normalizeStoredVideoProject(pruneExpiredVideoReferencesFromProject(project)),
   );
+  let fileSaved = false;
   const filePath = await getProjectsFilePath();
   if (filePath) {
-    const ok = await writeJsonFile(filePath, sanitizedProjects);
-    if (ok) return true;
+    fileSaved = await writeJsonFile(filePath, sanitizedProjects);
   }
-  return saveProjectsToLocalStorage(sanitizedProjects);
+  const localSaved = saveProjectsToLocalStorage(sanitizedProjects);
+  return fileSaved || localSaved;
 }
 
 export async function loadStoredVideoProjectById(
@@ -498,6 +1061,10 @@ export async function createStoredVideoProject(data: Partial<ProjectData>): Prom
     shotStyle: data.shotStyle || "",
     outputGoal: data.outputGoal || "",
     productionNotes: data.productionNotes || "",
+    referenceStyleSummary:
+      typeof data.referenceStyleSummary === "string" ? data.referenceStyleSummary : undefined,
+    kickoffModeConfirmed: data.kickoffModeConfirmed === true,
+    kickoffStyleConfirmed: data.kickoffStyleConfirmed === true,
     scenes: data.scenes || [],
     characters: data.characters || [],
     sceneSettings: data.sceneSettings || [],
@@ -508,19 +1075,36 @@ export async function createStoredVideoProject(data: Partial<ProjectData>): Prom
     storyboardPlan: data.storyboardPlan || "",
     videoPromptBatch: data.videoPromptBatch || "",
     segmentVideoPrompts: data.segmentVideoPrompts,
+    segmentPromptRefreshCursor:
+      typeof data.segmentPromptRefreshCursor === "string"
+        ? data.segmentPromptRefreshCursor
+        : data.segmentPromptRefreshCursor === null
+          ? null
+          : undefined,
     segmentVideos: data.segmentVideos,
+    segmentContinuityFrames: data.segmentContinuityFrames,
+    segmentContinuityFrameSets: data.segmentContinuityFrameSets,
+    segmentContinuityGridImages: data.segmentContinuityGridImages,
+    archivedSegmentVideos: data.archivedSegmentVideos,
     segmentVideoStatuses: data.segmentVideoStatuses,
+    videoAuditPackets: data.videoAuditPackets || [],
+    videoRepairTasks: data.videoRepairTasks || [],
+    automationState: data.automationState || null,
     sourceProjectId: data.sourceProjectId,
     styleLock: data.styleLock || null,
     worldModel: data.worldModel || null,
     assetManifest: data.assetManifest || null,
     shotPackets: data.shotPackets || [],
+    reviewQueue: data.reviewQueue || [],
     productionStateBundle: data.productionStateBundle || null,
     imageGenerationPrefs: normalizeVideoImageGenerationPrefs({
       ...buildLegacyVideoImageStylePrefs(data.artStyle || "live-action"),
       ...data.imageGenerationPrefs,
     }),
     videoGenerationPrefs: normalizeVideoGenerationPrefs(data.videoGenerationPrefs),
+    preferredScriptBreakdownPace: normalizeStoredScriptBreakdownPace(
+      data.preferredScriptBreakdownPace,
+    ),
     createdAt: now,
     updatedAt: now,
   });
@@ -540,16 +1124,32 @@ export async function upsertStoredVideoProject(project: PersistedVideoProject): 
     shotStyle: project.shotStyle || "",
     outputGoal: project.outputGoal || "",
     productionNotes: project.productionNotes || "",
+    referenceStyleSummary:
+      typeof project.referenceStyleSummary === "string" ? project.referenceStyleSummary : undefined,
     analysisSummary: project.analysisSummary || "",
     storyboardPlan: project.storyboardPlan || "",
     videoPromptBatch: project.videoPromptBatch || "",
     segmentVideoPrompts: project.segmentVideoPrompts,
+    segmentPromptRefreshCursor:
+      typeof project.segmentPromptRefreshCursor === "string"
+        ? project.segmentPromptRefreshCursor
+        : project.segmentPromptRefreshCursor === null
+          ? null
+          : undefined,
     segmentVideos: project.segmentVideos,
+    segmentContinuityFrames: project.segmentContinuityFrames,
+    segmentContinuityFrameSets: project.segmentContinuityFrameSets,
+    segmentContinuityGridImages: project.segmentContinuityGridImages,
+    archivedSegmentVideos: project.archivedSegmentVideos,
     segmentVideoStatuses: project.segmentVideoStatuses,
+    videoAuditPackets: project.videoAuditPackets || [],
+    videoRepairTasks: project.videoRepairTasks || [],
+    automationState: project.automationState || null,
     styleLock: project.styleLock || null,
     worldModel: project.worldModel || null,
     assetManifest: project.assetManifest || null,
     shotPackets: project.shotPackets || [],
+    reviewQueue: project.reviewQueue || [],
     productionStateBundle: project.productionStateBundle || null,
     updatedAt: new Date().toISOString(),
   }));
@@ -618,6 +1218,9 @@ export function useProjectPersistence() {
       shotStyle: project.shotStyle,
       outputGoal: project.outputGoal,
       productionNotes: project.productionNotes,
+      referenceStyleSummary: project.referenceStyleSummary,
+      kickoffModeConfirmed: project.kickoffModeConfirmed === true,
+      kickoffStyleConfirmed: project.kickoffStyleConfirmed === true,
       scenes: project.scenes,
       characters: project.characters,
       sceneSettings: project.sceneSettings,
@@ -628,16 +1231,34 @@ export function useProjectPersistence() {
       storyboardPlan: project.storyboardPlan,
       videoPromptBatch: project.videoPromptBatch,
       segmentVideoPrompts: project.segmentVideoPrompts,
+      segmentPromptRefreshCursor:
+        typeof project.segmentPromptRefreshCursor === "string"
+          ? project.segmentPromptRefreshCursor
+          : project.segmentPromptRefreshCursor === null
+            ? null
+            : undefined,
       segmentVideos: project.segmentVideos,
+      segmentContinuityFrames: project.segmentContinuityFrames,
+      segmentContinuityFrameSets: project.segmentContinuityFrameSets,
+      segmentContinuityGridImages: project.segmentContinuityGridImages,
+      archivedSegmentVideos: project.archivedSegmentVideos,
       segmentVideoStatuses: project.segmentVideoStatuses,
+      videoAuditPackets: project.videoAuditPackets,
+      videoRepairTasks: project.videoRepairTasks,
+      automationState: project.automationState,
       sourceProjectId: project.sourceProjectId,
       styleLock: project.styleLock,
       worldModel: project.worldModel,
       assetManifest: project.assetManifest,
       shotPackets: project.shotPackets,
+      reviewQueue: project.reviewQueue,
       productionStateBundle: project.productionStateBundle,
       imageGenerationPrefs: normalizeVideoImageGenerationPrefs(project.imageGenerationPrefs),
       videoGenerationPrefs: normalizeVideoGenerationPrefs(project.videoGenerationPrefs),
+      preferredEpisodeDurationSeconds: project.preferredEpisodeDurationSeconds ?? null,
+      preferredScriptBreakdownPace: normalizeStoredScriptBreakdownPace(
+        project.preferredScriptBreakdownPace,
+      ),
     };
   }, []);
 

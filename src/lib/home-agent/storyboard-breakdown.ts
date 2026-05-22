@@ -1,5 +1,10 @@
 import type { CharacterSetting, Scene, SceneSetting } from "@/types/project";
-import { getCharacterDisplayName, getSceneDisplayName } from "@/lib/workspace-labels";
+import {
+  getCharacterDisplayName,
+  getSceneDisplayName,
+  getSegmentCharacterDisplayNames,
+  getSegmentSceneDisplayName,
+} from "@/lib/workspace-labels";
 
 export interface StoryboardBreakdownShot {
   index: number;
@@ -97,15 +102,19 @@ function buildClip(
   );
 
   const sceneNames = uniqueStrings(
-    scenes.map((scene) => getSceneDisplayName(scene, sceneSettings) || scene.sceneName),
+    [
+      getSegmentSceneDisplayName(scenes, sceneSettings),
+      ...scenes.map((scene) => getSceneDisplayName(scene, sceneSettings) || scene.sceneName),
+    ],
   );
-  const characterNames = uniqueStrings(
-    scenes.flatMap((scene) =>
+  const characterNames = uniqueStrings([
+    ...getSegmentCharacterDisplayNames(scenes, characters),
+    ...scenes.flatMap((scene) =>
       (scene.characters || []).map((characterName) =>
         getCharacterDisplayName(String(characterName || ""), scene, characters),
       ),
     ),
-  );
+  ]);
 
   return {
     id: `segment-${segmentLabel}-${index + 1}`,
@@ -217,7 +226,7 @@ export function buildStoryboardBreakdownMessage(params: {
     "以下按导出拆镜 xlsx 的分段结构展示：",
     "",
     "```json",
-    JSON.stringify(root, null, 2),
+    JSON.stringify(root),
     "```",
   ].join("\n");
 }

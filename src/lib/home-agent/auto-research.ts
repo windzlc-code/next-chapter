@@ -20,6 +20,47 @@ function containsAny(value: string, needles: string[]): boolean {
   return needles.some((needle) => value.includes(needle));
 }
 
+function hasExplicitResearchLaunchIntent(prompt: string): boolean {
+  return (
+    containsAny(prompt, [
+      "并行研究",
+      "后台研究",
+      "研究任务",
+      "分方向研究",
+      "分别研究",
+      "逐个研究",
+      "拆成几个方向研究",
+      "拆成 3 个方向研究",
+      "拆成三个方向研究",
+      "先研究",
+      "帮我研究",
+    ]) ||
+    /(?:并行|后台|分别|逐个|分方向).{0,8}(?:研究|分析)/u.test(prompt) ||
+    /(?:研究|分析).{0,8}(?:并行|后台|分别|逐个|分方向)/u.test(prompt)
+  );
+}
+
+function hasNaturalLanguageGuidanceIntent(prompt: string): boolean {
+  return (
+    containsAny(prompt, [
+      "自然语言",
+      "先聊",
+      "聊聊",
+      "先说说",
+      "先解释",
+      "比较一下",
+      "对比一下",
+      "适合什么情况",
+      "怎么选",
+      "先别急着",
+      "别急着让我点",
+      "先不要让我选",
+      "一步一步追问",
+    ]) ||
+    /(?:先|你先).{0,12}(?:说说|解释|比较|对比|聊聊)/u.test(prompt)
+  );
+}
+
 function buildProjectPrefix(snapshot: ConversationProjectSnapshot | null): string {
   if (!snapshot) return "当前是一个新需求。";
   return `当前项目《${snapshot.title}》，阶段为 ${snapshot.derivedStage}，当前目标是：${snapshot.currentObjective || snapshot.agentSummary}。`;
@@ -126,19 +167,22 @@ export function buildAutoResearchPlan(
   const prompt = normalizeInput(rawPrompt);
   if (!prompt) return null;
 
-  const hasResearchIntent = containsAny(prompt, [
-    "分析",
-    "研究",
-    "比较",
-    "对比",
-    "定位",
-    "方向",
-    "策略",
-    "适合",
-    "怎么做更好",
+  const hasResearchTopic = containsAny(prompt, [
+    "市场",
+    "风格",
+    "卖点",
+    "路线",
+    "平台",
+    "受众",
+    "改编",
+    "角色",
+    "出片",
   ]);
+  const explicitResearchLaunch = hasExplicitResearchLaunchIntent(prompt);
+  const hasResearchIntent = explicitResearchLaunch || (prompt.includes("研究") && hasResearchTopic);
 
   if (!hasResearchIntent) return null;
+  if (!explicitResearchLaunch && hasNaturalLanguageGuidanceIntent(prompt)) return null;
 
   const lowerKind = snapshot?.projectKind;
   const isVideo =

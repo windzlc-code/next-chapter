@@ -22,11 +22,81 @@ type ConversationMemoryModuleLike = typeof import("@/lib/home-agent/conversation
 type ProjectStoreModuleLike = typeof import("@/lib/home-agent/project-store");
 type StructuredQuestionParserModuleLike = typeof import("./structured-question-parser");
 
-type DreaminaCapabilityState = {
-  ready: boolean;
-  available: boolean;
-  message?: string;
-};
+const ASSISTANT_META_PROGRESS_LINE =
+  /^(?:正在|继续)(?:为你|帮你)?(?:生成|整理|分析|撰写|设计|构思|输出|处理|完善).*(?:\.{3,}|…+|。)?$/u;
+const ASSISTANT_META_PREAMBLE_LINE =
+  /^(?:(?:好的|收到|明白|可以|没问题|行|完美|太好了|很好)[！!。\s]*)?(?:(?:现在|接下来|下面|先)(?:我)?(?:来|会)?(?:为你|帮你)?(?:继续)?(?:生成|整理|分析|撰写|设计|构思|输出|处理|完善).*(?:请稍等|稍候|我会给你|马上给你|这就给你|如下|：)|(?:我会|我先|我将)(?:为你|帮你)?.*(?:生成|整理|分析|撰写|设计|构思|输出|处理|完善).*(?:请稍等|稍候|马上|接下来|如下|：))$/u;
+
+function looksLikeAssistantMetaScaffold(line: string): boolean {
+  const normalized = line.replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  if (ASSISTANT_META_PROGRESS_LINE.test(normalized)) return true;
+  if (ASSISTANT_META_PREAMBLE_LINE.test(normalized)) return true;
+  return /(?:请稍等|稍候|马上为你|这就为你|我会给你)/u.test(normalized) &&
+    /(?:生成|整理|分析|撰写|设计|构思|输出|处理|完善)/u.test(normalized);
+}
+
+export function sanitizeAssistantReplyText(text: string): string {
+  const normalized = String(text || "")
+    .replace(/\r\n?/g, "\n")
+    .trim();
+  if (!normalized) return "";
+
+  const lines = normalized
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => !looksLikeAssistantMetaScaffold(line));
+
+  const collapsed: string[] = [];
+  for (const line of lines) {
+    if (!line) {
+      if (!collapsed.length || !collapsed[collapsed.length - 1]) continue;
+      collapsed.push("");
+      continue;
+    }
+    collapsed.push(line);
+  }
+  while (collapsed.length && !collapsed[0]) collapsed.shift();
+  while (collapsed.length && !collapsed[collapsed.length - 1]) collapsed.pop();
+
+  return collapsed.join("\n").trim();
+}
+
+function hasWorkflowForwardGuidance(text: string): boolean {
+  const normalized = String(text || "").trim();
+  if (!normalized) return false;
+  return /(?:^|\n)(?:##\s*)?下一步(?:建议)?\s*[:：]/u.test(normalized);
+}
+
+function buildWorkflowForwardGuidance(
+  snapshot: ConversationProjectSnapshot | null | undefined,
+): string {
+  const stage = snapshot?.derivedStage?.trim() || "当前阶段";
+  const nextAction = snapshot?.recommendedActions?.find((action) => action.trim())?.trim();
+  const objective = snapshot?.currentObjective?.trim();
+
+  if (nextAction) {
+    return `下一步建议：当前处于「${stage}」阶段，请先${nextAction}，不要跳到后续阶段。`;
+  }
+
+  if (objective) {
+    return `下一步建议：当前处于「${stage}」阶段，请先围绕这个目标继续推进：${objective}。不要跳到后续阶段。`;
+  }
+
+  return `下一步建议：当前处于「${stage}」阶段，请先完成这一阶段，再继续后面的步骤。`;
+}
+
+export function ensureAssistantReplyHasWorkflowGuidance(params: {
+  text: string;
+  snapshot: ConversationProjectSnapshot | null | undefined;
+  consumedStructuredPayload?: boolean;
+}): string {
+  const { text, snapshot, consumedStructuredPayload = false } = params;
+  const normalized = String(text || "").trim();
+  if (!normalized || !snapshot || consumedStructuredPayload) return normalized;
+  if (hasWorkflowForwardGuidance(normalized)) return normalized;
+  return `${normalized}\n\n${buildWorkflowForwardGuidance(snapshot)}`;
+}
 
 function createArtifactRevisionKey(
   artifact: ConversationProjectSnapshot["artifacts"][number],
@@ -495,6 +565,50 @@ export function resolveDirectVideoGenerationIntent(
   };
 }
 
+export function resolveBlockedWorkflowMediaAction(
+  text: string,
+): "image" | "storyboard" | "video" | null {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return null;
+  if (isInternalChoicePayload(trimmed)) return null;
+
+  const normalized = trimmed.replace(/\s+/g, " ");
+  const lower = normalized.toLowerCase();
+  const asksHowOrWhy =
+    /(?:\u600e\u4e48|\u5982\u4f55|\u4e3a\u4ec0\u4e48|\u6559\u7a0b|\u8bf4\u660e|help|how to|what is|why)/i.test(lower);
+  const mentionsMedia =
+    /(?:\u751f\u56fe|\u56fe(?:\u7247)?|\u56fe\u50cf|\u63d2\u753b|\u5c01\u9762|\u6d77\u62a5|\u5206\u955c|storyboard|\u89c6\u9891|\u77ed\u89c6\u9891|trailer|video)/i.test(
+      normalized,
+    );
+  if (asksHowOrWhy && mentionsMedia) return null;
+
+  if (resolveDirectStoryboardGenerationIntent(normalized, { hasActiveVideoProject: true })) {
+    return "storyboard";
+  }
+  if (resolveDirectVideoGenerationIntent(normalized, { hasActiveVideoProject: true })) {
+    return "video";
+  }
+  if (resolveDirectProjectImageIntent(normalized)) {
+    return "image";
+  }
+
+  const storyboardShortcut =
+    /(?:(?:\u7ed9\u6211|\u5e2e\u6211|\u6765(?:\u4e00(?:\u5957|\u7ec4|\u4e2a))?|\u76f4\u63a5)?\s*(?:\u51fa|\u505a|\u751f\u6210|\u8865)?\s*(?:\u4e00(?:\u5957|\u7ec4)|\u51e0\u7ec4)?\s*(?:\u5206\u955c(?:\u56fe|\u5e27)?|storyboard(?:\s+frames?)?)|(?:\u5206\u955c(?:\u56fe|\u5e27)?|storyboard)(?:\s*(?:\u7ed9\u6211|\u6765(?:\u4e00(?:\u5957|\u7ec4|\u4e2a))?|\u51fa(?:\u4e00(?:\u5957|\u7ec4))?)))$/i;
+  if (storyboardShortcut.test(normalized)) {
+    return "storyboard";
+  }
+
+  const videoShortcut =
+    /(?:(?:\u7ed9\u6211|\u5e2e\u6211|\u6765(?:\u4e00|\u6761|\u6bb5)?|\u76f4\u63a5)?\s*(?:\u51fa\u7247|\u505a|\u751f\u6210|\u6e32\u67d3|\u51fa(?:\u4e00|\u4e2a)?)\s*(?:\u4e00(?:\u6761|\u6bb5|\u4e2a)|\u51e0(?:\u6761|\u6bb5))?\s*(?:\u89c6\u9891|\u77ed\u89c6\u9891|\u9884\u544a\u7247|trailer|video)|(?:\u89c6\u9891|\u77ed\u89c6\u9891|\u9884\u544a\u7247|trailer)(?:\s*(?:\u7ed9\u6211|\u6765(?:\u4e00|\u6761|\u6bb5)?|\u51fa(?:\u4e00|\u4e2a)?))|(?:\u56fe\u751f\u89c6\u9891|\u6587\u751f\u89c6\u9891|image-to-video|text-to-video))$/i;
+  if (videoShortcut.test(normalized)) {
+    return "video";
+  }
+
+  const imageShortcut =
+    /(?:(?:\u7ed9\u6211|\u5e2e\u6211|\u6765(?:\u4e00|\u5f20)?|\u76f4\u63a5)?\s*(?:\u751f\u6210|\u753b|\u505a|\u6574|\u51fa)\s*(?:\u4e00(?:\u4e2a|\u5f20|\u7ec4|\u5957)|\u51e0(?:\u4e2a|\u5f20|\u7ec4))?\s*(?:\u56fe(?:\u7247)?|\u56fe\u50cf|\u63d2\u753b|image|picture|photo|illustration)|(?:\u7ed9\u6211|\u6765)(?:\u4e00|\u51e0)?(?:\u4e2a|\u5f20)?\s*(?:\u56fe(?:\u7247)?|\u5c01\u9762|\u6d77\u62a5|\u89d2\u8272\u6982\u5ff5\u56fe|\u573a\u666f\u53c2\u8003\u56fe)|(?:\u751f\u56fe))$/i;
+  return imageShortcut.test(normalized) ? "image" : null;
+}
+
 export function appendTextOverlayToInput(prompt: MessageInput, overlay: string): MessageInput {
   const normalizedOverlay = overlay.trim();
   if (!normalizedOverlay) return prompt;
@@ -554,6 +668,10 @@ export async function applyConversationMemoryOverlay(params: {
     flashMaintenanceHint,
   } = params;
 
+  if (runtime.suppressHistoricalMemory) {
+    return promptForEngine;
+  }
+
   try {
     const memoryModule = await loadConversationMemoryModule();
     let memoryRuntime = runtime;
@@ -596,49 +714,6 @@ export async function applyConversationMemoryOverlay(params: {
   }
 }
 
-export async function applyDreaminaContextOverlay(params: {
-  cleaned: string;
-  promptForEngine: string;
-  currentProjectSnapshot: ConversationProjectSnapshot | null;
-  dreaminaCapability: DreaminaCapabilityState;
-  resolveDreaminaCapability: () => Promise<DreaminaCapabilityState>;
-  isVideoIntentPrompt: (prompt: string, snapshot?: ConversationProjectSnapshot | null) => boolean;
-  buildDreaminaCapabilityOverlay: (message?: string) => string;
-  flashMaintenanceHint: (message: string, duration?: number) => void;
-  hasSurfacedHint: boolean;
-}): Promise<{ promptForEngine: string; surfacedHint: boolean }> {
-  const {
-    cleaned,
-    promptForEngine,
-    currentProjectSnapshot,
-    dreaminaCapability,
-    resolveDreaminaCapability,
-    isVideoIntentPrompt,
-    buildDreaminaCapabilityOverlay,
-    flashMaintenanceHint,
-    hasSurfacedHint,
-  } = params;
-
-  const shouldUseDreaminaContext = isVideoIntentPrompt(cleaned, currentProjectSnapshot);
-  const currentDreaminaCapability = shouldUseDreaminaContext ? await resolveDreaminaCapability() : dreaminaCapability;
-
-  if (!currentDreaminaCapability.available || !shouldUseDreaminaContext) {
-    return {
-      promptForEngine,
-      surfacedHint: hasSurfacedHint,
-    };
-  }
-
-  if (!hasSurfacedHint) {
-    flashMaintenanceHint("已接入 Dreamina CLI，可直接使用 Seedance 2.0", 2200);
-  }
-
-  return {
-    promptForEngine: `${promptForEngine}\n\n${buildDreaminaCapabilityOverlay(currentDreaminaCapability.message)}`,
-    surfacedHint: true,
-  };
-}
-
 type LearningOverlayModuleLike = typeof import("@/lib/home-agent/agent-learning-overlay");
 
 export async function applyAllOverlaysParallel(params: {
@@ -652,13 +727,8 @@ export async function applyAllOverlaysParallel(params: {
   readProjectSession: (projectId: string) => StudioSessionState | null;
   flashMaintenanceHint: (message: string, duration?: number) => void;
   currentProjectSnapshot: ConversationProjectSnapshot | null;
-  dreaminaCapability: DreaminaCapabilityState;
-  resolveDreaminaCapability: () => Promise<DreaminaCapabilityState>;
-  isVideoIntentPrompt: (prompt: string, snapshot?: ConversationProjectSnapshot | null) => boolean;
-  buildDreaminaCapabilityOverlay: (message?: string) => string;
-  hasSurfacedHint: boolean;
   loadLearningOverlayModule?: () => Promise<LearningOverlayModuleLike>;
-}): Promise<{ promptForEngine: string; surfacedHint: boolean }> {
+}): Promise<{ promptForEngine: string }> {
   const {
     cleaned,
     launchAutoResearchTasks,
@@ -670,20 +740,16 @@ export async function applyAllOverlaysParallel(params: {
     readProjectSession,
     flashMaintenanceHint,
     currentProjectSnapshot,
-    dreaminaCapability,
-    resolveDreaminaCapability,
-    isVideoIntentPrompt,
-    buildDreaminaCapabilityOverlay,
-    hasSurfacedHint,
     loadLearningOverlayModule,
   } = params;
 
-  const shouldUseDreaminaContext = isVideoIntentPrompt(cleaned, currentProjectSnapshot);
-
   // 四路并行：研究任务、记忆检索、Dreamina 能力检查、学习记忆注入
-  const [researchResult, memoryData, dreaminaCapabilityResult, learningOverlay] = await Promise.all([
+  const allowHistoricalMemory = !runtime.suppressHistoricalMemory;
+  const [researchResult, memoryData, learningOverlay] = await Promise.all([
     launchAutoResearchTasks(cleaned).catch(() => null),
-    (async () => {
+    !allowHistoricalMemory
+      ? Promise.resolve(null)
+      : (async () => {
       try {
         const memoryModule = await loadConversationMemoryModule();
         let memoryRuntime = runtime;
@@ -715,10 +781,7 @@ export async function applyAllOverlaysParallel(params: {
         };
       } catch { return null; }
     })(),
-    shouldUseDreaminaContext
-      ? resolveDreaminaCapability().catch(() => dreaminaCapability)
-      : Promise.resolve(dreaminaCapability),
-    loadLearningOverlayModule
+    allowHistoricalMemory && loadLearningOverlayModule
       ? (async () => {
           try {
             const mod = await loadLearningOverlayModule();
@@ -738,19 +801,11 @@ export async function applyAllOverlaysParallel(params: {
     flashMaintenanceHint(memoryData.hint, 1800);
     promptForEngine = `${promptForEngine}\n\n${memoryData.prompt}`;
   }
-  let surfacedHint = hasSurfacedHint;
-  if (dreaminaCapabilityResult?.available && shouldUseDreaminaContext) {
-    if (!hasSurfacedHint) {
-      flashMaintenanceHint("已接入 Dreamina CLI，可直接使用 Seedance 2.0", 2200);
-    }
-    promptForEngine = `${promptForEngine}\n\n${buildDreaminaCapabilityOverlay(dreaminaCapabilityResult.message)}`;
-    surfacedHint = true;
-  }
   if (learningOverlay) {
     promptForEngine = `${promptForEngine}\n\n${learningOverlay}`;
   }
 
-  return { promptForEngine, surfacedHint };
+  return { promptForEngine };
 }
 
 /**
@@ -760,48 +815,124 @@ export async function applyAllOverlaysParallel(params: {
 export function formatAskUserQuestionFallback(args: AskUserQuestionRequest): string {
   const parts: string[] = [];
 
-  if (args.title) parts.push(args.title);
+  if (args.title) parts.push(args.title.trim());
+  if (args.description?.trim()) parts.push(args.description.trim());
 
   for (const q of args.questions) {
     const block: string[] = [];
     // 多问题时每个问题单独显示标题；单问题且已有 title 时不重复
-    if (args.questions.length > 1 || !args.title) {
-      block.push(q.question);
+    const questionText = q.question?.trim();
+    if (
+      questionText &&
+      normalizeWorkflowFallbackLine(questionText) !== normalizeWorkflowFallbackLine(args.title)
+    ) {
+      block.push(questionText);
     }
     for (const option of q.options) {
-      block.push(`- ${option.label}`);
+      const detail = option.rationale?.trim() || option.description?.trim();
+      block.push(detail ? `- ${option.label}：${detail}` : `- ${option.label}`);
     }
     if (block.length) parts.push(block.join("\n"));
   }
 
+  parts.push(buildAskUserQuestionClosingSuggestion(args));
   return parts.filter(Boolean).join("\n\n");
+}
+
+function normalizeWorkflowFallbackLine(value: string | null | undefined): string {
+  return String(value || "").trim().replace(/\s+/g, "");
+}
+
+function buildAskUserQuestionClosingSuggestion(args: AskUserQuestionRequest): string {
+  if (args.questions.length > 1) {
+    return args.allowCustomInput
+      ? "下一步建议：先完成当前这一步；如果上面的选项都不完全合适，再直接补充你的具体偏好。"
+      : "下一步建议：先完成当前这一步，我会在你确认后继续下一项。";
+  }
+
+  return args.allowCustomInput
+    ? "下一步建议：优先选择最贴近当前步骤的一项；如果都不完全合适，再直接补充你的具体偏好。"
+    : "下一步建议：优先选择最贴近当前步骤的一项，我会据此继续推进。";
+}
+
+function formatAskUserQuestionPromptOnly(args: AskUserQuestionRequest | null | undefined): string {
+  if (!args?.questions?.length) return "";
+
+  const parts: string[] = [];
+  if (args.title) parts.push(args.title);
+  for (const question of args.questions) {
+    const text = question.question?.trim();
+    if (text) parts.push(text);
+  }
+  return parts.join("\n\n").trim();
+}
+
+function mergeAssistantQuestionFallbackText(
+  baseText: string,
+  request: AskUserQuestionRequest | null | undefined,
+): string {
+  if (!request?.questions?.length) return baseText.trim();
+
+  const fallbackText = formatAskUserQuestionFallback(request).trim();
+  if (!fallbackText) return baseText.trim();
+
+  const cleanedBase = baseText.trim();
+  if (!cleanedBase) return fallbackText;
+
+  const normalizedBase = normalizeWorkflowFallbackLine(cleanedBase);
+  const questionTexts = request.questions
+    .map((question) => question.question?.trim())
+    .filter((question): question is string => Boolean(question));
+  const optionLabels = request.questions.flatMap((question) =>
+    question.options.map((option) => option.label.trim()).filter(Boolean),
+  );
+  const hasQuestionText = questionTexts.some((question) =>
+    normalizedBase.includes(normalizeWorkflowFallbackLine(question)),
+  );
+  const optionLabelHits = optionLabels.filter((label) =>
+    normalizedBase.includes(normalizeWorkflowFallbackLine(label)),
+  ).length;
+
+  if (hasQuestionText && optionLabelHits >= Math.min(2, optionLabels.length)) {
+    return cleanedBase;
+  }
+
+  return `${cleanedBase}\n\n${fallbackText}`.trim();
 }
 
 export async function handleSendEngineEvent(params: {
   event: SDKMessage;
   loadStructuredQuestionParser: () => Promise<StructuredQuestionParserModuleLike>;
+  getCurrentProjectSnapshot?: () => ConversationProjectSnapshot | null | undefined;
   textOf: (content: unknown) => string;
   push: PushMessage;
   appendStreamingDelta: (delta: string) => void;
   updateStreamingLabel: (label?: string) => void;
+  replaceStreamingWithProgressLabel?: (label?: string) => void;
   finalizeStreamingMessage: (
     finalText?: string,
     artifactIds?: string[],
     artifactSnapshots?: ConversationArtifact[],
   ) => void;
-  setQuestionRequest: (request: AskUserQuestionRequest) => void;
+  setQuestionRequest?: (request: AskUserQuestionRequest) => void;
   consumePendingArtifacts?: () => ConversationArtifact[] | undefined;
+  consumePendingArtifactIds?: () => string[] | undefined;
+  getFallbackQuestionRequest?: () => AskUserQuestionRequest | null | undefined;
 }): Promise<void> {
   const {
     event,
     loadStructuredQuestionParser,
+    getCurrentProjectSnapshot,
     textOf,
     push,
     appendStreamingDelta,
     updateStreamingLabel,
+    replaceStreamingWithProgressLabel,
     finalizeStreamingMessage,
     setQuestionRequest,
     consumePendingArtifacts,
+    consumePendingArtifactIds,
+    getFallbackQuestionRequest,
   } = params;
 
   if (event.type === 'text_delta') {
@@ -821,7 +952,12 @@ export async function handleSendEngineEvent(params: {
       // AskUserQuestion 工具调用：落地已流式输出的文本；问题文本由 agent:ask-user-question 事件监听器追加
       finalizeStreamingMessage();
     } else {
-      updateStreamingLabel(textOf(event.message.content) || "继续分析中");
+      const label = textOf(event.message.content) || "继续分析中";
+      if (replaceStreamingWithProgressLabel) {
+        replaceStreamingWithProgressLabel(label);
+      } else {
+        updateStreamingLabel(label);
+      }
     }
     return;
   }
@@ -829,22 +965,55 @@ export async function handleSendEngineEvent(params: {
   if (event.type === "assistant") {
     const parser = await loadStructuredQuestionParser();
     const parsed = parser.extractStructuredQuestion(textOf(event.message.message.content));
+    const fallbackRequest =
+      !parsed.request && !parsed.workflowCall ? getFallbackQuestionRequest?.() ?? null : null;
     const cleanedText = parsed.cleanedText.trim();
-    const consumedStructuredPayload = Boolean(parsed.request || parsed.workflowCall);
+    const consumedStructuredPayload = Boolean(parsed.request || parsed.workflowCall || fallbackRequest);
+    const textFallbackRequest = parsed.request ?? fallbackRequest;
     const pendingArtifacts = consumePendingArtifacts?.();
-    const pendingArtifactIds = pendingArtifacts?.map((artifact) => artifact.id);
-    const finalText = consumedStructuredPayload ? cleanedText : cleanedText || undefined;
+    const pendingArtifactIds =
+      pendingArtifacts?.map((artifact) => artifact.id) ?? consumePendingArtifactIds?.();
+    const finalText = consumedStructuredPayload
+      ? mergeAssistantQuestionFallbackText(cleanedText, textFallbackRequest) || undefined
+      : cleanedText || undefined;
     if (pendingArtifactIds?.length) {
       finalizeStreamingMessage(finalText, pendingArtifactIds, pendingArtifacts);
     } else {
       finalizeStreamingMessage(finalText);
     }
-    if (parsed.request) setQuestionRequest(parsed.request);
+    if (parsed.request) {
+      setQuestionRequest?.(parsed.request);
+    } else if (fallbackRequest) {
+      setQuestionRequest?.(fallbackRequest);
+    }
     return;
   }
 
   if (event.type === "result" && event.isError && event.result) {
     finalizeStreamingMessage();
-    push("assistant", event.result);
+    push("assistant", formatSendError(event.result));
   }
+}
+
+export function formatSendError(error: unknown): string {
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  if (
+    (error instanceof Error && error.name === "AbortError") ||
+    msg.includes("timeout") ||
+    msg.includes("timed out") ||
+    msg.includes("超时")
+  ) {
+    return "分析超时，请稍后重试。";
+  }
+  if (
+    msg.includes("network") ||
+    msg.includes("failed to fetch") ||
+    msg.includes("fetch") ||
+    msg.includes("connection") ||
+    msg.includes("net::") ||
+    msg.includes("网络")
+  ) {
+    return "网络连接异常，请检查网络后重试。";
+  }
+  return "分析出错，请稍后重试。";
 }

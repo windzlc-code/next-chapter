@@ -1,14 +1,12 @@
 import * as React from "react";
 import { getAllTasks, type Task } from "@/lib/agent/tools/task-tools";
 import type { ConversationProjectSnapshot, StudioRuntimeState, StudioSessionState } from "@/lib/home-agent/types";
+import { hasSessionResetMarkerForProject } from "@/lib/home-agent/session-store";
+import { resolveSessionProjectIdForSnapshot } from "./home-agent-session-utils";
 
 const { useEffect, useRef } = React;
-
-type DreaminaCapabilityState = {
-  ready: boolean;
-  available: boolean;
-  message?: string;
-};
+const INITIAL_RECENT_PROJECTS_LIMIT = 24;
+const FULL_RECENT_PROJECTS_LIMIT = 160;
 
 export function useHomeAgentBootstrapEffects(params: {
   runtime: StudioRuntimeState;
@@ -17,8 +15,7 @@ export function useHomeAgentBootstrapEffects(params: {
   messages: Array<{ id: string; role: string; content: string; createdAt: string; status?: string; streamLabel?: string }>;
   compactedMessageCount: number;
   desktopSidebarCollapsed: boolean;
-  dreaminaCapability: DreaminaCapabilityState;
-  maintenanceHintTimerRef: React.MutableRefObject<number | null>;
+  maintenanceHintTimerRef: React.MutableRefObject<Map<string, number>>;
   draftPersistTimerRef: React.MutableRefObject<number | null>;
   messagesRef: React.MutableRefObject<Array<{ id: string; role: string; content: string; createdAt: string; status?: string; streamLabel?: string }>>;
   compactedMessageCountRef: React.MutableRefObject<number>;
@@ -26,18 +23,17 @@ export function useHomeAgentBootstrapEffects(params: {
   surfacedTaskFollowupIdsRef: React.MutableRefObject<Set<string>>;
   surfacedProjectSuggestionKeysRef: React.MutableRefObject<Set<string>>;
   restoredProjectSuggestionKeysRef: React.MutableRefObject<Set<string>>;
-  surfacedDreaminaHintRef: React.MutableRefObject<boolean>;
   setRuntime: React.Dispatch<React.SetStateAction<StudioRuntimeState>>;
   setRecentProjectsReady: React.Dispatch<React.SetStateAction<boolean>>;
   setMetaReady: React.Dispatch<React.SetStateAction<boolean>>;
   setActiveProjectId: React.Dispatch<React.SetStateAction<string | undefined>>;
+  activeProjectId?: string;
   setTasks: React.Dispatch<React.SetStateAction<Task[]>>;
   loadProjectStore: () => Promise<{
     listRecentConversationSnapshots(limit?: number, options?: { fast?: boolean }): Promise<ConversationProjectSnapshot[]>;
     readSkillDrafts(): StudioRuntimeState["skillDrafts"];
     readMaintenanceReports(): StudioRuntimeState["maintenanceReports"];
   }>;
-  resolveDreaminaCapability: () => Promise<DreaminaCapabilityState>;
   flashMaintenanceHint: (message: string, duration?: number) => void;
   scheduleBackgroundTask: (task: () => void, timeout?: number) => () => void;
   areProjectSnapshotsEquivalent: (
@@ -53,12 +49,10 @@ export function useHomeAgentBootstrapEffects(params: {
 }) {
   const {
     runtime,
-    mode,
     metaReady,
     messages,
     compactedMessageCount,
     desktopSidebarCollapsed,
-    dreaminaCapability,
     maintenanceHintTimerRef,
     draftPersistTimerRef,
     messagesRef,
@@ -67,15 +61,13 @@ export function useHomeAgentBootstrapEffects(params: {
     surfacedTaskFollowupIdsRef,
     surfacedProjectSuggestionKeysRef,
     restoredProjectSuggestionKeysRef,
-    surfacedDreaminaHintRef,
     setRuntime,
     setRecentProjectsReady,
     setMetaReady,
     setActiveProjectId,
+    activeProjectId,
     setTasks,
     loadProjectStore,
-    resolveDreaminaCapability,
-    flashMaintenanceHint,
     scheduleBackgroundTask,
     areProjectSnapshotsEquivalent,
     areRecentSessionsEquivalent,
@@ -87,9 +79,12 @@ export function useHomeAgentBootstrapEffects(params: {
 
   useEffect(
     () => () => {
-      if (maintenanceHintTimerRef.current && typeof window !== "undefined") {
-        window.clearTimeout(maintenanceHintTimerRef.current);
+      if (typeof window !== "undefined") {
+        for (const timer of maintenanceHintTimerRef.current.values()) {
+          window.clearTimeout(timer);
+        }
       }
+      maintenanceHintTimerRef.current.clear();
       if (draftPersistTimerRef.current && typeof window !== "undefined") {
         window.clearTimeout(draftPersistTimerRef.current);
       }
@@ -130,36 +125,64 @@ export function useHomeAgentBootstrapEffects(params: {
 
   useEffect(() => {
     let cancelled = false;
+    let cancelFollowupTask = () => {};
 
-    const hydrateRecentProjects = async () => {
-      try {
-        const store = await loadProjectStore();
-        // 加载前先执行自动剪枝（若开关开启且超出上限）
-        const items = await store.listRecentConversationSnapshots(16, { fast: true });
-        if (cancelled) return;
-        React.startTransition(() => {
-          setRuntime((prev) => {
-            if (areProjectSnapshotsEquivalent(items, prev.recentProjects)) {
-              return prev;
-            }
+    const commitRecentProjects = (items: ConversationProjectSnapshot[], markReady: boolean) => {
+      if (cancelled) return;
+      React.startTransition(() => {
+        setRuntime((prev) => {
+          const shouldPreserveRicherList =
+            prev.recentProjects.length > items.length &&
+            items.every((item) => prev.recentProjects.some((project) => project.projectId === item.projectId));
+          if (shouldPreserveRicherList) {
+            return prev;
+          }
+          if (areProjectSnapshotsEquivalent(items, prev.recentProjects)) {
+            return prev;
+          }
 
-            return { ...prev, recentProjects: items };
-          });
-          setRecentProjectsReady(true);
+          return { ...prev, recentProjects: items };
         });
+        if (markReady) {
+          setRecentProjectsReady(true);
+        }
+      });
+    };
+
+    const hydrateRecentProjects = async (
+      store: Awaited<ReturnType<typeof loadProjectStore>>,
+      limit: number,
+      markReady: boolean,
+    ) => {
+      try {
+        const items = (await store.listRecentConversationSnapshots(limit, { fast: true })).filter(
+          (item) => item.projectId && !hasSessionResetMarkerForProject(item.projectId),
+        );
+        commitRecentProjects(items, markReady);
+        return items.length;
       } catch {
         if (cancelled) return;
-        setRecentProjectsReady(true);
+        if (markReady) {
+          setRecentProjectsReady(true);
+        }
+        return 0;
       }
     };
 
     const cancelTask = scheduleBackgroundTask(() => {
-      void hydrateRecentProjects();
+      void loadProjectStore().then(async (store) => {
+        const initialCount = await hydrateRecentProjects(store, INITIAL_RECENT_PROJECTS_LIMIT, true);
+        if (cancelled || initialCount < INITIAL_RECENT_PROJECTS_LIMIT) return;
+        cancelFollowupTask = scheduleBackgroundTask(() => {
+          void hydrateRecentProjects(store, FULL_RECENT_PROJECTS_LIMIT, false);
+        }, 1600);
+      });
     });
 
     return () => {
       cancelled = true;
       cancelTask();
+      cancelFollowupTask();
     };
   }, [
     areProjectSnapshotsEquivalent,
@@ -200,37 +223,21 @@ export function useHomeAgentBootstrapEffects(params: {
   }, [loadProjectStore, metaReady, scheduleBackgroundTask, setMetaReady, setRuntime]);
 
   useEffect(() => {
-    if (runtime.currentProjectSnapshot?.projectId) {
-      setActiveProjectId(runtime.currentProjectSnapshot.projectId);
+    const nextSessionProjectId = resolveSessionProjectIdForSnapshot({
+      currentSessionProjectId: activeProjectId,
+      snapshot: runtime.currentProjectSnapshot,
+      fallbackProjectId: runtime.currentProjectSnapshot?.projectId,
+    });
+    if (nextSessionProjectId) {
+      setActiveProjectId(nextSessionProjectId);
     }
-  }, [runtime.currentProjectSnapshot?.projectId, setActiveProjectId]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const cancelTask = scheduleBackgroundTask(() => {
-      void resolveDreaminaCapability().then(() => {
-        if (cancelled) return;
-      });
-    }, 900);
-
-    return () => {
-      cancelled = true;
-      cancelTask();
-    };
-  }, [resolveDreaminaCapability, scheduleBackgroundTask]);
-
-  useEffect(() => {
-    if (
-      !dreaminaCapability.available ||
-      surfacedDreaminaHintRef.current ||
-      runtime.currentProjectSnapshot?.projectKind !== "video"
-    ) {
-      return;
-    }
-
-    surfacedDreaminaHintRef.current = true;
-    flashMaintenanceHint("已接入 Dreamina CLI，可直接使用 Seedance 2.0", 2400);
-  }, [dreaminaCapability.available, flashMaintenanceHint, runtime.currentProjectSnapshot?.projectKind, surfacedDreaminaHintRef]);
+  }, [
+    activeProjectId,
+    runtime.currentProjectSnapshot?.projectId,
+    runtime.currentProjectSnapshot?.projectKind,
+    runtime.currentProjectSnapshot?.sourceProjectId,
+    setActiveProjectId,
+  ]);
 
   useEffect(() => {
     const syncTasks = () => {

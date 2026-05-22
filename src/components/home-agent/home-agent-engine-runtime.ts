@@ -113,9 +113,19 @@ export async function launchHomeAgentAutoResearchTasks(params: {
   selectedTextModelKey: string;
   planOverride?: ReturnType<typeof buildAutoResearchPlan>;
   taskIdFilter?: string[];
+  taskPromptPrefix?: string;
   sequential?: boolean;
 }): Promise<{ plan?: ReturnType<typeof buildAutoResearchPlan>; taskIds: string[] } | null> {
-  const { prompt, runtime, loadApiConfigModule, selectedTextModelKey, planOverride, taskIdFilter, sequential } = params;
+  const {
+    prompt,
+    runtime,
+    loadApiConfigModule,
+    selectedTextModelKey,
+    planOverride,
+    taskIdFilter,
+    taskPromptPrefix,
+    sequential,
+  } = params;
   const plan = planOverride ?? buildAutoResearchPlan(prompt, runtime.currentProjectSnapshot);
   if (!plan) return null;
   // 改编研究（改编路线/受众适配/角色重塑）暂时隐藏，不触发后台任务
@@ -154,7 +164,7 @@ export async function launchHomeAgentAutoResearchTasks(params: {
   const runTask = async (task: (typeof targetTasks)[number]) =>
     tool.call(
       {
-        prompt: task.prompt,
+        prompt: `${taskPromptPrefix || ""}${task.prompt}`,
         description: `并行研究 ${task.title}`,
         session_id: runtime.sessionId,
         project_id: runtime.currentProjectSnapshot?.projectId,

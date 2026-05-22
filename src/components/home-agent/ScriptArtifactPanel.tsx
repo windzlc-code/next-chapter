@@ -42,7 +42,8 @@ import type {
   ConversationArtifactEditorField,
   ConversationProjectSnapshot,
 } from "@/lib/home-agent/types";
-import type { ComplianceWorkspaceRiskPhrase } from "@/types/drama";
+import { resolveScriptWorkflowStage } from "./home-agent-project-questions";
+import type { ComplianceRevisionPacket, ComplianceWorkspaceRiskPhrase } from "@/types/drama";
 import { cn } from "@/lib/utils";
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
@@ -172,6 +173,33 @@ const PRIMARY_KINDS = new Set([
   "compliance",
   "export",
 ]);
+
+function isVideoScriptArtifact(artifact: ConversationArtifact): boolean {
+  return artifact.kind === "plan" && artifact.label.trim() === "视频脚本";
+}
+
+function resolveVisibleVideoArtifactStage(
+  stage: string | null | undefined,
+): "脚本拆解" | "角色与场景" | "分镜图生成" | "视频生成" | "预览与导出" {
+  switch (String(stage || "").trim()) {
+    case "角色与场景":
+      return "角色与场景";
+    case "分镜图生成":
+    case "分镜批次":
+    case "镜头指令包":
+      return "分镜图生成";
+    case "视频生成":
+    case "视频提示词":
+    case "生成中":
+      return "视频生成";
+    case "预览与导出":
+    case "审阅与修复":
+      return "预览与导出";
+    case "脚本拆解":
+    default:
+      return "脚本拆解";
+  }
+}
 
 const DIMENSION_LABELS: Record<string, string> = {
   rhythm: "节奏",
@@ -1385,7 +1413,21 @@ function getEditableArtifactText(artifact: ConversationArtifact): string {
 
 type ComplianceSummaryTab = "report" | "palette";
 
-type AnnotatedSegment = { text: string; level: "red" | "high" | "info" | null; status: "resolved" | "pending" | null };
+const DIALOGUE_REVIEW_MARKER = "【对话审查】";
+
+type AnnotatedSegment = {
+  text: string;
+  level: "red" | "high" | "info" | null;
+  status: "resolved" | "pending" | null;
+  dialogueReview?: boolean;
+};
+
+type ComplianceRepairRecord = {
+  id: string;
+  level: "red" | "high" | "info";
+  originalText: string;
+  replacement?: string;
+};
 
 function buildPaletteAnnotations(text: string, riskPhrases: ComplianceWorkspaceRiskPhrase[]): AnnotatedSegment[] {
   type Span = { start: number; end: number; level: "red" | "high" | "info"; status: "resolved" | "pending" };
@@ -1419,11 +1461,80 @@ function buildPaletteAnnotations(text: string, riskPhrases: ComplianceWorkspaceR
   return segments;
 }
 
+function splitDialogueReviewSegments(segments: AnnotatedSegment[]): AnnotatedSegment[] {
+  return segments.flatMap((segment) => {
+    if (!segment.text.includes(DIALOGUE_REVIEW_MARKER)) return [segment];
+    const pieces: AnnotatedSegment[] = [];
+    let remaining = segment.text;
+    while (remaining.length > 0) {
+      const markerIndex = remaining.indexOf(DIALOGUE_REVIEW_MARKER);
+      if (markerIndex < 0) {
+        pieces.push({ ...segment, text: remaining });
+        break;
+      }
+      if (markerIndex > 0) {
+        pieces.push({ ...segment, text: remaining.slice(0, markerIndex) });
+      }
+      pieces.push({
+        ...segment,
+        text: DIALOGUE_REVIEW_MARKER,
+        dialogueReview: true,
+      });
+      remaining = remaining.slice(markerIndex + DIALOGUE_REVIEW_MARKER.length);
+    }
+    return pieces;
+  });
+}
+
+function buildComplianceRepairRecords(
+  packets: ComplianceRevisionPacket[],
+  riskPhrases: ComplianceWorkspaceRiskPhrase[],
+): ComplianceRepairRecord[] {
+  const packetRecords = packets
+    .filter((packet) => packet.status === "resolved")
+    .map<ComplianceRepairRecord | null>((packet) => {
+      const originalText = packet.originalSnippet ?? packet.sourceQuote ?? packet.issueTitle;
+      if (!originalText?.trim()) return null;
+      return {
+        id: packet.id,
+        level:
+          packet.riskLevel === "high"
+            ? "red"
+            : packet.riskLevel === "medium"
+              ? "high"
+              : "info",
+        originalText,
+        replacement: packet.replacement?.trim() || undefined,
+      };
+    })
+    .filter((record): record is ComplianceRepairRecord => Boolean(record));
+  if (packetRecords.length) return packetRecords;
+  return riskPhrases
+    .filter((phrase) => phrase.status === "resolved")
+    .map((phrase) => ({
+      id: phrase.id,
+      level: phrase.level,
+      originalText: phrase.text,
+      replacement: phrase.replacement?.trim() || undefined,
+    }));
+}
+
 function PaletteAnnotated({ text, riskPhrases }: { text: string; riskPhrases: ComplianceWorkspaceRiskPhrase[] }) {
-  const segments = buildPaletteAnnotations(text, riskPhrases);
+  const segments = splitDialogueReviewSegments(buildPaletteAnnotations(text, riskPhrases));
   return (
     <p className="whitespace-pre-wrap text-xs leading-relaxed text-foreground/70">
       {segments.map((seg, i) => {
+        if (seg.dialogueReview) {
+          return (
+            <span
+              key={i}
+              className="font-medium text-sky-700 dark:text-sky-300"
+              title="对话审查"
+            >
+              {seg.text}
+            </span>
+          );
+        }
         if (!seg.level) return <React.Fragment key={i}>{seg.text}</React.Fragment>;
         const colorClass =
           seg.status === "resolved"
@@ -1447,6 +1558,11 @@ function ComplianceSummaryContent({
   onArtifactAction?: (value: string, label: string, input?: Record<string, unknown>) => void;
 }) {
   const hasPalette = Boolean(payload.workspace.paletteText.trim());
+  const hasDialogueReviewMarkers = payload.workspace.paletteText.includes(DIALOGUE_REVIEW_MARKER);
+  const repairRecords = useMemo(
+    () => buildComplianceRepairRecords(payload.packets, payload.workspace.riskPhrases),
+    [payload.packets, payload.workspace.riskPhrases],
+  );
   const [activeTab, setActiveTab] = useState<ComplianceSummaryTab>("report");
 
   return (
@@ -1512,17 +1628,73 @@ function ComplianceSummaryContent({
           ) : null}
           {activeTab === "palette" && hasPalette ? (
             <div className="space-y-3">
-              {payload.workspace.riskPhrases.length > 0 ? (
+              {payload.workspace.riskPhrases.length > 0 || hasDialogueReviewMarkers ? (
                 <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
                   <span><span className="text-red-600 dark:text-red-400">▬</span> 红线</span>
                   <span><span className="text-orange-600 dark:text-orange-400">▬</span> 高风险</span>
                   <span><span className="text-yellow-600 dark:text-yellow-400">▬</span> 提示</span>
                   <span><span className="text-emerald-600 dark:text-emerald-400">▬</span> 已改写</span>
+                  <span><span className="text-sky-600 dark:text-sky-400">▬</span> 对话审查</span>
                 </div>
               ) : null}
               <PaletteAnnotated text={payload.workspace.paletteText} riskPhrases={payload.workspace.riskPhrases} />
             </div>
           ) : null}
+        </div>
+      ) : null}
+      {repairRecords.length ? (
+        <div className="space-y-2 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] p-3">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-300">
+              修复记录
+            </span>
+            <span className="text-[11px] text-emerald-700/80 dark:text-emerald-300/80">
+              {repairRecords.length} 条
+            </span>
+          </div>
+          <div className="space-y-2">
+            {repairRecords.map((record) => {
+              const levelLabel =
+                record.level === "red"
+                  ? "红线"
+                  : record.level === "high"
+                    ? "高风险"
+                    : "提示";
+              const levelClass =
+                record.level === "red"
+                  ? "text-red-700 dark:text-red-300"
+                  : record.level === "high"
+                    ? "text-orange-700 dark:text-orange-300"
+                    : "text-yellow-700 dark:text-yellow-300";
+              return (
+                <div
+                  key={record.id}
+                  className="space-y-1 rounded-md border border-white/[0.08] bg-black/10 px-2.5 py-2"
+                >
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
+                    <span className={`font-medium ${levelClass}`}>{levelLabel}</span>
+                    <span className="text-emerald-700 dark:text-emerald-300">
+                      {record.replacement ? "已改写" : "已处理"}
+                    </span>
+                  </div>
+                  <p className="text-xs leading-relaxed text-foreground/70">
+                    <span className="text-muted-foreground">原文：</span>
+                    {record.originalText}
+                  </p>
+                  {record.replacement ? (
+                    <p className="text-xs leading-relaxed text-emerald-700 dark:text-emerald-300">
+                      <span className="text-muted-foreground dark:text-emerald-300/80">改写：</span>
+                      {record.replacement}
+                    </p>
+                  ) : (
+                    <p className="text-xs leading-relaxed text-muted-foreground">
+                      已标记为处理完成，当前风险不再进入待修列表。
+                    </p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
         </div>
       ) : null}
     </div>
@@ -2074,10 +2246,19 @@ export function ScriptArtifactPanel({
 
       const primaryArtifacts =
         snapshot?.artifacts.filter((artifact) => PRIMARY_KINDS.has(artifact.kind)) ?? [];
+      const workflowStage = snapshot ? resolveScriptWorkflowStage(snapshot.derivedStage) : null;
+      const videoStage =
+        snapshot?.projectKind === "video" ? resolveVisibleVideoArtifactStage(snapshot.derivedStage) : null;
+      const exportStageArtifacts =
+        workflowStage === "export" ? primaryArtifacts.filter((artifact) => artifact.kind === "export") : [];
       const hasDirectoryArtifact = primaryArtifacts.some((artifact) => artifact.kind === "directory");
       const hasRichEpisodePreview = primaryArtifacts.some((artifact) => isRichEpisodePreviewArtifact(artifact));
       const isOutlineStage =
         snapshot?.derivedStage === "单集细纲" || snapshot?.derivedStage === "生成单集细纲";
+
+      if (exportStageArtifacts.length) {
+        return exportStageArtifacts;
+      }
 
       return primaryArtifacts.filter((artifact) => {
         if (hasDirectoryArtifact && !isOutlineStage && isEmptyOutlinePlaceholderArtifact(artifact)) {
@@ -2085,6 +2266,10 @@ export function ScriptArtifactPanel({
         }
 
         if (hasRichEpisodePreview && artifact.kind === "episode" && !isRichEpisodePreviewArtifact(artifact)) {
+          return false;
+        }
+
+        if (videoStage && videoStage !== "脚本拆解" && isVideoScriptArtifact(artifact)) {
           return false;
         }
 

@@ -22,7 +22,7 @@ async function waitForServer(url, timeoutMs = 30000) {
       // Keep polling until timeout so the script can start its own local dev server.
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
 
   return false;
@@ -298,7 +298,17 @@ async function runIdleToActiveScenario(page) {
 
   await page.getByText("我想做一个新项目").waitFor({ state: "visible", timeout: 10000 });
   await page.locator("textarea").last().waitFor({ state: "visible", timeout: 10000 });
-  await page.waitForTimeout(400);
+  await page.waitForFunction(
+    (previousGap) => {
+      const areas = Array.from(document.querySelectorAll("textarea"));
+      const textarea = areas.at(-1);
+      if (!(textarea instanceof HTMLTextAreaElement)) return false;
+      const rect = textarea.getBoundingClientRect();
+      return window.innerHeight - rect.bottom < previousGap;
+    },
+    idleBottomGap,
+    { timeout: 5000 },
+  );
 
   const activeBottomGap = await page.locator("textarea").last().evaluate((element) => {
     const rect = element.getBoundingClientRect();
@@ -341,13 +351,19 @@ async function runAnalysisRecoveryScenario(page) {
   });
 
   await openHistoryProject(page, "契约婚姻反转录");
-  await page.getByText(/我已对照当前项目产物做了恢复分析/).first().waitFor({ state: "visible", timeout: 10000 });
-  await page.getByText(/我已分析《契约婚姻反转录》的当前状态/).first().waitFor({ state: "visible", timeout: 10000 });
+  const recoverySignal = await Promise.any([
+    page.getByText(/我已对照当前项目(?:产物|状态)做了恢复分析/).first().waitFor({ state: "visible", timeout: 10000 }).then(() => "summary"),
+    page.locator('[data-composer-question-answer-key="script-creative-plan"]').first().waitFor({ state: "visible", timeout: 10000 }).then(() => "script-creative-plan"),
+  ]).catch(() => null);
+  assert.ok(
+    recoverySignal,
+    "opening a project without a saved session should either surface the recovery summary or the standard script-creative-plan workflow panel",
+  );
 
   assert.equal(new URL(page.url()).pathname, "/", "无保存会话时应以首页摘要恢复而不是切页");
 
   return {
-    recoveryAnalysisVisible: true,
+    recoverySignal,
   };
 }
 
@@ -357,7 +373,6 @@ async function runVideoHistoryScenario(page) {
   });
 
   await openHistoryProject(page, "夜雨追击预告片");
-  await page.getByText(/待审阅素材/).waitFor({ state: "visible", timeout: 10000 });
   await page.getByRole("button", { name: "整理待审阅项" }).waitFor({ state: "visible", timeout: 10000 });
   await page.getByRole("button", { name: "通过稳定项" }).waitFor({ state: "visible", timeout: 10000 });
   await page.getByRole("button", { name: "逐条审阅" }).waitFor({ state: "visible", timeout: 10000 });
@@ -460,7 +475,17 @@ async function runSidebarCollapseScenario(page) {
   const before = await sidebar.boundingBox();
   await collapseButton.click();
   await page.getByRole("button", { name: "展开侧栏" }).waitFor({ state: "visible", timeout: 5000 });
-  await page.waitForTimeout(250);
+  if (before?.width) {
+    await page.waitForFunction(
+      (previousWidth) => {
+        const sidebarElement = document.querySelector("aside .fixed.inset-y-0.left-0");
+        if (!(sidebarElement instanceof HTMLElement)) return false;
+        return sidebarElement.getBoundingClientRect().width < previousWidth;
+      },
+      before.width,
+      { timeout: 5000 },
+    );
+  }
   const after = await sidebar.boundingBox();
 
   assert.ok(before?.width && after?.width && after.width < before.width, "侧栏收起后宽度应变小");

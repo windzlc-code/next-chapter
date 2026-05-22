@@ -1,4 +1,7 @@
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
 import http from "node:http";
+import path from "node:path";
 import { Readable } from "node:stream";
 import { URL } from "node:url";
 
@@ -9,14 +12,26 @@ const HOST = process.env.AI_PROXY_HOST || "127.0.0.1";
 const REQUEST_TIMEOUT_MS = Number(process.env.AI_PROXY_TIMEOUT_MS || 300000);
 const WORKFLOW_COOKIE_NAME = process.env.WORKFLOW_COOKIE_NAME || "workflow_token";
 const WORKFLOW_TASK_TIMEOUT_MS = Number(process.env.WORKFLOW_TASK_TIMEOUT_MS || 900000);
+const WORKFLOW_ASSET_ROOT = path.resolve(
+  process.env.WORKFLOW_ASSET_ROOT || path.join(process.cwd(), "server-data", "workflow-assets"),
+);
+const HOME_AGENT_SHARED_STATE_PATH = path.resolve(
+  process.env.HOME_AGENT_SHARED_STATE_PATH ||
+    path.join(process.cwd(), "server-data", "home-agent-shared-state.json"),
+);
+const HOME_AGENT_SHARED_STATE_LIMIT = Number(
+  process.env.HOME_AGENT_SHARED_STATE_LIMIT || 15 * 1024 * 1024,
+);
 const WORKFLOW_STORE = createWorkflowStore({
   storePath: process.env.WORKFLOW_STORE_PATH,
   maxTasks: Number(process.env.WORKFLOW_MAX_TASKS || 500),
 });
+const ACTIVE_WORKFLOW_TASKS = new Map();
 
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
-  "access-control-allow-headers": "content-type, x-workflow-token",
+  "access-control-allow-headers":
+    "content-type, x-workflow-token, anthropic-version, anthropic-beta, authorization, x-api-key",
   "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
 };
 
@@ -39,6 +54,18 @@ const PROVIDERS = {
   grok: {
     endpoint: process.env.GROK_ENDPOINT || "https://api.tu-zi.com/v1",
     apiKey: process.env.GROK_API_KEY || process.env.GEMINI_API_KEY || "",
+    authScheme: "Bearer",
+  },
+  aliyun: {
+    endpoint:
+      process.env.ALIYUN_ENDPOINT ||
+      "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis",
+    apiKey: process.env.ALIYUN_API_KEY || "",
+    authScheme: "Bearer",
+  },
+  runninghub: {
+    endpoint: process.env.RUNNINGHUB_ENDPOINT || "https://www.runninghub.cn",
+    apiKey: process.env.RUNNINGHUB_API_KEY || "",
     authScheme: "Bearer",
   },
   seedream: {
@@ -78,10 +105,26 @@ const PROVIDER_FIELD_MAP = {
   gpt: { endpoint: "gptEndpoint", apiKey: "gptKey" },
   claude: { endpoint: "claudeEndpoint", apiKey: "claudeKey" },
   grok: { endpoint: "grokEndpoint", apiKey: "grokKey" },
+  aliyun: { endpoint: "aliyunEndpoint", apiKey: "aliyunKey" },
+  runninghub: { endpoint: "runninghubEndpoint", apiKey: "runninghubKey" },
   seedream: { endpoint: "seedreamEndpoint", apiKey: "seedreamKey" },
   jimeng: { endpoint: "jimengEndpoint", apiKey: "jimengKey" },
   tuzi: { endpoint: "tuziEndpoint", apiKey: "tuziKey" },
 };
+
+const HOME_AGENT_SHARED_STORAGE_KEYS = new Set([
+  "storyforge-home-agent-session-v1",
+  "storyforge-home-agent-session-bootstrap-v1",
+  "storyforge-home-agent-project-sessions-v1",
+  "storyforge_projects",
+  "storyforge_drama_projects",
+  "storyforge_current_project",
+  "storyforge-home-agent-text-model-v1",
+  "storyforge-home-agent-image-prefs-v1",
+  "storyforge-home-agent-video-prefs-v1",
+  "storyforge-home-agent-automation-mode-v1",
+  "storyforge-home-agent-project-meta-v1",
+]);
 
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload);
@@ -102,6 +145,16 @@ function sendText(res, statusCode, text, extraHeaders = {}) {
     ...extraHeaders,
   });
   res.end(text);
+}
+
+function sendBuffer(res, statusCode, buffer, contentType, extraHeaders = {}) {
+  res.writeHead(statusCode, {
+    ...CORS_HEADERS,
+    "content-type": contentType,
+    "content-length": buffer.length,
+    ...extraHeaders,
+  });
+  res.end(buffer);
 }
 
 function toNodeStream(stream) {
@@ -167,12 +220,14 @@ function resolveProviderTarget(provider, session) {
   const endpoint =
     explicitProviderEndpoint ||
     base.endpoint ||
-    (provider === "gemini" ? sharedGeminiEndpoint : sharedGeminiEndpoint) ||
+    (provider === "aliyun" ? "" : sharedGeminiEndpoint) ||
     PROVIDERS.gemini.endpoint;
   let apiKey = String(config[fields.apiKey] || "").trim();
 
   if (!apiKey) {
-    if (provider === "jimeng" && isArkJimengEndpoint(endpoint)) {
+    if (provider === "aliyun" || provider === "runninghub") {
+      apiKey = base.apiKey;
+    } else if (provider === "jimeng" && isArkJimengEndpoint(endpoint)) {
       apiKey = base.apiKey;
     } else {
       apiKey = geminiKey || base.apiKey;
@@ -218,7 +273,9 @@ function buildUpstreamUrl(baseEndpoint, pathName = "", search = "") {
 function buildProxyUpstreamUrl(provider, requestUrl, session) {
   const target = resolveProviderTarget(provider, session);
   const suffix = requestUrl.pathname.replace(/^\/api\/proxy\/[^/]+/, "");
-  const pathName = suffix.startsWith("/") ? suffix : `/${suffix}`;
+  const pathName = suffix
+    ? (suffix.startsWith("/") ? suffix : `/${suffix}`)
+    : "";
   return {
     target,
     url: buildUpstreamUrl(target.endpoint, pathName, requestUrl.search || ""),
@@ -238,6 +295,7 @@ function copyResponseHeaders(upstream, res) {
   for (const [key, value] of upstream.headers.entries()) {
     if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue;
     if (key.toLowerCase() === "content-length") continue;
+    if (key.toLowerCase() === "content-encoding") continue;
     res.setHeader(key, value);
   }
 }
@@ -246,6 +304,123 @@ function buildPublicBaseUrl(req) {
   const protocol = String(req.headers["x-forwarded-proto"] || "http");
   const host = String(req.headers["x-forwarded-host"] || req.headers.host || "127.0.0.1");
   return `${protocol}://${host}`;
+}
+
+function trimSlashes(value) {
+  return String(value || "").trim().replace(/^\/+|\/+$/g, "");
+}
+
+function safeSegment(value, fallback = "file") {
+  const normalized = String(value || "")
+    .trim()
+    .replace(/[<>:"/\\|?*\x00-\x1f]+/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized || fallback;
+}
+
+function inferExtension(mimeType = "", fileName = "") {
+  const lowerMimeType = String(mimeType || "").toLowerCase();
+  const ext = path.extname(String(fileName || "").trim()).toLowerCase();
+  if (ext) return ext;
+  const map = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+    "application/json": ".json",
+  };
+  return map[lowerMimeType] || ".bin";
+}
+
+function inferContentType(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const map = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".pdf": "application/pdf",
+    ".json": "application/json; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+  };
+  return map[ext] || "application/octet-stream";
+}
+
+function parseDataUrl(input) {
+  const match = String(input || "").match(/^data:([^;]+);base64,(.+)$/i);
+  if (!match) return null;
+  return {
+    mimeType: match[1],
+    buffer: Buffer.from(match[2], "base64"),
+  };
+}
+
+async function ensureDir(dirPath) {
+  await fs.mkdir(dirPath, { recursive: true });
+}
+
+async function readJsonFileSafe(filePath, fallback) {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    return JSON.parse(raw);
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return fallback;
+    }
+    return fallback;
+  }
+}
+
+async function writeJsonFileAtomic(filePath, payload) {
+  await ensureDir(path.dirname(filePath));
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(tempPath, JSON.stringify(payload, null, 2), "utf8");
+  await fs.rename(tempPath, filePath);
+}
+
+function sanitizeHomeAgentSharedState(input) {
+  const rawStorage =
+    input?.storage && typeof input.storage === "object" && !Array.isArray(input.storage)
+      ? input.storage
+      : {};
+  const storage = {};
+  for (const [key, value] of Object.entries(rawStorage)) {
+    if (!HOME_AGENT_SHARED_STORAGE_KEYS.has(key)) continue;
+    if (typeof value !== "string") continue;
+    storage[key] = value;
+  }
+  const updatedAt =
+    typeof input?.updatedAt === "string" && input.updatedAt.trim()
+      ? input.updatedAt.trim()
+      : new Date().toISOString();
+  const clientId =
+    typeof input?.clientId === "string" && input.clientId.trim()
+      ? input.clientId.trim().slice(0, 120)
+      : "";
+  return {
+    version: 1,
+    updatedAt,
+    savedAt: new Date().toISOString(),
+    clientId,
+    storage,
+  };
+}
+
+function buildAssetUrl(req, sessionId, relativePath) {
+  return `${buildPublicBaseUrl(req)}/workflow-assets/${encodeURIComponent(sessionId)}/${relativePath
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/")}`;
 }
 
 async function readRequestBody(req, options = {}) {
@@ -307,7 +482,26 @@ function toSerializableHeaders(headers) {
   return next;
 }
 
-async function performWorkflowRequest(session, requestSpec) {
+function setActiveWorkflowTask(taskId, value) {
+  if (!taskId) return;
+  if (value) {
+    ACTIVE_WORKFLOW_TASKS.set(taskId, value);
+  } else {
+    ACTIVE_WORKFLOW_TASKS.delete(taskId);
+  }
+}
+
+function extractRemoteTaskId(result) {
+  return String(
+    result?.response?.body?.task_id ||
+      result?.response?.body?.id ||
+      result?.response?.body?.data?.id ||
+      result?.response?.body?.data?.task_id ||
+      "",
+  ).trim();
+}
+
+async function performWorkflowRequest(session, requestSpec, options = {}) {
   const provider = String(requestSpec.provider || "").trim();
   if (!PROVIDERS[provider]) {
     throw new Error(`Unsupported provider: ${provider}`);
@@ -332,7 +526,7 @@ async function performWorkflowRequest(session, requestSpec) {
         ).toString()
       : "";
   const url = buildUpstreamUrl(target.endpoint, requestSpec.path || "", query ? `?${query}` : "");
-  const controller = new AbortController();
+  const controller = options.controller || new AbortController();
   const timeoutMs = Number(requestSpec.timeoutMs || REQUEST_TIMEOUT_MS);
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -400,7 +594,7 @@ function renderTemplate(template, values) {
   return String(template || "").replace(/\{([a-zA-Z0-9_]+)\}/g, (_, key) => String(values[key] || ""));
 }
 
-async function maybePollWorkflowRequest(session, payload, initialResult) {
+async function maybePollWorkflowRequest(session, payload, initialResult, options = {}) {
   const poll = payload?.poll || buildDefaultPollSpec(payload);
   if (!poll) return { final: initialResult };
 
@@ -425,6 +619,11 @@ async function maybePollWorkflowRequest(session, payload, initialResult) {
   let latest = initialResult;
 
   while (Date.now() - startedAt < timeoutMs) {
+    if (options.signal?.aborted) {
+      const abortError = new Error("Workflow task cancelled");
+      abortError.summary = { initial: initialResult, final: latest };
+      throw abortError;
+    }
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
     latest = await performWorkflowRequest(session, {
       provider: payload.provider,
@@ -437,7 +636,7 @@ async function maybePollWorkflowRequest(session, payload, initialResult) {
       headers: poll.headers,
       body: poll.body,
       timeoutMs: poll.requestTimeoutMs,
-    });
+    }, options);
     const statusValue = String(readNestedValue(latest.response.body, statusField) || "").trim().toLowerCase();
     if (completedStatuses.has(statusValue)) {
       return { initial: initialResult, final: latest };
@@ -475,9 +674,127 @@ function sanitizeTask(task) {
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     payload: task.payload,
+    remoteTaskId: task.remoteTaskId || null,
     response: task.response,
     error: task.error,
   };
+}
+
+async function saveWorkflowAsset(req, session, payload, binaryBody) {
+  let buffer = null;
+  let mimeType = String(payload?.mimeType || req.headers["content-type"] || "application/octet-stream").split(";")[0].trim();
+  let originalFileName = String(payload?.fileName || "").trim();
+
+  if (payload?.dataUrl) {
+    const parsed = parseDataUrl(payload.dataUrl);
+    if (!parsed) throw new Error("Invalid asset dataUrl");
+    buffer = parsed.buffer;
+    mimeType = parsed.mimeType || mimeType;
+  } else if (payload?.base64) {
+    buffer = Buffer.from(String(payload.base64), "base64");
+  } else if (payload?.sourceUrl) {
+    const parsedSourceUrl = (() => { try { return new URL(String(payload.sourceUrl)); } catch { return null; } })();
+    if (!parsedSourceUrl || !["http:", "https:"].includes(parsedSourceUrl.protocol)) {
+      throw new Error("Invalid sourceUrl: only http and https are supported");
+    }
+    const response = await fetch(parsedSourceUrl.href);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch source asset (${response.status})`);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    buffer = Buffer.from(arrayBuffer);
+    mimeType = String(response.headers.get("content-type") || mimeType).split(";")[0].trim();
+    if (!originalFileName) {
+      originalFileName = path.basename(parsedSourceUrl.pathname) || "";
+    }
+  } else if (Buffer.isBuffer(binaryBody)) {
+    buffer = binaryBody;
+  }
+
+  if (!buffer?.length) {
+    throw new Error("Asset body is empty");
+  }
+
+  const folder = trimSlashes(payload?.folder || "uploads")
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => safeSegment(segment, "folder"))
+    .join("/");
+  const assetId = crypto.randomUUID();
+  const extension = inferExtension(mimeType, originalFileName);
+  const baseName = safeSegment(path.basename(originalFileName, path.extname(originalFileName)), "asset");
+  const fileName = `${baseName}-${assetId}${extension}`;
+  const relativePath = [folder || "uploads", fileName].filter(Boolean).join("/");
+  const targetDir = path.join(WORKFLOW_ASSET_ROOT, session.clientId, folder || "uploads");
+  const targetPath = path.join(targetDir, fileName);
+  await ensureDir(targetDir);
+  await fs.writeFile(targetPath, buffer);
+
+  return {
+    id: assetId,
+    fileName,
+    mimeType: mimeType || inferContentType(targetPath),
+    size: buffer.length,
+    url: buildAssetUrl(req, session.clientId, relativePath),
+    relativePath,
+  };
+}
+
+function buildCancelRequestSpec(task) {
+  const payload = task?.payload || {};
+  const remoteTaskId = String(
+    task?.remoteTaskId ||
+      task?.response?.initial?.response?.body?.task_id ||
+      task?.response?.initial?.response?.body?.id ||
+      "",
+  ).trim();
+  const provider = String(payload.provider || "").trim();
+  const explicit = payload.cancel && typeof payload.cancel === "object" ? payload.cancel : null;
+
+  if (explicit) {
+    return {
+      provider: explicit.provider || provider,
+      method: explicit.method || "DELETE",
+      path: explicit.path ||
+        renderTemplate(explicit.pathTemplate || "/{task_id}", {
+          task_id: remoteTaskId,
+          id: remoteTaskId,
+        }),
+      query: explicit.query,
+      headers: explicit.headers,
+      body: explicit.body,
+      timeoutMs: explicit.timeoutMs,
+    };
+  }
+
+  if (!remoteTaskId) return null;
+  if (provider === "jimeng") {
+    return {
+      provider,
+      method: "DELETE",
+      path: `/${remoteTaskId}`,
+    };
+  }
+  if (provider === "tuzi") {
+    return {
+      provider,
+      method: "DELETE",
+      path: `/doubao/api/v3/contents/generations/tasks/${remoteTaskId}`,
+    };
+  }
+  return null;
+}
+
+async function cancelWorkflowTask(task, session, runner) {
+  if (runner) {
+    runner.cancelled = true;
+    runner.controller.abort();
+  }
+  const cancelSpec = buildCancelRequestSpec(task);
+  if (!cancelSpec) {
+    return null;
+  }
+  return performWorkflowRequest(session, cancelSpec);
 }
 
 async function resolveWorkflowSession(req) {
@@ -504,6 +821,33 @@ async function requireWorkflowSession(req, res) {
 async function handleWorkflowApi(req, res, requestUrl) {
   if (req.method === "OPTIONS") {
     sendJson(res, 200, { ok: true });
+    return true;
+  }
+
+  if (requestUrl.pathname === "/api/home-agent/shared-state") {
+    if (req.method === "GET") {
+      const state = await readJsonFileSafe(HOME_AGENT_SHARED_STATE_PATH, {
+        version: 1,
+        updatedAt: null,
+        savedAt: null,
+        clientId: "",
+        storage: {},
+      });
+      sendJson(res, 200, {
+        state: sanitizeHomeAgentSharedState(state),
+      });
+      return true;
+    }
+
+    if (req.method === "PUT") {
+      const payload = await readRequestBody(req, { limit: HOME_AGENT_SHARED_STATE_LIMIT });
+      const state = sanitizeHomeAgentSharedState(payload);
+      await writeJsonFileAtomic(HOME_AGENT_SHARED_STATE_PATH, state);
+      sendJson(res, 200, { state });
+      return true;
+    }
+
+    sendJson(res, 405, { error: "Method not allowed" });
     return true;
   }
 
@@ -579,6 +923,16 @@ async function handleWorkflowApi(req, res, requestUrl) {
     }
   }
 
+  if (requestUrl.pathname === "/api/workflow/assets" && req.method === "POST") {
+    const session = await requireWorkflowSession(req, res);
+    if (!session) return true;
+    const body = await readRequestBody(req, { limit: 25 * 1024 * 1024 });
+    const payload = Buffer.isBuffer(body) ? {} : body;
+    const asset = await saveWorkflowAsset(req, session, payload, Buffer.isBuffer(body) ? body : null);
+    sendJson(res, 201, { asset });
+    return true;
+  }
+
   if (requestUrl.pathname === "/api/workflow/tasks" && req.method === "GET") {
     const session = await requireWorkflowSession(req, res);
     if (!session) return true;
@@ -593,21 +947,40 @@ async function handleWorkflowApi(req, res, requestUrl) {
     if (!session) return true;
     const payload = await readRequestBody(req);
     const task = await WORKFLOW_STORE.createTask(session, payload);
+    const controller = new AbortController();
+    const runner = {
+      taskId: task.id,
+      sessionId: session.clientId,
+      controller,
+      cancelled: false,
+    };
+    setActiveWorkflowTask(task.id, runner);
     void (async () => {
       try {
         await WORKFLOW_STORE.updateTask(task.id, { status: "running", error: null });
-        const initialResult = await performWorkflowRequest(session, payload);
-        const result = await maybePollWorkflowRequest(session, payload, initialResult);
+        const initialResult = await performWorkflowRequest(session, payload, { controller });
+        const remoteTaskId = extractRemoteTaskId(initialResult);
+        if (remoteTaskId) {
+          await WORKFLOW_STORE.updateTask(task.id, { remoteTaskId });
+        }
+        const result = await maybePollWorkflowRequest(session, payload, initialResult, {
+          controller,
+          signal: controller.signal,
+        });
         await WORKFLOW_STORE.updateTask(task.id, {
           status: "completed",
+          ...(remoteTaskId ? { remoteTaskId } : {}),
           response: result,
           error: null,
         });
       } catch (error) {
+        const aborted = controller.signal.aborted || runner.cancelled;
         await WORKFLOW_STORE.updateTask(task.id, {
-          status: "failed",
-          error: serializeError(error),
+          status: aborted ? "cancelled" : "failed",
+          error: aborted ? null : serializeError(error),
         });
+      } finally {
+        setActiveWorkflowTask(task.id, null);
       }
     })();
     sendJson(res, 202, { task: sanitizeTask(task) });
@@ -615,7 +988,7 @@ async function handleWorkflowApi(req, res, requestUrl) {
   }
 
   const taskMatch = requestUrl.pathname.match(/^\/api\/workflow\/tasks\/([0-9a-f-]+)$/i);
-  if (taskMatch && req.method === "GET") {
+  if (taskMatch && (req.method === "GET" || req.method === "DELETE")) {
     const session = await requireWorkflowSession(req, res);
     if (!session) return true;
     const task = await WORKFLOW_STORE.readTask(taskMatch[1]);
@@ -623,11 +996,89 @@ async function handleWorkflowApi(req, res, requestUrl) {
       sendJson(res, 404, { error: "Workflow task not found" });
       return true;
     }
+    if (req.method === "DELETE") {
+      if (["completed", "failed", "cancelled"].includes(String(task.status || "").toLowerCase())) {
+        sendJson(res, 200, { task: sanitizeTask(task) });
+        return true;
+      }
+      const runner = ACTIVE_WORKFLOW_TASKS.get(task.id);
+      let cancelResult = null;
+      try {
+        cancelResult = await cancelWorkflowTask(task, session, runner);
+      } catch (error) {
+        await WORKFLOW_STORE.updateTask(task.id, {
+          status: "cancelled",
+          error: {
+            message: "Local task cancelled, but upstream cancel returned an error.",
+            summary: serializeError(error),
+          },
+        });
+        const cancelled = await WORKFLOW_STORE.readTask(task.id);
+        setActiveWorkflowTask(task.id, null);
+        sendJson(res, 200, {
+          task: sanitizeTask(cancelled),
+          cancel: { ok: false, error: serializeError(error) },
+        });
+        return true;
+      }
+      await WORKFLOW_STORE.updateTask(task.id, {
+        status: "cancelled",
+        error: null,
+        ...(cancelResult ? { cancel: cancelResult } : {}),
+      });
+      const cancelled = await WORKFLOW_STORE.readTask(task.id);
+      setActiveWorkflowTask(task.id, null);
+      sendJson(res, 200, {
+        task: sanitizeTask(cancelled),
+        cancel: { ok: true, upstream: cancelResult || null },
+      });
+      return true;
+    }
     sendJson(res, 200, { task: sanitizeTask(task) });
     return true;
   }
 
   return false;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function handleWorkflowAssets(req, res, requestUrl) {
+  const match = requestUrl.pathname.match(/^\/workflow-assets\/([^/]+)\/(.+)$/);
+  if (!match || req.method !== "GET") return false;
+  const sessionId = decodeURIComponent(match[1]);
+  if (!UUID_RE.test(sessionId)) {
+    sendJson(res, 400, { error: "Invalid session" });
+    return true;
+  }
+  const relativeSegments = match[2]
+    .split("/")
+    .map((segment) => decodeURIComponent(segment))
+    .filter(Boolean);
+  const normalizedRelativePath = path.normalize(relativeSegments.join(path.sep));
+  if (!normalizedRelativePath || normalizedRelativePath.startsWith("..")) {
+    sendJson(res, 400, { error: "Invalid asset path" });
+    return true;
+  }
+  const absolutePath = path.resolve(WORKFLOW_ASSET_ROOT, sessionId, normalizedRelativePath);
+  const expectedRoot = path.resolve(WORKFLOW_ASSET_ROOT, sessionId);
+  if (!absolutePath.startsWith(expectedRoot + path.sep) && absolutePath !== expectedRoot) {
+    sendJson(res, 400, { error: "Invalid asset path" });
+    return true;
+  }
+  try {
+    const buffer = await fs.readFile(absolutePath);
+    sendBuffer(res, 200, buffer, inferContentType(absolutePath), {
+      "cache-control": "public, max-age=31536000, immutable",
+    });
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      sendJson(res, 404, { error: "Workflow asset not found" });
+      return true;
+    }
+    throw error;
+  }
+  return true;
 }
 
 async function handleProxy(req, res, requestUrl) {
@@ -703,6 +1154,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (await handleWorkflowApi(req, res, requestUrl)) {
+      return;
+    }
+
+    if (await handleWorkflowAssets(req, res, requestUrl)) {
       return;
     }
 

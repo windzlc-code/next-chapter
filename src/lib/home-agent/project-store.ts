@@ -23,12 +23,14 @@ import type {
   StudioSessionState,
 } from "./types";
 import type { PersistedVideoProject } from "@/hooks/use-local-persistence";
-import type { VideoStyleLock, VideoWorldModel } from "@/types/project";
+import type { VideoAutomationState, VideoStyleLock, VideoWorldModel } from "@/types/project";
 import { synchronizeVideoProductionState } from "./video-production-memory";
 import {
   canSwitchToVideoWorkflowStep,
   deriveNaturalVideoStep,
+  hasPassedVideoScriptBreakdown,
 } from "./video-workflow-step-gates";
+import { getHomeAgentVideoGenerationBatchLimit } from "./video-models";
 import { synchronizeDramaProductionState } from "./drama-production-memory";
 import {
   normalizeComplianceWorkspace,
@@ -55,13 +57,15 @@ import {
 } from "./script-artifact-helpers";
 import {
   clearStudioSession,
+  hasSessionResetMarkerForProject,
+  readSessionResetMarkers,
   pruneExpiredMediaFromSession,
   readProjectStudioSession,
   readProjectSessionFromFile,
-  readSessionResetMarker,
   readStudioProjectSession,
   readStudioSession,
   removeProjectStudioSession,
+  sessionHasFullAutoLineage,
   writeStudioSession,
   writeProjectStudioSession,
 } from "./session-store";
@@ -89,6 +93,8 @@ const DRAMA_PROJECTS_KEY = "storyforge_drama_projects";
 const SKILL_DRAFTS_KEY = "storyforge-skill-drafts-v1";
 const MAINTENANCE_REPORTS_KEY = "storyforge-maintenance-reports-v1";
 const CONVERSATION_PROJECT_META_KEY = "storyforge-home-agent-project-meta-v1";
+const inferredConversationAutomationModeCache = new Map<string, "manual" | "full-auto">();
+const pendingConversationArchiveBackfillProjectIds = new Set<string>();
 
 type ConversationProjectMeta = {
   pinned?: boolean;
@@ -106,13 +112,28 @@ function loadVideoPersistenceModule(): Promise<VideoPersistenceModule> {
   return videoPersistencePromise;
 }
 
+async function cleanupResetMarkedConversationArchives(): Promise<void> {
+  const resetProjectIds = new Set(readSessionResetMarkers());
+  if (!resetProjectIds.size) return;
+
+  const archiveRecords = await scanConversationArchives({ refresh: true });
+  const staleArchiveIds = [...new Set(
+    archiveRecords
+      .map((record) => record.manifest.projectId)
+      .filter((projectId) => resetProjectIds.has(projectId)),
+  )];
+  if (!staleArchiveIds.length) return;
+
+  await Promise.all(staleArchiveIds.map((projectId) => deleteConversationArchive(projectId)));
+}
+
 async function materializeConversationArchiveProjectById(projectId: string): Promise<{
   snapshot: ConversationProjectSnapshot | null;
   dramaProject: DramaProject | null;
   videoProject: PersistedVideoProject | null;
   materialized: boolean;
 }> {
-  if (readSessionResetMarker() === projectId) {
+  if (hasSessionResetMarkerForProject(projectId)) {
     return {
       snapshot: null,
       dramaProject: null,
@@ -187,12 +208,12 @@ async function materializeConversationArchiveProjectById(projectId: string): Pro
 }
 
 export async function materializeConversationArchives(): Promise<number> {
+  await cleanupResetMarkedConversationArchives();
   const archiveRecords = await scanConversationArchives({ refresh: true });
-  const deletedProjectId = readSessionResetMarker();
   let importedCount = 0;
 
   for (const record of archiveRecords) {
-    if (deletedProjectId && record.manifest.projectId === deletedProjectId) {
+    if (hasSessionResetMarkerForProject(record.manifest.projectId)) {
       continue;
     }
     const imported = await materializeConversationArchiveProjectById(record.manifest.projectId);
@@ -272,6 +293,246 @@ function applyConversationProjectMetaFromMap(
     title: meta.customTitle || snapshot.title,
     pinned: Boolean(meta.pinned),
   };
+}
+
+async function inferConversationProjectAutomationMode(
+  snapshot: ConversationProjectSnapshot,
+): Promise<"manual" | "full-auto"> {
+  const cached = inferredConversationAutomationModeCache.get(snapshot.projectId);
+  if (cached) return cached;
+
+  const snapshotMode = normalizeAutomationMode(snapshot.automationMode);
+  if (snapshotMode === "full-auto") {
+    inferredConversationAutomationModeCache.set(snapshot.projectId, snapshotMode);
+    return snapshotMode;
+  }
+
+  const localSession = readStudioProjectSession(snapshot.projectId);
+  if (sessionHasFullAutoLineage(localSession)) {
+    inferredConversationAutomationModeCache.set(snapshot.projectId, "full-auto");
+    return "full-auto";
+  }
+
+  const fileSession = await readProjectSessionFromFile(snapshot.projectId);
+  if (sessionHasFullAutoLineage(fileSession)) {
+    inferredConversationAutomationModeCache.set(snapshot.projectId, "full-auto");
+    return "full-auto";
+  }
+
+  inferredConversationAutomationModeCache.set(snapshot.projectId, snapshotMode);
+  return snapshotMode;
+}
+
+function getConversationProjectSnapshotFromSession(
+  session: StudioSessionState | null | undefined,
+  projectId: string,
+): ConversationProjectSnapshot | null {
+  const snapshot = session?.currentProjectSnapshot;
+  if (!snapshot || snapshot.projectId !== projectId) return null;
+  return snapshot;
+}
+
+async function inferConversationProjectSessionSnapshot(
+  snapshot: ConversationProjectSnapshot,
+): Promise<ConversationProjectSnapshot | null> {
+  const localSnapshot = getConversationProjectSnapshotFromSession(
+    readStudioProjectSession(snapshot.projectId),
+    snapshot.projectId,
+  );
+  if (localSnapshot) return localSnapshot;
+
+  const fileSnapshot = getConversationProjectSnapshotFromSession(
+    await readProjectSessionFromFile(snapshot.projectId),
+    snapshot.projectId,
+  );
+  return fileSnapshot;
+}
+
+async function repairConversationSnapshotAutomationModes(
+  snapshots: ConversationProjectSnapshot[],
+  metaMap: Record<string, ConversationProjectMeta>,
+): Promise<ConversationProjectSnapshot[]> {
+  let nextMetaMap: Record<string, ConversationProjectMeta> | null = null;
+
+  const repairedSnapshots = await Promise.all(
+    snapshots.map(async (snapshot) => {
+      const meta = metaMap[snapshot.projectId];
+      const sessionSnapshot = await inferConversationProjectSessionSnapshot(snapshot);
+      const mergedSnapshot = sessionSnapshot
+        ? {
+            ...snapshot,
+            ...sessionSnapshot,
+            projectId: snapshot.projectId,
+            title: meta?.customTitle || sessionSnapshot.title || snapshot.title,
+            pinned: typeof meta?.pinned === "boolean" ? meta.pinned : Boolean(snapshot.pinned),
+          }
+        : snapshot;
+
+      const inferredAutomationMode = await inferConversationProjectAutomationMode(mergedSnapshot);
+      if (inferredAutomationMode === normalizeAutomationMode(mergedSnapshot.automationMode)) {
+        return mergedSnapshot;
+      }
+
+      nextMetaMap ??= { ...metaMap };
+      nextMetaMap[snapshot.projectId] = {
+        ...(nextMetaMap[snapshot.projectId] ?? {}),
+        automationMode: inferredAutomationMode,
+      };
+      return {
+        ...mergedSnapshot,
+        automationMode: inferredAutomationMode,
+      };
+    }),
+  );
+
+  if (nextMetaMap) {
+    writeConversationProjectMetaMap(nextMetaMap);
+  }
+
+  return repairedSnapshots;
+}
+
+async function listSessionBackedConversationSnapshots(
+  existingProjectIds: Set<string>,
+): Promise<ConversationProjectSnapshot[]> {
+  if (typeof window === "undefined") return [];
+  if (!window.electronAPI?.storage?.getDefaultPath || !window.electronAPI?.storage?.listDir) return [];
+
+  try {
+    const paths = await window.electronAPI.storage.getDefaultPath();
+    const dir = `${paths.db}/sessions`;
+    const result = await window.electronAPI.storage.listDir(dir);
+    if (!result.ok || !Array.isArray(result.entries)) return [];
+
+    const projectIds = result.entries
+      .filter((entry) => !entry.isDirectory && entry.name.endsWith(".json") && entry.name !== "_last.json")
+      .map((entry) => entry.name.slice(0, -5))
+      .filter((projectId) =>
+        projectId &&
+        !existingProjectIds.has(projectId) &&
+        !hasSessionResetMarkerForProject(projectId),
+      );
+    if (!projectIds.length) return [];
+
+    const seen = new Set<string>();
+    const snapshots: ConversationProjectSnapshot[] = [];
+    const sessions = await Promise.all(projectIds.map((projectId) => readProjectSessionFromFile(projectId)));
+    for (const session of sessions) {
+      const snapshot = session?.currentProjectSnapshot;
+      if (!snapshot?.projectId || existingProjectIds.has(snapshot.projectId) || seen.has(snapshot.projectId)) continue;
+      seen.add(snapshot.projectId);
+      snapshots.push(snapshot);
+    }
+
+    return snapshots;
+  } catch {
+    return [];
+  }
+}
+
+function createArchiveBackfillSession(
+  snapshot: ConversationProjectSnapshot,
+  baseSession?: StudioSessionState | null,
+): StudioSessionState {
+  const createdAt = snapshot.updatedAt || new Date().toISOString();
+  const fallbackSummary =
+    snapshot.agentSummary?.trim() ||
+    snapshot.currentObjective?.trim() ||
+    `${snapshot.title} 历史归档补建`;
+
+  return {
+    sessionId:
+      baseSession?.sessionId ||
+      `archive-backfill-${snapshot.projectId}`,
+    compactedMessageCount: baseSession?.compactedMessageCount ?? 0,
+    mode: baseSession?.mode ?? "active",
+    creationMode: baseSession?.creationMode ?? "fast",
+    automationMode: normalizeAutomationMode(baseSession?.automationMode ?? snapshot.automationMode),
+    devMode: baseSession?.devMode ?? false,
+    suppressHistoricalMemory: baseSession?.suppressHistoricalMemory ?? true,
+    messages:
+      Array.isArray(baseSession?.messages) && baseSession.messages.length > 0
+        ? baseSession.messages
+        : [
+            {
+              id: `archive-backfill-message-${snapshot.projectId}`,
+              role: "assistant",
+              content: fallbackSummary,
+              createdAt,
+            },
+          ],
+    currentProjectSnapshot: snapshot,
+    recentMessageSummary: baseSession?.recentMessageSummary || fallbackSummary,
+    projectId: snapshot.projectId,
+    selectedTextModelKey: baseSession?.selectedTextModelKey,
+    selectedImageModelFamily: baseSession?.selectedImageModelFamily,
+    imageGenerationPrefs: baseSession?.imageGenerationPrefs,
+    selectedVideoModelKey: baseSession?.selectedVideoModelKey,
+    videoGenerationPrefs: baseSession?.videoGenerationPrefs,
+    draft: baseSession?.draft ?? "",
+    qState: baseSession?.qState ?? null,
+    deferredQuestionState: baseSession?.deferredQuestionState ?? null,
+    pendingWorkflowUploadKind: baseSession?.pendingWorkflowUploadKind ?? null,
+    pendingChoiceQuestion: baseSession?.pendingChoiceQuestion ?? null,
+    interruptedChoiceQuestion: baseSession?.interruptedChoiceQuestion ?? null,
+    selectedValues: baseSession?.selectedValues ?? [],
+    deferredSelectedValues: baseSession?.deferredSelectedValues ?? [],
+    deferredDraft: baseSession?.deferredDraft ?? "",
+    surfacedTaskIds: baseSession?.surfacedTaskIds ?? [],
+    surfacedTaskFollowupKeys: baseSession?.surfacedTaskFollowupKeys ?? [],
+    surfacedProjectSuggestionKeys: baseSession?.surfacedProjectSuggestionKeys ?? [],
+    fullAutoRun: baseSession?.fullAutoRun ?? null,
+  };
+}
+
+function queueConversationArchiveBackfill(snapshot: ConversationProjectSnapshot): void {
+  const projectId = snapshot.projectId;
+  if (!projectId || pendingConversationArchiveBackfillProjectIds.has(projectId)) return;
+
+  pendingConversationArchiveBackfillProjectIds.add(projectId);
+  const baseSession = readProjectStudioSession(projectId);
+  const backfillSession = createArchiveBackfillSession(snapshot, baseSession);
+
+  void writeProjectStudioSession(backfillSession).finally(() => {
+    pendingConversationArchiveBackfillProjectIds.delete(projectId);
+  });
+}
+
+function stripConversationDuplicateSuffix(title: string): string {
+  const trimmed = title.trim();
+  if (!trimmed) return "";
+  return trimmed.replace(/\s*-\s*副本\d*\s*$/u, "").trim();
+}
+
+async function buildNextDuplicateConversationTitle(sourceTitle: string): Promise<string> {
+  const metaMap = readConversationProjectMetaMap();
+  const applyMetaTitle = (projectId: string, fallbackTitle: string) =>
+    metaMap[projectId]?.customTitle?.trim() || fallbackTitle.trim();
+
+  const baseTitle = stripConversationDuplicateSuffix(sourceTitle) || sourceTitle.trim() || "未命名项目";
+  const existingTitles = new Set<string>();
+
+  for (const project of listStoredDramaProjects()) {
+    existingTitles.add(applyMetaTitle(project.id, project.dramaTitle || "未命名项目"));
+  }
+
+  const { listStoredVideoProjects } = await loadVideoPersistenceModule();
+  for (const project of await listStoredVideoProjects({ fast: true })) {
+    existingTitles.add(applyMetaTitle(project.id, project.title || "未命名视频项目"));
+  }
+
+  for (const snapshot of await listConversationArchiveSnapshots()) {
+    existingTitles.add(applyMetaTitle(snapshot.projectId, snapshot.title || "未命名项目"));
+  }
+
+  const firstCopyTitle = `${baseTitle} - 副本`;
+  if (!existingTitles.has(firstCopyTitle)) return firstCopyTitle;
+
+  let index = 2;
+  while (existingTitles.has(`${baseTitle} - 副本${index}`)) {
+    index += 1;
+  }
+  return `${baseTitle} - 副本${index}`;
 }
 
 function removeConversationProjectMeta(projectId: string): void {
@@ -493,7 +754,16 @@ function normalizeDramaProject(project: DramaProject): DramaProject {
   };
 }
 
-function truncate(text: string, max = 180): string {
+function firstNonEmptyText(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    if (value.trim()) return value;
+  }
+  return "";
+}
+
+function truncate(text: unknown, max = 180): string {
+  if (typeof text !== "string") return "";
   const normalized = text.replace(/\s+/g, " ").trim();
   if (!normalized) return "";
   return normalized.length > max ? `${normalized.slice(0, max - 1)}…` : normalized;
@@ -598,13 +868,13 @@ function deriveDramaStyleLock(project: DramaProject): VideoStyleLock | null {
 }
 
 function deriveDramaWorldModel(project: DramaProject): VideoWorldModel | null {
-  const synopsisSource =
-    project.creativePlan ||
-    project.structureTransform ||
-    project.referenceStructure ||
-    project.setup?.creativeInput ||
-    project.setup?.customTopic ||
-    "";
+  const synopsisSource = firstNonEmptyText(
+    project.creativePlan,
+    project.structureTransform,
+    project.referenceStructure,
+    project.setup?.creativeInput,
+    project.setup?.customTopic,
+  );
 
   if (!synopsisSource.trim() && !project.directory.length && !project.episodes.length) {
     return null;
@@ -615,6 +885,15 @@ function deriveDramaWorldModel(project: DramaProject): VideoWorldModel | null {
     name: `第 ${entry.number} 集 · ${entry.title}`,
     description: entry.summary || entry.outline || "等待补充分集推进",
   }));
+
+  const primaryCharacterDescription = firstNonEmptyText(project.characters, project.characterTransform);
+  if (typeof project.characters !== "string" || typeof project.characterTransform !== "string") {
+    project = {
+      ...project,
+      characters: typeof project.characters === "string" ? project.characters : primaryCharacterDescription,
+      characterTransform: typeof project.characterTransform === "string" ? project.characterTransform : "",
+    };
+  }
 
   return {
     version: `drama-world-${project.updatedAt || new Date().toISOString()}`,
@@ -810,14 +1089,25 @@ function buildCharactersPayload(project: DramaProject): ScriptArtifactPayload | 
   const body = stripMermaidCodeBlocks(project.characterTransform || project.characters || "");
   if (!body.trim()) return undefined;
   const rawText = project.characterTransform || project.characters || "";
+  const mermaidCode = extractMermaidCode(rawText)?.trim();
+  const detailedMermaidCode = extractDetailedMermaidCode(rawText)?.trim();
+
+  if (!mermaidCode || !detailedMermaidCode || mermaidCode === detailedMermaidCode) {
+    return undefined;
+  }
+
   return {
     type: "characters+mermaid",
     body,
-    mermaidCode: extractMermaidCode(rawText) ?? undefined,
-    detailedMermaidCode: extractDetailedMermaidCode(rawText) ?? undefined,
+    mermaidCode,
+    detailedMermaidCode,
     characterCards: project.characterStateCards ?? [],
     diagramCollapsed: Boolean(project.artifactPreferences?.relationshipDiagramCollapsed),
   };
+}
+
+function hasHomepageReadyCharacters(project: DramaProject): boolean {
+  return Boolean(buildCharactersPayload(project));
 }
 
 function buildDirectoryPayload(project: DramaProject): ScriptArtifactPayload | undefined {
@@ -1071,7 +1361,7 @@ function buildSetupActions(project: DramaProject): ConversationArtifactAction[] 
         ),
       ];
     }
-    if (!project.characters?.trim()) {
+    if (!hasHomepageReadyCharacters(project)) {
       return [
         createArtifactAction(
           `${project.id}-setup-character-transform`,
@@ -1088,7 +1378,7 @@ function buildSetupActions(project: DramaProject): ConversationArtifactAction[] 
       createArtifactAction(`${project.id}-setup-plan`, "确认方案", "生成创作方案", "primary"),
     ];
   }
-  if (!project.characters?.trim()) {
+  if (!hasHomepageReadyCharacters(project)) {
     return [
       createArtifactAction(
         `${project.id}-setup-characters`,
@@ -1213,12 +1503,15 @@ function buildEpisodeActions(project: DramaProject): ConversationArtifactAction[
   const totalEpisodes = project.setup?.totalEpisodes || project.directory.length || project.episodes.length;
   const hasPendingEpisodes = project.episodes.length < totalEpisodes;
   const actions: ConversationArtifactAction[] = [];
+  const batchEpisodeLabel = project.episodes.some((episode) => episode.content?.trim())
+    ? "自动批量补齐"
+    : "自动批量续写";
 
   if (hasPendingEpisodes) {
     actions.push(
       createArtifactAction(
         `${project.id}-episode-batch-generate`,
-        "批量生成（自动按顺序生成）",
+        batchEpisodeLabel,
         "script:episode-generate-batch",
         "primary",
       ),
@@ -1512,12 +1805,15 @@ function buildDramaRecommendations(project: DramaProject): string[] {
   }
 
   if (project.currentStep === "episodes" && completedEpisodeCount < totalEpisodes) {
+    const batchEpisodeLabel = project.episodes.some((episode) => episode.content?.trim())
+      ? "自动批量补齐"
+      : "自动批量续写";
     return [
       typeof project.preferredEpisodeDurationSeconds === "number"
         ? `设定单集时长（当前 ${project.preferredEpisodeDurationSeconds} 秒）`
         : "设定单集时长",
       nextEpisodeNumber ? `选择生成集数（下一集建议第 ${nextEpisodeNumber} 集）` : "选择生成集数",
-      "批量生成（自动按顺序生成）",
+      batchEpisodeLabel,
     ];
   }
 
@@ -1542,7 +1838,7 @@ function buildDramaRecommendations(project: DramaProject): string[] {
       ];
     case "characters":
       return [
-        project.characters.trim()
+        hasHomepageReadyCharacters(project)
           ? project.directory.length
             ? "角色设定完成，继续完善分集目录"
             : "角色设定完成，生成分集目录"
@@ -1550,7 +1846,7 @@ function buildDramaRecommendations(project: DramaProject): string[] {
       ];
     case "character-transform":
       return [
-        project.characterTransform.trim()
+        hasHomepageReadyCharacters(project)
           ? project.directory.length
             ? "角色转译完成，继续完善分集目录"
             : "角色转译完成，生成分集目录"
@@ -1665,8 +1961,11 @@ function buildUnifiedDramaRecommendations(project: DramaProject): string[] {
         : [buildNextOutlineBatchLabel(project) ?? "生成下一批细纲", "重新生成全部细纲"];
     case "episodes":
       if (project.episodes.length < totalEpisodes) {
+        const batchEpisodeLabel = project.episodes.some((episode) => episode.content?.trim())
+          ? "自动批量补齐"
+          : "自动批量续写";
         return [
-          "批量生成剩余正文",
+          batchEpisodeLabel,
           nextEpisodeNumber ? `生成第 ${nextEpisodeNumber} 集正文` : "生成指定集正文",
           "进入合规审查",
           "跳过合规，直接进入导出",
@@ -1712,11 +2011,16 @@ export function loadStoredDramaProjectById(id: string): DramaProject | null {
 
 export function upsertStoredDramaProject(project: DramaProject): DramaProject {
   const projects = listStoredDramaProjects();
+  const normalizedProject = normalizeDramaProject(project);
   const nextProject = {
-    ...synchronizeDramaProductionState(project, deriveDramaStyleLock(project), deriveDramaWorldModel(project)),
+    ...synchronizeDramaProductionState(
+      normalizedProject,
+      deriveDramaStyleLock(normalizedProject),
+      deriveDramaWorldModel(normalizedProject),
+    ),
     updatedAt: new Date().toISOString(),
   };
-  const index = projects.findIndex((item) => item.id === project.id);
+  const index = projects.findIndex((item) => item.id === normalizedProject.id);
 
   if (index >= 0) {
     projects[index] = nextProject;
@@ -1853,10 +2157,11 @@ export function writeMaintenanceReports(reports: MaintenanceReport[]): void {
 }
 
 export function createDramaSnapshot(project: DramaProject): ConversationProjectSnapshot {
+  const normalizedProject = normalizeDramaProject(project);
   const syncedProject = synchronizeDramaProductionState(
-    project,
-    project.styleLock ?? deriveDramaStyleLock(project),
-    project.worldModel ?? deriveDramaWorldModel(project),
+    normalizedProject,
+    normalizedProject.styleLock ?? deriveDramaStyleLock(normalizedProject),
+    normalizedProject.worldModel ?? deriveDramaWorldModel(normalizedProject),
   );
   const projectKind = syncedProject.mode === "adaptation" ? "adaptation" : "script";
   const updatedAt = syncedProject.updatedAt || new Date().toISOString();
@@ -1994,6 +2299,7 @@ export function createDramaSnapshot(project: DramaProject): ConversationProjectS
   }
 
   if (
+    charactersPayload &&
     syncedProject.characters.trim() &&
     !(syncedProject.mode === "adaptation" && syncedProject.characterTransform.trim())
   ) {
@@ -2028,15 +2334,23 @@ export function createDramaSnapshot(project: DramaProject): ConversationProjectS
         "角色转译",
         syncedProject.characterTransform,
         updatedAt,
-        {
-          presentation: "script-rich",
-          payload: charactersPayload,
-          actions: buildCharacterTransformPanelActions(syncedProject),
-          editor: {
-            field: "characterTransform",
-            text: syncedProject.characterTransform,
-          },
-        },
+        charactersPayload
+          ? {
+              presentation: "script-rich",
+              payload: charactersPayload,
+              actions: buildCharacterTransformPanelActions(syncedProject),
+              editor: {
+                field: "characterTransform",
+                text: syncedProject.characterTransform,
+              },
+            }
+          : {
+              actions: buildCharacterTransformPanelActions(syncedProject),
+              editor: {
+                field: "characterTransform",
+                text: syncedProject.characterTransform,
+              },
+            },
       ),
     );
   }
@@ -2101,7 +2415,7 @@ export function createDramaSnapshot(project: DramaProject): ConversationProjectS
     );
   }
 
-  if (episodeBatchPayload?.type === "episodes+batchProgress") {
+  if (episodeBatchPayload?.type === "episodes+batchProgress" && syncedProject.currentStep !== "compliance") {
     const episodePreviewText = episodeBatchPayload.entries
       .slice(0, 3)
       .map((entry) =>
@@ -2219,7 +2533,7 @@ export function createDramaSnapshot(project: DramaProject): ConversationProjectS
     );
   }
 
-  if (false && syncedProject.complianceReport.trim()) {
+  if (syncedProject.complianceReport.trim()) {
     artifacts.push(
       buildArtifact(
         `${syncedProject.id}-compliance`,
@@ -2276,19 +2590,34 @@ export function createDramaSnapshot(project: DramaProject): ConversationProjectS
     (syncedProject.mode === "adaptation" ? "未命名改编项目" : "未命名剧本项目");
   const stage = deriveDramaStage(syncedProject);
   const artifactLabels = summarizeArtifactLabels(artifacts.map((artifact) => artifact.label));
-  const nextAction = buildUnifiedDramaRecommendations(syncedProject)[0];
+  const baseRecommendedActions = buildUnifiedDramaRecommendations(syncedProject);
+  const homepageReadyCharacters = hasHomepageReadyCharacters(syncedProject);
+  const hasCharacterSource = Boolean((syncedProject.characterTransform || syncedProject.characters || "").trim());
+  const recommendedActions =
+    (syncedProject.currentStep === "characters" || syncedProject.currentStep === "character-transform") &&
+    hasCharacterSource &&
+    !homepageReadyCharacters
+      ? ["进入角色开发"]
+      : baseRecommendedActions;
+  const currentObjective =
+    (syncedProject.currentStep === "characters" || syncedProject.currentStep === "character-transform") &&
+    hasCharacterSource &&
+    !homepageReadyCharacters
+      ? "继续完善角色关系图，确认简单版和详细版都已生成且可切换后，再放出到首页并进入分集目录。"
+      : deriveUnifiedDramaObjective(syncedProject);
+  const nextAction = recommendedActions[0];
 
   return {
     projectId: syncedProject.id,
     projectKind,
     title,
-    currentObjective: deriveUnifiedDramaObjective(syncedProject),
+    currentObjective,
     derivedStage: stage,
     agentSummary:
       artifacts.length > 0
         ? `项目当前位于“${stage}”，已整理出 ${artifacts.length} 份关键产物${artifactLabels ? `，包括${artifactLabels}` : ""}。${syncedProject.characterStateCards?.length ? `当前有 ${syncedProject.characterStateCards.length} 张角色状态卡。` : ""}${syncedProject.storyBeatPackets?.length ? `已锁定 ${syncedProject.storyBeatPackets.length} 条剧情 beat。` : ""}${syncedProject.episodeQualityReviewPackets?.length ? `批量质检结果覆盖 ${syncedProject.episodeQualityReviewPackets.length} 集。` : ""}${syncedProject.complianceRevisionPackets?.length ? `合规修订包 ${syncedProject.complianceRevisionPackets.length} 条。` : ""}建议下一步先${nextAction}。`
         : `项目当前位于“${stage}”，但还缺少第一份可复用产物。建议先${nextAction}。`,
-    recommendedActions: buildUnifiedDramaRecommendations(syncedProject),
+    recommendedActions,
     artifacts,
     updatedAt,
     memory: {
@@ -2305,6 +2634,9 @@ export function createDramaSnapshot(project: DramaProject): ConversationProjectS
 }
 
 function deriveVideoStage(project: PersistedVideoProject): string {
+  if (!hasPassedVideoScriptBreakdown(project)) {
+    return "脚本拆解";
+  }
   const hasReviewableOutputs = project.scenes.some(
     (scene) => !!scene.videoUrl || scene.videoStatus === "failed",
   );
@@ -2335,6 +2667,7 @@ function deriveVideoStage(project: PersistedVideoProject): string {
 
 function buildVideoRecommendations(project: PersistedVideoProject): string[] {
   const stage = deriveVideoStage(project);
+  const breakdownPassed = hasPassedVideoScriptBreakdown(project);
   const generatedVideoCount = project.scenes.filter((scene) => scene.videoUrl).length;
   const failedVideoCount = project.scenes.filter((scene) => scene.videoStatus === "failed").length;
   const storyboardedSceneCount = project.scenes.filter((scene) => scene.storyboardUrl).length;
@@ -2349,9 +2682,13 @@ function buildVideoRecommendations(project: PersistedVideoProject): string[] {
   switch (stage) {
     case "脚本拆解":
       return [
-        project.script?.trim() ? "梳理脚本拆解结果" : "导入脚本开始拆解",
+        project.script?.trim()
+          ? breakdownPassed
+            ? "梳理脚本拆解结果"
+            : "完成剧本拆解并通过内部检查"
+          : "导入脚本开始拆解",
         project.targetPlatform?.trim() ? "补充镜头风格偏好" : "先补充目标平台",
-        project.scenes.length ? "继续提取角色与场景" : "先完成第一轮镜头拆解",
+        breakdownPassed ? "继续提取角色与场景" : "先完成第一轮镜头拆解",
       ];
     case "角色与场景":
       return [
@@ -2368,14 +2705,14 @@ function buildVideoRecommendations(project: PersistedVideoProject): string[] {
     case "镜头指令包":
       return [
         shotPacketCount ? `复核 ${shotPacketCount} 个镜头指令包` : "编译镜头指令包",
-        project.videoPromptBatch?.trim() ? "微调视频提示词批次" : "准备视频提示词批次",
+        project.videoPromptBatch?.trim() ? "微调视频提示词" : "视频提示词生成方式",
         ...bundleFollowups,
         "导出生产状态包",
       ];
     case "视频提示词":
       return [
         failedVideoCount ? `补发 ${failedVideoCount} 条失败镜头` : "开始第一轮出片",
-        project.videoPromptBatch?.trim() ? "继续微调视频提示词批次" : "回到对话里补充出片要求",
+        project.videoPromptBatch?.trim() ? "继续微调视频提示词" : "回到对话里补充出片要求",
         ...bundleFollowups,
         "导出生产状态包",
       ];
@@ -2407,14 +2744,18 @@ export function createVideoSnapshotLite(project: PersistedVideoProject): Convers
   const stage = deriveVisibleVideoStage(project);
   const recommendedActions = buildVisibleVideoRecommendations(project);
   const nextAction = recommendedActions[0] || "继续推进当前项目";
+  const breakdownPassed = hasPassedVideoScriptBreakdown(project);
   const generatedVideoCount = project.scenes.filter((scene) => Boolean(scene.videoUrl)).length;
   const failedVideoCount = countFailedVideoScenes(project);
   const progressSummary = [
-    project.scenes.length ? `${project.scenes.length} 个镜头` : null,
+    breakdownPassed && project.scenes.length ? `${project.scenes.length} 个镜头` : null,
     project.characters.length ? `${project.characters.length} 个角色` : null,
     project.sceneSettings.length ? `${project.sceneSettings.length} 个场景` : null,
     generatedVideoCount ? `${generatedVideoCount} 条已生成视频` : null,
     failedVideoCount ? `${failedVideoCount} 条失败` : null,
+    project.referenceStyleSummary?.trim()
+      ? `参考图风格摘要：${project.referenceStyleSummary.trim()}`
+      : null,
   ]
     .filter(Boolean)
     .join("，");
@@ -2422,6 +2763,7 @@ export function createVideoSnapshotLite(project: PersistedVideoProject): Convers
   return {
     projectId: project.id,
     projectKind: "video",
+    sourceProjectId: project.sourceProjectId,
     title: project.title || "未命名视频项目",
     currentObjective: `先${nextAction}`,
     derivedStage: stage,
@@ -2452,10 +2794,55 @@ function buildVideoSceneArtifactText(scenes: PersistedVideoProject["scenes"]): s
     .join("\n\n");
 }
 
+function resolveSegmentPromptSourceLabel(
+  source: "model" | undefined,
+): string {
+  switch (source) {
+    case "model":
+      return "模型直出";
+    default:
+      return "未记录";
+  }
+}
+
+function buildSegmentPromptArtifactText(project: PersistedVideoProject): string {
+  const prompts = Object.values(project.segmentVideoPrompts ?? {})
+    .filter((entry) => entry?.prompt?.trim())
+    .sort((left, right) => String(left.segmentLabel).localeCompare(String(right.segmentLabel), "zh-CN"));
+  if (!prompts.length) return "";
+
+  const sceneById = new Map((project.scenes ?? []).map((scene) => [scene.id, scene] as const));
+  const coveragePassed = prompts.filter((prompt) => prompt.debug?.shotCoverageComplete !== false).length;
+  const header = [
+    `已记录 ${prompts.length} 个片段的最终提示词。`,
+    `镜头覆盖校验通过 ${coveragePassed} / ${prompts.length}。`,
+    "提示词链路：仅保留模型直出 + 同一份规范化整理，不再使用本地回退模板。",
+  ].join("\n");
+
+  const sections = prompts.map((prompt) => {
+    const sceneNumbers = prompt.sceneIds
+      .map((sceneId) => sceneById.get(sceneId)?.sceneNumber)
+      .filter((sceneNumber): sceneNumber is number => Number.isFinite(sceneNumber))
+      .join("、");
+    return [
+      `### 片段 ${prompt.segmentLabel} 最终提示词`,
+      `镜头：${sceneNumbers || "未记录"}`,
+      `时长：${prompt.duration}s / 模型上限 ${prompt.maxDurationForModel}s`,
+      `来源：${resolveSegmentPromptSourceLabel(prompt.debug?.source)}`,
+      `镜头覆盖校验：${prompt.debug?.shotCoverageComplete === false ? "待关注" : "通过"}`,
+      "",
+      prompt.prompt.trim(),
+    ].join("\n");
+  });
+
+  return [header, ...sections].join("\n\n====================\n\n");
+}
+
 export function createVideoSnapshot(project: PersistedVideoProject): ConversationProjectSnapshot {
   const syncedProject = synchronizeVideoProductionState(project);
   const updatedAt = syncedProject.updatedAt || new Date().toISOString();
-  const sceneArtifactText = buildVideoSceneArtifactText(syncedProject.scenes);
+  const breakdownPassed = hasPassedVideoScriptBreakdown(syncedProject);
+  const sceneArtifactText = breakdownPassed ? buildVideoSceneArtifactText(syncedProject.scenes) : "";
   const characterArtifactText = (syncedProject.characters || [])
     .slice(0, 6)
     .map((character) => `${character.name}: ${character.description || "已创建角色设定"}`)
@@ -2641,6 +3028,22 @@ export function createVideoSnapshot(project: PersistedVideoProject): Conversatio
     );
   }
 
+  const segmentPromptArtifactText = buildSegmentPromptArtifactText(syncedProject);
+  if (segmentPromptArtifactText.trim()) {
+    artifacts.push(
+      buildArtifact(
+        `${syncedProject.id}-segment-video-prompts`,
+        "report",
+        "片段最终提示词日志",
+        segmentPromptArtifactText,
+        updatedAt,
+        {
+          summary: `已记录 ${Object.keys(syncedProject.segmentVideoPrompts ?? {}).length} 个片段的最终提示词。`,
+        },
+      ),
+    );
+  }
+
   if (syncedProject.shotPackets?.length) {
     artifacts.push(
       buildArtifact(
@@ -2684,6 +3087,7 @@ export function createVideoSnapshot(project: PersistedVideoProject): Conversatio
     .join("，");
   const artifactLabels = summarizeArtifactLabels(artifacts.map((artifact) => artifact.label));
   const nextAction = buildVisibleVideoRecommendations(syncedProject)[0];
+  const referenceAutomationSummary = summarizeReferenceAutomationState(syncedProject);
   const failedScenes = syncedProject.scenes.filter((scene) => scene.videoStatus === "failed");
   const failedSceneSummary = failedScenes
     .slice(0, 2)
@@ -2709,7 +3113,7 @@ export function createVideoSnapshot(project: PersistedVideoProject): Conversatio
               : syncedProject.videoPromptBatch?.trim()
                 ? "视频提示词批次已经就绪，可以继续提交新一轮出片任务。"
                 : syncedProject.shotPackets?.length
-                  ? "继续准备视频提示词批次，再开始提交视频生成。"
+                  ? "继续选择视频提示词生成方式，再开始提交视频生成。"
                   : "先编译镜头指令包，收口第 4 步内部准备链路。"
             : hasReviewableOutputs
                 ? "继续预览、返工和导出当前视频结果，完成最后出片收口。"
@@ -2718,20 +3122,23 @@ export function createVideoSnapshot(project: PersistedVideoProject): Conversatio
   return {
     projectId: syncedProject.id,
     projectKind: "video",
+    sourceProjectId: syncedProject.sourceProjectId,
     title: syncedProject.title || "未命名视频项目",
     currentObjective,
     derivedStage: stage,
     agentSummary:
       artifacts.length > 0
-        ? `视频项目当前位于“${stage}”，已整理 ${syncedProject.scenes.length} 个镜头、${syncedProject.characters.length} 个角色和 ${syncedProject.sceneSettings.length} 个场景${artifactLabels ? `，当前可直接使用${artifactLabels}` : ""}。${syncedProject.assetManifest ? `已建立 ${syncedProject.assetManifest.items.length} 项资产清单。` : ""}${failedSceneSummary ? `当前失败项：${failedSceneSummary}。` : ""}${contextSummary ? `当前${contextSummary}。` : ""}建议下一步先${nextAction}。`
-        : `视频项目当前位于“${stage}”，适合先${nextAction}。${failedSceneSummary ? `当前失败项：${failedSceneSummary}。` : ""}${contextSummary ? `当前${contextSummary}。` : ""}`,
+        ? `视频项目当前位于“${stage}”，已整理 ${breakdownPassed ? syncedProject.scenes.length : 0} 个镜头、${syncedProject.characters.length} 个角色和 ${syncedProject.sceneSettings.length} 个场景${artifactLabels ? `，当前可直接使用${artifactLabels}` : ""}。${syncedProject.assetManifest ? `已建立 ${syncedProject.assetManifest.items.length} 项资产清单。` : ""}${failedSceneSummary ? `当前失败项：${failedSceneSummary}。` : ""}${contextSummary ? `当前${contextSummary}。` : ""}${referenceAutomationSummary ? `${referenceAutomationSummary}。` : ""}建议下一步先${nextAction}。`
+        : `视频项目当前位于“${stage}”，适合先${nextAction}。${failedSceneSummary ? `当前失败项：${failedSceneSummary}。` : ""}${contextSummary ? `当前${contextSummary}。` : ""}${referenceAutomationSummary ? `${referenceAutomationSummary}。` : ""}`,
     recommendedActions: buildVisibleVideoRecommendations(syncedProject),
     artifacts,
     updatedAt,
     memory: {
       styleLock: syncedProject.styleLock,
+      referenceImageStyleSummary: syncedProject.referenceStyleSummary,
       worldModel: syncedProject.worldModel,
       assetManifest: syncedProject.assetManifest,
+      automationState: syncedProject.automationState as VideoAutomationState | null,
       videoScenes: syncedProject.scenes.map((scene) => ({
         id: scene.id,
         sceneNumber: scene.sceneNumber,
@@ -2743,6 +3150,8 @@ export function createVideoSnapshot(project: PersistedVideoProject): Conversatio
         videoFailureMessage: scene.videoFailure?.message,
       })),
       shotPackets: syncedProject.shotPackets || [],
+      videoAuditPackets: syncedProject.videoAuditPackets || [],
+      videoRepairTasks: syncedProject.videoRepairTasks || [],
       reviewQueue: syncedProject.reviewQueue || [],
     },
   };
@@ -2772,6 +3181,26 @@ function countMissingReferenceAssets(project: PersistedVideoProject): number {
   const missingCharacterRefs = project.characters.filter((character) => !readyCharacterIds.has(character.id)).length;
   const missingSceneRefs = project.sceneSettings.filter((scene) => !readySceneIds.has(scene.id)).length;
   return missingCharacterRefs + missingSceneRefs;
+}
+
+function summarizeReferenceAutomationState(project: PersistedVideoProject): string {
+  const referenceTargets = Object.values(project.automationState?.referenceTargets || {});
+  if (!referenceTargets.length) return "";
+  const readyCount = referenceTargets.filter((target) => target.status === "ready").length;
+  const pendingCount = referenceTargets.filter(
+    (target) => target.status === "pending" || target.status === "retryable",
+  ).length;
+  const blockedCount = referenceTargets.filter((target) => target.status === "blocked").length;
+  const exhaustedCount = referenceTargets.filter((target) => target.status === "exhausted").length;
+
+  return [
+    readyCount > 0 ? `已就绪 ${readyCount} 个参考资产目标` : "",
+    pendingCount > 0 ? `${pendingCount} 个仍在自动补齐队列中` : "",
+    blockedCount > 0 ? `${blockedCount} 个因依赖主参考图暂时阻塞` : "",
+    exhaustedCount > 0 ? `${exhaustedCount} 个已转入 review 兜底` : "",
+  ]
+    .filter(Boolean)
+    .join("，");
 }
 
 function hasMinimumReferenceAssets(project: PersistedVideoProject): boolean {
@@ -2868,11 +3297,22 @@ function hasVideoBootstrapContext(project: PersistedVideoProject): boolean {
 }
 
 function hasReviewableVideoOutputs(project: PersistedVideoProject): boolean {
+  const hasSegmentOutputs =
+    (project.videoGenerationPrefs?.mode ?? "image-to-video") === "text-to-video" &&
+    [...new Set(
+      project.scenes
+        .map((scene) => scene.segmentLabel?.trim())
+        .filter((label): label is string => Boolean(label)),
+    )].some((label) => {
+      const status = String(project.segmentVideoStatuses?.[label]?.status || "").toLowerCase();
+      return Boolean(project.segmentVideos?.[label]?.trim()) || status === "failed";
+    });
   return Boolean(
     project.productionStateBundle?.directoryPath ||
       project.scenes.some(
         (scene) => !!scene.videoUrl || String(scene.videoStatus || "").toLowerCase() === "failed",
-      ),
+      ) ||
+      hasSegmentOutputs,
   );
 }
 
@@ -2890,6 +3330,14 @@ function deriveVisibleVideoStage(project: PersistedVideoProject): string {
     }
   }
 
+  if (hasReviewableVideoOutputs(project)) {
+    return "\u9884\u89c8\u4e0e\u5bfc\u51fa";
+  }
+
+  if (project.videoPromptBatch?.trim()) {
+    return "\u89c6\u9891\u751f\u6210";
+  }
+
   switch (deriveNaturalVideoStep(project)) {
     case 5:
       return "\u9884\u89c8\u4e0e\u5bfc\u51fa";
@@ -2903,32 +3351,11 @@ function deriveVisibleVideoStage(project: PersistedVideoProject): string {
     default:
       return "\u811a\u672c\u62c6\u89e3";
   }
-
-  if (hasReviewableVideoOutputs(project)) {
-    return "预览与导出";
-  }
-
-  if (project.videoPromptBatch?.trim()) {
-    return "视频生成";
-  }
-
-  if (!project.scenes.length || !hasExtractedVideoEntities(project)) {
-    return "脚本拆解";
-  }
-
-  if (!hasMinimumReferenceAssets(project)) {
-    return "角色与场景";
-  }
-
-  if (!hasStoryboardText(project) || !hasMinimumStoryboardFrames(project)) {
-    return "分镜图生成";
-  }
-
-  return "视频生成";
 }
 
 function buildVisibleVideoRecommendations(project: PersistedVideoProject): string[] {
   const stage = deriveVisibleVideoStage(project);
+  const breakdownPassed = hasPassedVideoScriptBreakdown(project);
   const generatedVideoCount = project.scenes.filter((scene) => scene.videoUrl).length;
   const failedVideoCount = countFailedVideoScenes(project);
   const storyboardedSceneCount = project.scenes.length - countMissingStoryboardFrames(project);
@@ -2943,9 +3370,9 @@ function buildVisibleVideoRecommendations(project: PersistedVideoProject): strin
   switch (stage) {
     case "脚本拆解":
       return [
-        "完成第一轮剧本拆解",
+        breakdownPassed ? "复核剧本拆解结果" : "完成第一轮剧本拆解",
         project.targetPlatform?.trim() ? "补充镜头风格偏好" : "补充平台与镜头偏好",
-        "确认出片目标",
+        breakdownPassed ? "确认出片目标" : "等待拆解通过内部检查",
       ];
     case "角色与场景":
       return [
@@ -2971,6 +3398,7 @@ function buildVisibleVideoRecommendations(project: PersistedVideoProject): strin
       ];
     case "视频生成":
       if (project.videoGenerationPrefs?.mode === "text-to-video") {
+        const videoBatchLimit = getHomeAgentVideoGenerationBatchLimit(project.videoGenerationPrefs);
         const runningSegmentCount = countRunningSegmentVideos(project);
         const failedSegmentCount = countFailedSegmentVideos(project);
         const generatableSegmentCount = countGeneratableSegmentVideos(project);
@@ -2979,10 +3407,10 @@ function buildVisibleVideoRecommendations(project: PersistedVideoProject): strin
             runningSegmentCount > 0
               ? `刷新 ${runningSegmentCount} 个进行中片段`
               : failedSegmentCount > 0
-                ? `补发 ${Math.min(failedSegmentCount, 3)} 个失败片段`
+                ? `补发 ${Math.min(failedSegmentCount, videoBatchLimit)} 个失败片段`
                 : generatableSegmentCount === 1
                   ? "生成当前片段"
-                  : `先生成前 ${Math.min(generatableSegmentCount, 3)} 个片段`,
+                  : `先生成前 ${Math.min(generatableSegmentCount, videoBatchLimit)} 个片段`,
             project.videoPromptBatch?.trim()
               ? "提交第一批视频生成"
               : shotPacketCount > 0
@@ -2995,13 +3423,13 @@ function buildVisibleVideoRecommendations(project: PersistedVideoProject): strin
       if (project.videoPromptBatch?.trim()) {
         return [
           runningTasks > 0 ? `刷新 ${runningTasks} 条进行中任务` : "提交第一批视频生成",
-          "继续微调视频提示词批次",
+          "继续微调视频提示词",
           shotPacketCount > 0 ? `复核 ${shotPacketCount} 个镜头指令包` : "编译镜头指令包",
         ];
       }
       return [
         shotPacketCount > 0 ? `复核 ${shotPacketCount} 个镜头指令包` : "编译镜头指令包",
-        project.videoPromptBatch?.trim() ? "提交第一批视频生成" : "准备视频提示词批次",
+        project.videoPromptBatch?.trim() ? "提交第一批视频生成" : "视频提示词生成方式",
         runningTasks > 0 ? `刷新 ${runningTasks} 条进行中任务` : "开始第一轮视频生成",
       ];
     case "预览与导出":
@@ -3022,16 +3450,44 @@ function buildVisibleVideoRecommendations(project: PersistedVideoProject): strin
 export async function loadConversationSnapshotById(
   projectId: string,
 ): Promise<ConversationProjectSnapshot | null> {
+  if (hasSessionResetMarkerForProject(projectId)) return null;
   const dramaProject = loadStoredDramaProjectById(projectId);
-  if (dramaProject) return applyConversationProjectMeta(createDramaSnapshot(dramaProject));
+  if (dramaProject) {
+    const repaired = await repairConversationSnapshotAutomationModes(
+      [applyConversationProjectMeta(createDramaSnapshot(dramaProject))],
+      readConversationProjectMetaMap(),
+    );
+    return repaired[0] ?? null;
+  }
 
   const { loadStoredVideoProjectById } = await loadVideoPersistenceModule();
   const videoProject = await loadStoredVideoProjectById(projectId);
-  if (videoProject) return applyConversationProjectMeta(createVideoSnapshot(videoProject));
+  if (videoProject) {
+    const repaired = await repairConversationSnapshotAutomationModes(
+      [applyConversationProjectMeta(createVideoSnapshot(videoProject))],
+      readConversationProjectMetaMap(),
+    );
+    return repaired[0] ?? null;
+  }
 
   const archive = await readConversationArchiveFull(projectId);
   const archiveSnapshot = archive?.session?.currentProjectSnapshot;
-  if (archiveSnapshot) return applyConversationProjectMeta(archiveSnapshot);
+  if (archiveSnapshot) {
+    const repaired = await repairConversationSnapshotAutomationModes(
+      [applyConversationProjectMeta(archiveSnapshot)],
+      readConversationProjectMetaMap(),
+    );
+    return repaired[0] ?? null;
+  }
+
+  const fileSnapshot = (await readProjectSessionFromFile(projectId))?.currentProjectSnapshot ?? null;
+  if (fileSnapshot) {
+    const repaired = await repairConversationSnapshotAutomationModes(
+      [applyConversationProjectMeta(fileSnapshot)],
+      readConversationProjectMetaMap(),
+    );
+    return repaired[0] ?? null;
+  }
 
   return null;
 }
@@ -3044,11 +3500,23 @@ export async function loadConversationSourceById(
   dramaProject: DramaProject | null;
   videoProject: PersistedVideoProject | null;
 }> {
+  if (hasSessionResetMarkerForProject(projectId)) {
+    return {
+      snapshot: null,
+      dramaProject: null,
+      videoProject: null,
+    };
+  }
+
   const includeSnapshot = options?.includeSnapshot !== false;
   const dramaProject = loadStoredDramaProjectById(projectId);
   if (dramaProject) {
+    const snapshot = includeSnapshot ? applyConversationProjectMeta(createDramaSnapshot(dramaProject)) : null;
+    const repairedSnapshot = snapshot
+      ? (await repairConversationSnapshotAutomationModes([snapshot], readConversationProjectMetaMap()))[0] ?? null
+      : null;
     return {
-      snapshot: includeSnapshot ? applyConversationProjectMeta(createDramaSnapshot(dramaProject)) : null,
+      snapshot: repairedSnapshot,
       dramaProject,
       videoProject: null,
     };
@@ -3059,8 +3527,12 @@ export async function loadConversationSourceById(
     fast: options?.fastVideoLoad === true,
   });
   if (videoProject) {
+    const snapshot = includeSnapshot ? applyConversationProjectMeta(createVideoSnapshot(videoProject)) : null;
+    const repairedSnapshot = snapshot
+      ? (await repairConversationSnapshotAutomationModes([snapshot], readConversationProjectMetaMap()))[0] ?? null
+      : null;
     return {
-      snapshot: includeSnapshot ? applyConversationProjectMeta(createVideoSnapshot(videoProject)) : null,
+      snapshot: repairedSnapshot,
       dramaProject: null,
       videoProject,
     };
@@ -3068,26 +3540,38 @@ export async function loadConversationSourceById(
 
   const materialized = await materializeConversationArchiveProjectById(projectId);
   if (materialized.dramaProject || materialized.videoProject) {
+    const snapshot = includeSnapshot && materialized.snapshot ? applyConversationProjectMeta(materialized.snapshot) : null;
+    const repairedSnapshot = snapshot
+      ? (await repairConversationSnapshotAutomationModes([snapshot], readConversationProjectMetaMap()))[0] ?? null
+      : null;
     return {
-      snapshot: includeSnapshot && materialized.snapshot ? applyConversationProjectMeta(materialized.snapshot) : null,
+      snapshot: repairedSnapshot,
       dramaProject: materialized.dramaProject,
       videoProject: materialized.videoProject,
     };
   }
-
-  if (readSessionResetMarker() === projectId) {
+  const archive = await readConversationArchiveFull(projectId);
+  const archiveSnapshot = archive?.session?.currentProjectSnapshot ?? null;
+  if (archiveSnapshot) {
+    const snapshot = includeSnapshot ? applyConversationProjectMeta(archiveSnapshot) : null;
+    const repairedSnapshot = snapshot
+      ? (await repairConversationSnapshotAutomationModes([snapshot], readConversationProjectMetaMap()))[0] ?? null
+      : null;
     return {
-      snapshot: null,
+      snapshot: repairedSnapshot,
       dramaProject: null,
       videoProject: null,
     };
   }
 
-  const archive = await readConversationArchiveFull(projectId);
-  const archiveSnapshot = archive?.session?.currentProjectSnapshot ?? null;
-  if (archiveSnapshot) {
+  const fileSnapshot = (await readProjectSessionFromFile(projectId))?.currentProjectSnapshot ?? null;
+  if (fileSnapshot) {
+    const snapshot = includeSnapshot ? applyConversationProjectMeta(fileSnapshot) : null;
+    const repairedSnapshot = snapshot
+      ? (await repairConversationSnapshotAutomationModes([snapshot], readConversationProjectMetaMap()))[0] ?? null
+      : null;
     return {
-      snapshot: includeSnapshot ? applyConversationProjectMeta(archiveSnapshot) : null,
+      snapshot: repairedSnapshot,
       dramaProject: null,
       videoProject: null,
     };
@@ -3104,18 +3588,23 @@ export async function listRecentConversationSnapshots(
   limit = 8,
   options?: { fast?: boolean },
 ): Promise<ConversationProjectSnapshot[]> {
-  const deletedProjectId = readSessionResetMarker();
+  await cleanupResetMarkedConversationArchives();
   const metaMap = readConversationProjectMetaMap();
   const applyMeta = (snapshot: ConversationProjectSnapshot) =>
     applyConversationProjectMetaFromMap(snapshot, metaMap);
   const archiveSnapshots = (await listConversationArchiveSnapshots())
-    .filter((snapshot) => snapshot.projectId !== deletedProjectId)
+    .filter((snapshot) => !hasSessionResetMarkerForProject(snapshot.projectId))
     .map(applyMeta);
-  const dramaSnapshots = listStoredDramaProjects().map((project) => applyMeta(createDramaSnapshot(project)));
+  const archiveProjectIds = new Set(archiveSnapshots.map((snapshot) => snapshot.projectId));
+  const dramaSnapshots = listStoredDramaProjects()
+    .filter((project) => !hasSessionResetMarkerForProject(project.id))
+    .map((project) => applyMeta(createDramaSnapshot(project)));
   const { listStoredVideoProjects } = await loadVideoPersistenceModule();
-  const videoSnapshots = (await listStoredVideoProjects({ fast: options?.fast })).map((project) =>
-    applyMeta(options?.fast ? createVideoSnapshotLite(project) : createVideoSnapshot(project)),
-  );
+  const videoSnapshots = (await listStoredVideoProjects({ fast: options?.fast }))
+    .filter((project) => !hasSessionResetMarkerForProject(project.id))
+    .map((project) =>
+      applyMeta(options?.fast ? createVideoSnapshotLite(project) : createVideoSnapshot(project)),
+    );
   const snapshotsById = new Map<string, ConversationProjectSnapshot>();
   for (const snapshot of archiveSnapshots) {
     snapshotsById.set(snapshot.projectId, snapshot);
@@ -3123,8 +3612,25 @@ export async function listRecentConversationSnapshots(
   for (const snapshot of [...dramaSnapshots, ...videoSnapshots]) {
     snapshotsById.set(snapshot.projectId, snapshot);
   }
+  const sessionFallbackSnapshots = await listSessionBackedConversationSnapshots(
+    new Set(snapshotsById.keys()),
+  );
+  for (const snapshot of sessionFallbackSnapshots) {
+    snapshotsById.set(snapshot.projectId, applyMeta(snapshot));
+  }
+  const repairedSnapshots = await repairConversationSnapshotAutomationModes(
+    [...snapshotsById.values()],
+    metaMap,
+  );
 
-  return [...snapshotsById.values()]
+  if (!options?.fast) {
+    for (const snapshot of repairedSnapshots) {
+      if (archiveProjectIds.has(snapshot.projectId)) continue;
+      queueConversationArchiveBackfill(snapshot);
+    }
+  }
+
+  return repairedSnapshots
     .sort((a, b) => {
       const pinnedDelta = Number(Boolean(b.pinned)) - Number(Boolean(a.pinned));
       if (pinnedDelta !== 0) return pinnedDelta;
@@ -3173,6 +3679,7 @@ export async function setConversationProjectAutomationMode(
   projectId: string,
   automationMode: "manual" | "full-auto",
 ): Promise<void> {
+  inferredConversationAutomationModeCache.set(projectId, normalizeAutomationMode(automationMode));
   const map = readConversationProjectMetaMap();
   const current = map[projectId] ?? {};
   map[projectId] = { ...current, automationMode: normalizeAutomationMode(automationMode) };
@@ -3249,24 +3756,119 @@ export async function cleanupConversationProjectExpiredVideoMedia(
 }
 
 /** Remove drama/video project storage and per-project studio session for one conversation. */
-export async function deleteConversationProject(
-  snapshot: Pick<ConversationProjectSnapshot, "projectId" | "projectKind">,
-): Promise<void> {
-  removeProjectStudioSession(snapshot.projectId);
-  removeConversationProjectMeta(snapshot.projectId);
+type ConversationProjectDeletionTarget = Pick<ConversationProjectSnapshot, "projectId" | "projectKind">;
+
+async function resolveConversationProjectDeletionTargets(
+  snapshot: Pick<ConversationProjectSnapshot, "projectId" | "projectKind" | "sourceProjectId">,
+): Promise<ConversationProjectDeletionTarget[]> {
+  const requestedProjectId = snapshot.projectId.trim();
+  if (!requestedProjectId) return [];
+
+  const targets = new Map<string, ConversationProjectDeletionTarget>();
+  const addTarget = (projectId: string, projectKind: ConversationProjectSnapshot["projectKind"]) => {
+    const normalizedProjectId = projectId.trim();
+    if (!normalizedProjectId) return;
+    targets.set(normalizedProjectId, {
+      projectId: normalizedProjectId,
+      projectKind,
+    });
+  };
+
+  addTarget(requestedProjectId, snapshot.projectKind);
+
+  const { listStoredVideoProjects, loadStoredVideoProjectById } = await loadVideoPersistenceModule();
+
   if (snapshot.projectKind === "video") {
-    const { deleteStoredVideoProjectById } = await loadVideoPersistenceModule();
-    await deleteStoredVideoProjectById(snapshot.projectId);
-  } else {
-    deleteStoredDramaProject(snapshot.projectId);
+    const storedVideoProject = await loadStoredVideoProjectById(requestedProjectId, { fast: true });
+    let sourceProjectId =
+      typeof snapshot.sourceProjectId === "string" ? snapshot.sourceProjectId.trim() : "";
+    if (!sourceProjectId) {
+      sourceProjectId =
+        typeof storedVideoProject?.sourceProjectId === "string"
+          ? storedVideoProject.sourceProjectId.trim()
+          : "";
+    }
+    if (!sourceProjectId) {
+      return [...targets.values()];
+    }
+
+    const linkedVideoProjects = (await listStoredVideoProjects({ fast: true })).filter(
+      (project) =>
+        typeof project.sourceProjectId === "string" &&
+        project.sourceProjectId.trim() === sourceProjectId,
+    );
+
+    // Bridged "use current script" cards project the live video snapshot onto the
+    // source script session shell. When the card is deleted we need to map that
+    // shell back to the underlying script/video pair instead of treating the
+    // script id like a real stored video id.
+    if (!storedVideoProject && sourceProjectId === requestedProjectId) {
+      targets.delete(requestedProjectId);
+      if (loadStoredDramaProjectById(sourceProjectId)) {
+        addTarget(sourceProjectId, "script");
+      }
+      if (linkedVideoProjects.length === 1) {
+        addTarget(linkedVideoProjects[0].id, "video");
+      }
+      return [...targets.values()];
+    }
+
+    const siblingVideoProjects = linkedVideoProjects.filter(
+      (project) => project.id !== requestedProjectId,
+    );
+    if (!siblingVideoProjects.length && loadStoredDramaProjectById(sourceProjectId)) {
+      addTarget(sourceProjectId, "script");
+    }
+    return [...targets.values()];
   }
-  await deleteConversationArchive(snapshot.projectId);
+
+  const linkedVideoProjects = (await listStoredVideoProjects({ fast: true })).filter(
+    (project) =>
+      typeof project.sourceProjectId === "string" &&
+      project.sourceProjectId.trim() === requestedProjectId,
+  );
+  if (linkedVideoProjects.length === 1) {
+    addTarget(linkedVideoProjects[0].id, "video");
+  }
+
+  return [...targets.values()];
+}
+
+export async function deleteConversationProject(
+  snapshot: Pick<ConversationProjectSnapshot, "projectId" | "projectKind" | "sourceProjectId">,
+): Promise<{ deletedProjectIds: string[] }> {
+  const deletionTargets = await resolveConversationProjectDeletionTargets(snapshot);
+  const { deleteStoredVideoProjectById } = await loadVideoPersistenceModule();
+  const { getProjectRootPath } = await import("@/lib/file-cache");
+
+  for (const target of deletionTargets) {
+    removeProjectStudioSession(target.projectId);
+    removeConversationProjectMeta(target.projectId);
+    if (target.projectKind === "video") {
+      await deleteStoredVideoProjectById(target.projectId);
+    } else {
+      deleteStoredDramaProject(target.projectId);
+    }
+    await deleteConversationArchive(target.projectId);
+    // Remove cached media files for the deleted project as well.
+    const legacyDir = await getProjectRootPath(target.projectId);
+    if (legacyDir) {
+      await window.electronAPI?.storage?.deleteDir?.(legacyDir);
+    }
+  }
+
+  return {
+    deletedProjectIds: deletionTargets.map((target) => target.projectId),
+  };
+  /*
+  for (const target of deletionTargets) {
   // 删除项目文件目录（图片、视频等缓存文件）
   const { getProjectRootPath } = await import("@/lib/file-cache");
-  const legacyDir = await getProjectRootPath(snapshot.projectId);
+    removeProjectStudioSession(target.projectId);
   if (legacyDir) {
     await window.electronAPI?.storage?.deleteDir?.(legacyDir);
   }
+  */
 }
 
 /** 原地复制一个对话项目（含会话消息），返回新项目的快照。 */
@@ -3274,6 +3876,7 @@ export async function duplicateConversationProject(
   snapshot: ConversationProjectSnapshot,
 ): Promise<ConversationProjectSnapshot | null> {
   const now = new Date().toISOString();
+  const nextTitle = await buildNextDuplicateConversationTitle(snapshot.title);
   // 优先从文件系统读取完整会话（无截断），回退到 localStorage 的压缩版本
   const fileSession = await readProjectSessionFromFile(snapshot.projectId);
   const localSession = readProjectStudioSession(snapshot.projectId);
@@ -3281,16 +3884,47 @@ export async function duplicateConversationProject(
     fileSession && (!localSession || fileSession.messages.length >= localSession.messages.length)
       ? fileSession
       : localSession;
+  const duplicateSessionOnlyConversation = async (): Promise<ConversationProjectSnapshot | null> => {
+    if (!srcSession) return null;
+    const newId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const duplicatedSnapshot: ConversationProjectSnapshot = {
+      ...(srcSession.currentProjectSnapshot ?? snapshot),
+      projectId: newId,
+      title: nextTitle,
+      updatedAt: now,
+      automationMode: normalizeAutomationMode(
+        srcSession.currentProjectSnapshot?.automationMode ??
+          srcSession.automationMode ??
+          snapshot.automationMode,
+      ),
+    };
+    await writeProjectStudioSession({
+      ...srcSession,
+      automationMode: normalizeAutomationMode(srcSession.automationMode ?? snapshot.automationMode),
+      projectId: newId,
+      sessionId: undefined,
+      currentProjectSnapshot: duplicatedSnapshot,
+    });
+    const metaMap = readConversationProjectMetaMap();
+    metaMap[newId] = {
+      ...metaMap[newId],
+      customTitle: nextTitle,
+      automationMode: normalizeAutomationMode(duplicatedSnapshot.automationMode),
+    };
+    writeConversationProjectMetaMap(metaMap);
+    await setConversationProjectAutomationMode(newId, normalizeAutomationMode(duplicatedSnapshot.automationMode));
+    return (await loadConversationSnapshotById(newId))?.snapshot ?? applyConversationProjectMeta(duplicatedSnapshot);
+  };
 
   if (snapshot.projectKind === "video") {
     const { loadStoredVideoProjectById, upsertStoredVideoProject } = await loadVideoPersistenceModule();
     const src = await loadStoredVideoProjectById(snapshot.projectId);
-    if (!src) return null;
+    if (!src) return duplicateSessionOnlyConversation();
     const newId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     await upsertStoredVideoProject({
       ...src,
       id: newId,
-      title: `${src.title || snapshot.title} - 副本`,
+      title: nextTitle,
       createdAt: now,
       updatedAt: now,
     });
@@ -3304,22 +3938,30 @@ export async function duplicateConversationProject(
           ? {
               ...srcSession.currentProjectSnapshot,
               projectId: newId,
+              title: nextTitle,
               automationMode: normalizeAutomationMode(srcSession.currentProjectSnapshot.automationMode ?? snapshot.automationMode),
             }
           : srcSession.currentProjectSnapshot,
       });
     }
+    const metaMap = readConversationProjectMetaMap();
+    metaMap[newId] = {
+      ...metaMap[newId],
+      customTitle: nextTitle,
+      automationMode: normalizeAutomationMode(snapshot.automationMode),
+    };
+    writeConversationProjectMetaMap(metaMap);
     await setConversationProjectAutomationMode(newId, normalizeAutomationMode(snapshot.automationMode));
     return loadConversationSnapshotById(newId);
   }
 
   const src = loadStoredDramaProjectById(snapshot.projectId);
-  if (!src) return null;
+  if (!src) return duplicateSessionOnlyConversation();
   const newId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   upsertStoredDramaProject({
     ...src,
     id: newId,
-    dramaTitle: `${src.dramaTitle || snapshot.title} - 副本`,
+    dramaTitle: nextTitle,
     createdAt: now,
     updatedAt: now,
   });
@@ -3333,11 +3975,19 @@ export async function duplicateConversationProject(
         ? {
             ...srcSession.currentProjectSnapshot,
             projectId: newId,
+            title: nextTitle,
             automationMode: normalizeAutomationMode(srcSession.currentProjectSnapshot.automationMode ?? snapshot.automationMode),
           }
         : srcSession.currentProjectSnapshot,
     });
   }
+  const metaMap = readConversationProjectMetaMap();
+  metaMap[newId] = {
+    ...metaMap[newId],
+    customTitle: nextTitle,
+    automationMode: normalizeAutomationMode(snapshot.automationMode),
+  };
+  writeConversationProjectMetaMap(metaMap);
   await setConversationProjectAutomationMode(newId, normalizeAutomationMode(snapshot.automationMode));
   return loadConversationSnapshotById(newId);
 }

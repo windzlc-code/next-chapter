@@ -10,6 +10,7 @@ interface UseSmartScrollOptions {
   followTargetOffsetRatio?: number;
   resetKey?: unknown;
   showUnreadOnBlocked?: boolean;
+  preferPhysicalBottomWhenLocked?: boolean;
   threshold?: number;
   smooth?: boolean;
 }
@@ -38,6 +39,7 @@ export function useSmartScroll({
   followTargetOffsetRatio = DEFAULT_FOLLOW_TARGET_OFFSET_RATIO,
   resetKey,
   showUnreadOnBlocked = false,
+  preferPhysicalBottomWhenLocked = false,
   threshold = 180,
   smooth = true,
 }: UseSmartScrollOptions) {
@@ -292,8 +294,20 @@ export function useSmartScroll({
     }
 
     setHasUnreadMessage(false);
+    if (preferPhysicalBottomWhenLocked) {
+      scheduleScrollToPhysicalBottom(false);
+      return;
+    }
     scrollToBottom(true);
-  }, [active, dependency, isUserIdle, scrollToBottom, showUnreadOnBlocked]);
+  }, [
+    active,
+    dependency,
+    isUserIdle,
+    preferPhysicalBottomWhenLocked,
+    scheduleScrollToPhysicalBottom,
+    scrollToBottom,
+    showUnreadOnBlocked,
+  ]);
 
   useEffect(() => {
     if (!active || forceBottomDependency == null) return;
@@ -309,7 +323,7 @@ export function useSmartScroll({
       resizeRafRef.current = window.requestAnimationFrame(() => {
         resizeRafRef.current = null;
         if (!lockedRef.current) return;
-        if (forceBottomDependency != null) {
+        if (forceBottomDependency != null || preferPhysicalBottomWhenLocked) {
           scheduleScrollToPhysicalBottom(true);
           return;
         }
@@ -325,7 +339,14 @@ export function useSmartScroll({
         resizeRafRef.current = null;
       }
     };
-  }, [active, endRef, forceBottomDependency, scheduleScrollToPhysicalBottom, scrollToBottom]);
+  }, [
+    active,
+    endRef,
+    forceBottomDependency,
+    preferPhysicalBottomWhenLocked,
+    scheduleScrollToPhysicalBottom,
+    scrollToBottom,
+  ]);
 
   useEffect(
     () => () => {
@@ -335,5 +356,5 @@ export function useSmartScroll({
     [cancelPhysicalBottomScroll, cancelScroll],
   );
 
-  return { scrollToBottom, isNearBottom, hasUnreadMessage };
+  return { scrollToBottom, scrollToPhysicalBottom, isNearBottom, hasUnreadMessage };
 }

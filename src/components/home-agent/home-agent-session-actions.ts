@@ -7,11 +7,15 @@ import {
   isOriginalScriptKickoffRequest,
   type OriginalScriptKickoffCompletion,
   isOriginalScriptKickoffGenreQuestion,
+  shouldTreatOriginalScriptKickoffInputAsAnswer,
 } from "@/lib/home-agent/original-script-kickoff";
 import {
+  advanceAdaptationWorkflowUploadSuggestion,
+  buildAdaptationUploadInstruction,
   advanceAdaptationWorkflowKickoff,
-  buildAdaptationWorkflowStartPrompt,
+  buildAdaptationWorkflowStartDialogPrompt,
   isAdaptationWorkflowKickoffRequest,
+  isAdaptationWorkflowUploadSuggestionRequest,
   type AdaptationWorkflowKickoffCompletion,
 } from "@/lib/home-agent/adaptation-workflow-kickoff";
 import {
@@ -175,7 +179,20 @@ export function answerHomeAgentQuestion(params: {
     setSelectedValues([]);
     resetComposerDraft("");
     void Promise.resolve(completeAdaptationWorkflowKickoff?.(completion)).catch(() => {
-      void send(buildAdaptationWorkflowStartPrompt(), completion.userBubble);
+      void send(buildAdaptationWorkflowStartDialogPrompt(), completion.userBubble);
+    });
+    return;
+  }
+
+  if (isAdaptationWorkflowUploadSuggestionRequest(qState.request)) {
+    const completion = advanceAdaptationWorkflowUploadSuggestion({ value, label });
+    if (!completion) return;
+    setQState(null);
+    setSelectedValues([]);
+    resetComposerDraft("");
+    void Promise.resolve(completeAdaptationWorkflowKickoff?.(completion)).catch(() => {
+      push("user", completion.userBubble);
+      push("assistant", buildAdaptationUploadInstruction());
     });
     return;
   }
@@ -286,21 +303,22 @@ export function buildConfirmedStructuredAnswer(params: {
 export function launchTemplateConversation(params: {
   prompt: string;
   title: string;
-  dreaminaAvailable: boolean;
-  flashMaintenanceHint: (message: string, duration?: number) => void;
-  markDreaminaSurfaced: () => void;
   send: (prompt: string, shown?: string) => Promise<void>;
 }) {
-  const { prompt, title, dreaminaAvailable, flashMaintenanceHint, markDreaminaSurfaced, send } = params;
-
-  if (dreaminaAvailable && title.includes("视频")) {
-    flashMaintenanceHint("已接入 Dreamina CLI，可直接使用 Seedance 2.0", 2400);
-    markDreaminaSurfaced();
-  }
+  const { prompt, title, send } = params;
   void send(prompt, title);
 }
 
-export function resetRuntimeState(setRuntime: React.Dispatch<React.SetStateAction<StudioRuntimeState>>) {
+export function resetRuntimeState(
+  setRuntime: React.Dispatch<React.SetStateAction<StudioRuntimeState>>,
+  runtimeRef?: React.MutableRefObject<StudioRuntimeState>,
+) {
+  if (runtimeRef) {
+    const nextRuntime = buildResetRuntimeState(runtimeRef.current);
+    runtimeRef.current = nextRuntime;
+    setRuntime(() => nextRuntime);
+    return;
+  }
   setRuntime((prev) => buildResetRuntimeState(prev));
 }
 
@@ -420,6 +438,7 @@ export function submitHomeAgentComposer(params: {
   ) => Promise<void>;
 }) {
   const { qState, question, draft, attachmentsPresent, confirmStructuredAnswer, deferQuestionToChat, answer, send } = params;
+  const trimmedDraft = draft.trim();
 
   if (qState && (question?.submissionMode === "confirm" || question?.multiSelect)) {
     confirmStructuredAnswer();
@@ -427,11 +446,21 @@ export function submitHomeAgentComposer(params: {
   }
 
   if (qState) {
-    if ((draft.trim() || attachmentsPresent) && deferQuestionToChat) {
+    if (isOriginalScriptKickoffRequest(qState.request) && trimmedDraft && !attachmentsPresent) {
+      if (shouldTreatOriginalScriptKickoffInputAsAnswer({ qState, draft: trimmedDraft })) {
+        answer(trimmedDraft);
+        return;
+      }
+      if (deferQuestionToChat) {
+        deferQuestionToChat();
+        return;
+      }
+    }
+    if ((trimmedDraft || attachmentsPresent) && deferQuestionToChat) {
       deferQuestionToChat();
       return;
     }
-    answer(draft);
+    answer(trimmedDraft);
     return;
   }
 

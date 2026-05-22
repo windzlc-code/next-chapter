@@ -75,7 +75,7 @@ const FAMILY_OPTIONS: HomeAgentImageModelFamilyOption[] = [
     key: "gpt-image-2",
     label: "gpt-image-2",
     description: "OpenAI-compatible image generation route through /v1/images/generations.",
-    maxImagesPerRun: 4,
+    maxImagesPerRun: 8,
   },
 ];
 
@@ -218,7 +218,27 @@ const RESOLUTION_LABELS: Record<VideoImageResolution, string> = {
   "4k": "4K",
 };
 
-const SUPPORTED_ASPECT_RATIOS: VideoImageAspectRatio[] = ["16:9", "9:16", "1:1", "2:3", "3:2"];
+const SUPPORTED_ASPECT_RATIOS: VideoImageAspectRatio[] = [
+  "16:9",
+  "9:16",
+  "1:1",
+  "4:3",
+  "3:4",
+  "4:5",
+  "5:4",
+  "2:3",
+  "3:2",
+];
+const SINGLE_VIEW_SUPPORTED_ASPECT_RATIOS: VideoImageAspectRatio[] = [
+  "9:16",
+  "1:1",
+  "4:3",
+  "3:4",
+  "4:5",
+  "5:4",
+  "2:3",
+  "3:2",
+];
 
 function normalizeVideoImageViewMode(
   value?: string | null,
@@ -252,6 +272,14 @@ export function listHomeAgentImageResolutions(): Array<{ value: VideoImageResolu
 
 export function listHomeAgentImageAspectRatios(): VideoImageAspectRatio[] {
   return [...SUPPORTED_ASPECT_RATIOS];
+}
+
+export function listHomeAgentImageAspectRatiosForViewMode(
+  viewMode?: string | null,
+): VideoImageAspectRatio[] {
+  return normalizeVideoImageViewMode(viewMode) === "single"
+    ? [...SINGLE_VIEW_SUPPORTED_ASPECT_RATIOS]
+    : [...SUPPORTED_ASPECT_RATIOS];
 }
 
 export function normalizeHomeAgentImageModelFamilyKey(
@@ -291,6 +319,43 @@ export function normalizeVideoImageAspectRatio(value?: string | null): VideoImag
   return SUPPORTED_ASPECT_RATIOS.includes(normalized as VideoImageAspectRatio)
     ? (normalized as VideoImageAspectRatio)
     : DEFAULT_HOME_AGENT_IMAGE_GENERATION_PREFS.aspectRatio;
+}
+
+export function imageViewModeSupportsAspectRatio(
+  viewMode?: string | null,
+  aspectRatio?: string | null,
+): boolean {
+  const normalizedAspectRatio = normalizeVideoImageAspectRatio(aspectRatio);
+  return listHomeAgentImageAspectRatiosForViewMode(viewMode).includes(normalizedAspectRatio);
+}
+
+export function resolveVideoImageAspectRatioForViewMode(
+  viewMode?: string | null,
+  aspectRatio?: string | null,
+): VideoImageAspectRatio {
+  const normalizedAspectRatio = normalizeVideoImageAspectRatio(aspectRatio);
+  if (imageViewModeSupportsAspectRatio(viewMode, normalizedAspectRatio)) {
+    return normalizedAspectRatio;
+  }
+  return normalizeVideoImageViewMode(viewMode) === "single"
+    ? SINGLE_VIEW_SUPPORTED_ASPECT_RATIOS[0]
+    : normalizedAspectRatio;
+}
+
+export function applyVideoImageViewModeConstraints(
+  value?: Partial<VideoImageGenerationPrefs> | null,
+): VideoImageGenerationPrefs {
+  const normalized = normalizeVideoImageGenerationPrefs(value);
+  if (normalized.viewMode !== "single") {
+    return normalized;
+  }
+  return {
+    ...normalized,
+    aspectRatio: resolveVideoImageAspectRatioForViewMode(
+      normalized.viewMode,
+      normalized.aspectRatio,
+    ),
+  };
 }
 
 export function inferVideoImageStyleCategoryFromPreset(

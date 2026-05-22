@@ -13,6 +13,7 @@ type PushMessage = (
   artifactIds?: string[],
   attachments?: ChatAttachment[],
   artifactSnapshots?: ConversationArtifact[],
+  messageExtras?: Partial<Pick<HomeAgentMessage, "automationOrigin" | "workflowRefresh">>,
 ) => void;
 
 export function createWorkflowShortcutUiBridge(params: {
@@ -31,6 +32,7 @@ export function createWorkflowShortcutUiBridge(params: {
   ) => void;
   setStreaming: (streaming: boolean) => void;
   setSuggested: (question: ComposerQuestion | null) => void;
+  getAssistantMessageExtras?: () => Partial<Pick<HomeAgentMessage, "automationOrigin" | "workflowRefresh">> | undefined;
 }) {
   const {
     activateConversation,
@@ -42,6 +44,7 @@ export function createWorkflowShortcutUiBridge(params: {
     setPopoverQuestion,
     setStreaming,
     setSuggested,
+    getAssistantMessageExtras,
   } = params;
 
   return {
@@ -50,7 +53,7 @@ export function createWorkflowShortcutUiBridge(params: {
     commitRuntime,
     getSuggestedQuestion,
     pushAssistant: (content: string, artifactIds?: string[], artifactSnapshots?: ConversationArtifact[]) =>
-      push("assistant", content, artifactIds, undefined, artifactSnapshots),
+      push("assistant", content, artifactIds, undefined, artifactSnapshots, getAssistantMessageExtras?.()),
     pushUser: (content: string) => push("user", content),
     resetComposerDraft: () => resetComposerDraft(""),
     setPopoverQuestion,
@@ -65,16 +68,31 @@ export function showChoicePopoverMessage(params: {
   nextQuestion: ComposerQuestion;
   push: PushMessage;
   setPopoverOverride: (question: ComposerQuestion | null) => void;
+  openPopoverQuestion?: (question: ComposerQuestion | null) => void | boolean;
   setSuggested: (question: ComposerQuestion | null) => void;
   setMode: (mode: "active") => void;
   resetComposerDraft: (value?: string) => void;
 }) {
-  const { label, assistantMessage, nextQuestion, push, setPopoverOverride, setSuggested, setMode, resetComposerDraft } =
+  const {
+    label,
+    assistantMessage,
+    nextQuestion,
+    push,
+    setPopoverOverride,
+    openPopoverQuestion,
+    setSuggested,
+    setMode,
+    resetComposerDraft,
+  } =
     params;
 
   push("user", label);
   push("assistant", assistantMessage);
-  setPopoverOverride(nextQuestion);
+  if (openPopoverQuestion) {
+    openPopoverQuestion(nextQuestion);
+  } else {
+    setPopoverOverride(nextQuestion);
+  }
   setSuggested(null);
   setMode("active");
   resetComposerDraft("");
@@ -84,6 +102,7 @@ export function showChoiceNoticeMessage(params: {
   label: string;
   assistantMessage: string;
   nextSuggestion?: ComposerQuestion | null;
+  preservePopover?: boolean;
   push: PushMessage;
   setPopoverOverride: (question: ComposerQuestion | null) => void;
   setSuggested: (question: ComposerQuestion | null) => void;
@@ -94,6 +113,7 @@ export function showChoiceNoticeMessage(params: {
     label,
     assistantMessage,
     nextSuggestion = null,
+    preservePopover = false,
     push,
     setPopoverOverride,
     setSuggested,
@@ -103,7 +123,9 @@ export function showChoiceNoticeMessage(params: {
 
   push("user", label);
   push("assistant", assistantMessage);
-  setPopoverOverride(null);
+  if (!preservePopover) {
+    setPopoverOverride(null);
+  }
   setSuggested(nextSuggestion);
   setMode("active");
   resetComposerDraft("");

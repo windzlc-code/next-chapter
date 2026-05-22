@@ -241,7 +241,7 @@ export function localizeMediaSettingValue(
     if (lower === "text-to-video") return "文生视频";
   }
   if (kind === "provider") {
-    if (lower === "jimeng" || lower === "dreamina") return "即梦";
+    if (lower === "jimeng") return "即梦";
   }
 
   return normalized;
@@ -254,6 +254,17 @@ export function buildMediaContentSummary(params: {
   runtime?: StudioRuntimeState | null;
   targetIds?: string[];
 }): string {
+  if (params.action === "generate_segment_video" && params.targetIds?.length) {
+    return unique(
+      params.targetIds
+        .map((targetId) => String(targetId || "").trim())
+        .filter(Boolean)
+        .map((targetId) => `片段${targetId}`),
+    )
+      .slice(0, 3)
+      .join(" 路 ");
+  }
+
   const prompt = normalizePromptText(params.promptText);
   const subject = prompt ? extractPromptSubject(prompt) : "";
   const runtimeContext = collectRuntimeTargetContext(params.runtime, params.targetIds, subject);

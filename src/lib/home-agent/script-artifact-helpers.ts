@@ -25,18 +25,73 @@ const DIRECTORY_KEY_MARKER_PATTERN = /🔥|关键(?:剧情)?集?|重点/;
 const DIRECTORY_CLIMAX_MARKER_PATTERN = /⚡|高潮(?:卡点)?集?/;
 const DIRECTORY_PAYWALL_MARKER_PATTERN = /💰|付费(?:卡点)?集?|付费点|付费墙/;
 
+const MERMAID_BLOCK_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
+const DETAILED_MERMAID_INFO_PATTERN = /\bmermaid(?:[-_\s]+detailed|\b.*\bdetailed\b)/i;
+const DETAILED_MERMAID_CONTEXT_PATTERN = /详细关系图|完整关系图|完整版关系图|全部关系图|含\s*NPC|all(?:\s+plot-driving)?\s+characters|detailed relationship/i;
+const SIMPLE_MERMAID_CONTEXT_PATTERN = /简单关系图|简洁关系图|主要人物关系图|simple relationship/i;
+
+type MermaidBlock = {
+  info: string;
+  code: string;
+  index: number;
+};
+
+function extractMermaidBlocks(text: string): MermaidBlock[] {
+  const normalized = text.replace(/\r/g, "");
+  const blocks: MermaidBlock[] = [];
+
+  for (const match of normalized.matchAll(MERMAID_BLOCK_PATTERN)) {
+    const info = (match[1] || "").trim();
+    if (!/^mermaid\b/i.test(info)) continue;
+    const code = (match[2] || "").trim();
+    if (!code) continue;
+    blocks.push({
+      info,
+      code,
+      index: match.index ?? 0,
+    });
+  }
+
+  return blocks;
+}
+
+function getMermaidContext(text: string, block: MermaidBlock): string {
+  return text
+    .replace(/\r/g, "")
+    .slice(Math.max(0, block.index - 160), block.index)
+    .trim();
+}
+
+function isDetailedMermaidBlock(text: string, block: MermaidBlock): boolean {
+  return DETAILED_MERMAID_INFO_PATTERN.test(block.info)
+    || DETAILED_MERMAID_CONTEXT_PATTERN.test(getMermaidContext(text, block));
+}
+
+function isSimpleMermaidBlock(text: string, block: MermaidBlock): boolean {
+  if (isDetailedMermaidBlock(text, block)) return false;
+  return SIMPLE_MERMAID_CONTEXT_PATTERN.test(getMermaidContext(text, block));
+}
+
 export function extractMermaidCode(text: string): string | null {
-  const match = text.match(/```mermaid\s*\n([\s\S]*?)```/);
-  return match ? match[1].trim() : null;
+  const blocks = extractMermaidBlocks(text);
+  if (!blocks.length) return null;
+
+  return blocks.find((block) => isSimpleMermaidBlock(text, block))?.code
+    ?? blocks.find((block) => !isDetailedMermaidBlock(text, block))?.code
+    ?? blocks[0]?.code
+    ?? null;
 }
 
 export function extractDetailedMermaidCode(text: string): string | null {
-  const match = text.match(/```mermaid-detailed\s*\n([\s\S]*?)```/);
-  return match ? match[1].trim() : null;
+  const blocks = extractMermaidBlocks(text);
+  if (!blocks.length) return null;
+
+  return blocks.find((block) => isDetailedMermaidBlock(text, block))?.code
+    ?? (blocks.length >= 2 ? blocks[1].code : null);
 }
 
 export function stripMermaidCodeBlocks(text: string): string {
-  return text.replace(/```mermaid(?:-detailed)?\s*\n[\s\S]*?```\s*/g, "").trim();
+  return text.replace(/```mermaid[^\n`]*\n[\s\S]*?```\s*/gi, "").trim();
 }
 
 export function sanitizeMermaidCode(input: string): string {
@@ -62,7 +117,9 @@ export function isNonChineseText(text: string): boolean {
   return chineseCount / Math.max(sample.length, 1) < 0.12;
 }
 
-export function parseDramaDirectoryText(raw: string): EpisodeEntry[] {
+export function parseDramaDirectoryText(raw: unknown): EpisodeEntry[] {
+  if (typeof raw !== "string" || !raw.trim()) return [];
+
   return raw
     .replace(/\r/g, "")
     .split("\n")
@@ -96,17 +153,18 @@ export function parseDramaDirectoryText(raw: string): EpisodeEntry[] {
 }
 
 export function repairDramaDirectoryFromRaw(
-  directoryRaw: string,
-  existingDirectory: EpisodeEntry[],
+  directoryRaw: unknown,
+  existingDirectory: EpisodeEntry[] | null | undefined,
 ): EpisodeEntry[] {
+  const safeExistingDirectory = Array.isArray(existingDirectory) ? existingDirectory : [];
   const parsedDirectory = parseDramaDirectoryText(directoryRaw);
-  if (!parsedDirectory.length) return existingDirectory;
-  if (existingDirectory.length === 0) return parsedDirectory;
-  if (parsedDirectory.length !== existingDirectory.length) return existingDirectory;
+  if (!parsedDirectory.length) return safeExistingDirectory;
+  if (safeExistingDirectory.length === 0) return parsedDirectory;
+  if (parsedDirectory.length !== safeExistingDirectory.length) return safeExistingDirectory;
 
   const parsedByEpisode = new Map(parsedDirectory.map((entry) => [entry.number, entry]));
 
-  return existingDirectory.map((entry) => {
+  return safeExistingDirectory.map((entry) => {
     const parsed = parsedByEpisode.get(entry.number);
     if (!parsed) return entry;
 

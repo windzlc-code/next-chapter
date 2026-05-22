@@ -1,7 +1,7 @@
 # 视频创作模块源码分析
 
 > 适用版本：当前仓库工作树  
-> 最后核对：2026-04-11  
+> 最后核对：2026-05-10  
 > 目标：把首页 Home Agent 的视频创作模块、工作流步骤、内联按键、实现逻辑、模型接口和状态结构整理成一份可直接给开发/维护人员使用的技术文档。
 
 ---
@@ -43,6 +43,12 @@
 ## 2. 主调用链
 
 首页一次视频内联点击的真实调用链如下：
+
+补充一条 2026-05 之后必须知道的入口规则：
+
+- 如果用户是在首页直接输入“继续视频工作流 / 开启视频工作流 / 先做分镜和出片”这类文本，真正的起手并不是先把文本发给 LLM 自由发挥。
+- `use-home-agent-composer-bindings.tsx` 会在“当前没有活动项目、没有挂起问题、没有附件”时先走 `resolveHomepageKickoffIntent()`，然后直接创建 `buildVideoWorkflowKickoffRequest(false)` 对应的结构化问题。
+- 也就是说，主页直接对话入口和快捷入口最终会汇合到同一套标准弹窗与后续工作流，不允许在起手阶段跳过剧本来源确认、拆解参数确认和标准追问面板。
 
 1. `home-agent-project-questions.ts` 生成 `ComposerQuestion`
 2. 用户点击某个 option
@@ -137,12 +143,47 @@
 
 这两个按钮几乎会被插到所有视频阶段面板里，属于“全局快捷推进”。
 
+### 4.1.1 主页直接对话与标准弹窗
+
+首页直接对话进入视频工作流时，当前实现有 3 个约束：
+
+1. 起手问题统一使用 `ComposerChoiceModal`
+   - 组件：`src/components/home-agent/ComposerChoiceModal.tsx`
+   - 稳定标记：`data-composer-choice-modal`、`data-composer-question-answer-key`、`data-composer-question-id`
+   - Electron smoke 和组件回归都依赖这组标记判断“当前是不是标准预置弹窗”
+2. 追问文本以“当前问题文案”为准，不以 request title 为准
+   - 例如原创起手真正显示的是“这次想从哪种方式开始原创剧本？”
+   - 视频起手真正显示的是“你的剧本来源是什么？”
+3. 用户如果在当前步骤里乱输“直接出片 / 直接做角色海报 / 跳到后面”，系统会优先恢复当前结构化问题，而不是越级放出后续按钮
+   - 相关逻辑：`isNaturalLanguageWorkflowAdvanceRequest()`、`appendStructuredQuestionReminder()`
+
 ### 4.2 脚本桥接阶段
 
 构建函数：`buildVideoBridgeQuestion()`  
 位置：`src/components/home-agent/home-agent-project-questions.ts:214`
 
 它根据 `snapshot.derivedStage` 决定显示哪一组桥接按钮。
+
+### 4.2.1 拆解前参数门禁与恢复
+
+这一段是本轮文档最容易过期的地方，当前真实顺序如下：
+
+1. 先确认 `单集时长`
+2. 再确认 `视频节奏`
+3. 不是立刻开跑，而是先弹 `完成剧本拆解`
+4. 用户点击 `完成剧本拆解` 后，才真正触发 `analyze_script_for_video`
+
+对应实现主要在：
+
+- `src/components/home-agent/home-agent-video-choice-handlers.ts`
+- `src/components/home-agent/home-agent-project-questions.ts`
+
+恢复规则：
+
+- 首次执行时不显示 `继续剧本拆解`
+- 只有在拆解已经启动、但因为超时 / 失败 / 用户停止 / 刷新 / 切换会话而中断时，才恢复 `继续剧本拆解`
+- 如果是“补拆缺失集数”阶段被中断，则恢复 `继续补拆缺失集`
+- 只要脚本拆解还没有完成，就不能进入“角色与场景”或更后的步骤面板
 
 #### 阶段 A：脚本拆解
 
@@ -460,6 +501,7 @@
 - 生成 `Scene[]`
 - 写入 `project.scenes`
 - 生成 `analysisSummary`
+- 只有内部检查通过后才会把这一轮结果当作“首页可见的正式拆解结果”
 
 参数特点：
 
@@ -467,6 +509,13 @@
 - `segmentsPerEpisode` 默认 `5`
 - `systemPrompt` 可传
 - `model` 可传
+
+当前版本额外的门禁与恢复行为：
+
+- 拆解过程中可以持续上报 partial progress，但如果 `scriptBreakdownPassed` 还没通过，partial scenes 只会留在内部检查链路
+- 若已有一版通过检查的拆解结果，而新一轮拆解还没过内部检查，首页会继续保留旧版已通过结果
+- 若拆解失败但已经拿到部分镜头，会保留当前 partial scenes 供内部恢复，不会提前放出“角色与场景”下一步按钮
+- `preferredEpisodeDurationSeconds` 与 `preferredScriptBreakdownPace` 会持久化到项目，供 `继续剧本拆解 / 继续补拆缺失集` 恢复使用
 
 ### 6.3 角色与场景提取
 
@@ -556,7 +605,7 @@
 - 若传 `sceneStart / sceneEnd`，按区间取
 - 否则默认取可生成镜头前 3 条
 - `forceRegenerate = true` 时允许跳过“已有视频 URL”的限制
-- `batchSize` 最大 8，默认 3
+- `batchSize` 会自动对齐当前所选视频模型支持的批次上限；默认 3，且不会超过 3
 
 ### 6.8 轮询出片状态
 

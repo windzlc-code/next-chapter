@@ -43,6 +43,12 @@ type KickoffAnswerKey =
 type KickoffAnswers = Partial<Record<KickoffAnswerKey, string>>;
 type KickoffDisplayAnswers = Partial<Record<KickoffAnswerKey, string>>;
 
+const KICKOFF_CHAT_TURN_PATTERNS = [
+  /^(?:你好|您好|哈喽|嗨|hello|hi|早上好|中午好|下午好|晚上好|在吗|在么|在不在)[!！。,.?？]*$/i,
+  /^(?:收到|好的|好哦|ok|okay|明白|先等等|稍等|等下|暂停|继续|下一步)[!！。,.?？]*$/i,
+  /(什么意思|啥意思|为什么|为啥|怎么选|怎么填|怎么定|区别是|有什么区别|解释一下|介绍一下|说说看|说说|讲讲|先聊聊|先分析一下|先讨论一下|比较一下|适合什么|自然语言|拿不准|没想好|不太确定|帮我判断|你来定|你决定)/,
+] as const;
+
 export interface OriginalScriptKickoffCompletion {
   setupInput: Record<string, unknown>;
   userBubble: string;
@@ -105,6 +111,60 @@ function parseKickoffRequestMeta(requestId: string): { flowId: string; step: Ori
 
 function normalizeSetupMode(value: string | undefined): OriginalScriptSetupMode {
   return value === "creative" ? "creative" : "topic";
+}
+
+function normalizeKickoffInput(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[，。！？、,.!?\-_/（）()【】[\]“”"'`~:：；;]/g, "");
+}
+
+function matchesKickoffOptionText(
+  value: string,
+  options: Array<{ label?: string; value?: string }> | undefined,
+): boolean {
+  const normalizedValue = normalizeKickoffInput(value);
+  if (!normalizedValue || !options?.length) return false;
+
+  return options.some((option) => {
+    const candidates = [option.label, option.value]
+      .map((item) => normalizeKickoffInput(String(item || "")))
+      .filter(Boolean);
+    return candidates.some((candidate) => candidate === normalizedValue || normalizedValue.includes(candidate));
+  });
+}
+
+function isLikelyKickoffConversationTurn(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (KICKOFF_CHAT_TURN_PATTERNS.some((pattern) => pattern.test(trimmed))) return true;
+  return /[?？]$/.test(trimmed) && /(什么|怎么|为何|为啥|区别|要不要|行不行|可以吗)/.test(trimmed);
+}
+
+function matchesOriginalKickoffAudienceAnswer(value: string): boolean {
+  return /(女频|女性向|女性读者|年轻女性|都市女性|女生向|女生|女性|宝妈|男频|男性向|男性读者|男生向|男生|男性|全年龄|全龄|大众向|泛人群|不知道|不确定|暂不确定|先给建议|你先给建议|都行)/i.test(
+    value,
+  );
+}
+
+function matchesOriginalKickoffToneAnswer(value: string): boolean {
+  return /(甜虐|甜宠|甜|虐|爽|燃|热血|搞笑|喜剧|轻喜|治愈|温暖|压抑|黑暗)/.test(value);
+}
+
+function matchesOriginalKickoffEndingAnswer(value: string): boolean {
+  return /(?:\bHE\b|\bBE\b|\bOE\b|好结局|坏结局|悲剧|遗憾|开放式?|圆满|团圆)/i.test(value);
+}
+
+function matchesOriginalKickoffWordCountAnswer(value: string): boolean {
+  const normalized = value.trim();
+  if (/^\d{1,4}$/.test(normalized) || /^\d{1,4}\s*集$/i.test(normalized)) {
+    return true;
+  }
+  return /(?:\b\d{1,3}\s*集\b|\d{1,3}\s*episodes?|\d{1,3}集|短一点|短篇|短线|标准|长线|超长)/i.test(
+    value,
+  );
 }
 
 function getDisplayValue(
@@ -277,11 +337,18 @@ function buildKickoffQuestionRequest(
             question: "这次更希望主打哪类受众？",
             multiSelect: false,
             presentation: "card",
-            options: AUDIENCES.map((audience) => ({
-              label: audience.label,
-              value: audience.value,
-              rationale: audience.desc,
-            })),
+            options: [
+              ...AUDIENCES.map((audience) => ({
+                label: audience.label,
+                value: audience.value,
+                rationale: audience.desc,
+              })),
+              {
+                label: "暂不确定，先给建议",
+                value: "暂不确定，先给建议",
+                rationale: "先让我根据市场和题材给你一个更稳的受众建议，再继续后面的基调和结局。",
+              },
+            ],
           },
         ],
       };
@@ -593,6 +660,47 @@ export function isOriginalScriptKickoffGenreQuestion(question: { id: string } | 
   return Boolean(question?.id.includes(":genres:") || question?.id.endsWith(":genres"));
 }
 
+export function shouldTreatOriginalScriptKickoffInputAsAnswer(params: {
+  qState: StudioQuestionState;
+  draft: string;
+}): boolean {
+  const { qState, draft } = params;
+  const trimmed = draft.trim();
+  if (!trimmed) return false;
+
+  const meta = parseKickoffRequestMeta(qState.request.id);
+  if (!meta) return false;
+  if (isLikelyKickoffConversationTurn(trimmed)) return false;
+
+  const activeQuestion =
+    qState.request.questions[qState.currentIndex] ??
+    qState.request.questions[0];
+  const options = activeQuestion?.options;
+
+  switch (meta.step) {
+    case "audience":
+      return matchesKickoffOptionText(trimmed, options) || matchesOriginalKickoffAudienceAnswer(trimmed);
+    case "tone":
+      return matchesKickoffOptionText(trimmed, options) || matchesOriginalKickoffToneAnswer(trimmed);
+    case "ending":
+      return matchesKickoffOptionText(trimmed, options) || matchesOriginalKickoffEndingAnswer(trimmed);
+    case "word-count":
+      return matchesKickoffOptionText(trimmed, options) || matchesOriginalKickoffWordCountAnswer(trimmed);
+    case "creative-input":
+    case "custom-topic":
+      if (matchesKickoffOptionText(trimmed, options)) return true;
+      return trimmed.length >= 4;
+    case "setup-mode":
+    case "target-market":
+    case "config-profile":
+      return matchesKickoffOptionText(trimmed, options);
+    case "genres":
+      return false;
+    default:
+      return false;
+  }
+}
+
 function prevKickoffStep(step: OriginalScriptKickoffStep, answers: KickoffAnswers): OriginalScriptKickoffStep | null {
   switch (step) {
     case "setup-mode":
@@ -695,6 +803,52 @@ export function buildOriginalScriptKickoffIntro(): string {
 
 export function buildOriginalScriptKickoffRequest(): AskUserQuestionRequest {
   return buildKickoffQuestionRequest(crypto.randomUUID(), "setup-mode", {}, {});
+}
+
+export function buildOriginalScriptKickoffBlueprintRequests(): AskUserQuestionRequest[] {
+  const flowId = "workflow-blueprint";
+  const defaultTargetMarketLabel =
+    TARGET_MARKETS.find((item) => item.value === DEFAULT_TARGET_MARKET)?.label || "国内（中文）";
+
+  return [
+    buildKickoffQuestionRequest(flowId, "setup-mode", {}, {}),
+    buildKickoffQuestionRequest(
+      flowId,
+      "target-market",
+      { setupMode: "topic" },
+      { setupMode: "选题创作" },
+    ),
+    buildKickoffQuestionRequest(
+      flowId,
+      "genres",
+      { setupMode: "topic", targetMarket: DEFAULT_TARGET_MARKET },
+      {
+        setupMode: "选题创作",
+        targetMarket: defaultTargetMarketLabel,
+      },
+    ),
+    buildKickoffQuestionRequest(
+      flowId,
+      "target-market",
+      { setupMode: "creative" },
+      { setupMode: "创意创作" },
+    ),
+    buildKickoffQuestionRequest(
+      flowId,
+      "creative-input",
+      { setupMode: "creative", targetMarket: DEFAULT_TARGET_MARKET },
+      {
+        setupMode: "创意创作",
+        targetMarket: defaultTargetMarketLabel,
+      },
+    ),
+    buildKickoffQuestionRequest(flowId, "config-profile", { setupMode: "topic" }, {}),
+    buildKickoffQuestionRequest(flowId, "audience", { setupMode: "topic" }, {}),
+    buildKickoffQuestionRequest(flowId, "tone", { setupMode: "topic" }, {}),
+    buildKickoffQuestionRequest(flowId, "ending", { setupMode: "topic" }, {}),
+    buildKickoffQuestionRequest(flowId, "word-count", { setupMode: "topic" }, {}),
+    buildKickoffQuestionRequest(flowId, "custom-topic", { setupMode: "topic" }, {}),
+  ];
 }
 
 export function buildOriginalScriptKickoffPrompt(answer: string): string {

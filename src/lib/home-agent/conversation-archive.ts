@@ -458,14 +458,19 @@ export async function scanConversationArchives(options?: { refresh?: boolean }):
   }
 
   const dirs = await listArchiveDirectories();
+  const manifests = await Promise.all(
+    dirs.map(async (entry) => ({
+      dir: entry.dir,
+      manifest: await readManifestAt(entry.name, entry.dir),
+    })),
+  );
   const records: ConversationArchiveRecord[] = [];
   const seen = new Set<string>();
 
-  for (const entry of dirs) {
-    const manifest = await readManifestAt(entry.name, entry.dir);
-    if (!manifest?.projectId || seen.has(manifest.projectId)) continue;
-    seen.add(manifest.projectId);
-    records.push({ dir: entry.dir, manifest });
+  for (const entry of manifests) {
+    if (!entry.manifest?.projectId || seen.has(entry.manifest.projectId)) continue;
+    seen.add(entry.manifest.projectId);
+    records.push({ dir: entry.dir, manifest: entry.manifest });
   }
 
   records.sort(

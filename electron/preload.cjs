@@ -32,7 +32,7 @@ function getEmbeddedBuiltinApiBundlePath() {
   if (process.defaultApp) {
     return import_node_path.default.resolve(__dirname, "..", "config", "builtin-api.json");
   }
-  return import_node_path.default.join(process.resourcesPath, "config", "builtin-api.json");
+  return import_node_path.default.join(import_node_path.default.dirname(process.execPath), "config", "builtin-api.json");
 }
 function getPortableBuiltinApiBundlePath() {
   const portableDir = process.env.PORTABLE_EXECUTABLE_DIR;
@@ -45,7 +45,8 @@ function getBuiltinApiBundlePath() {
 function getBuiltinApiBundleCandidatePaths() {
   const portablePath = getPortableBuiltinApiBundlePath();
   const embeddedPath = getEmbeddedBuiltinApiBundlePath();
-  return portablePath ? [portablePath, embeddedPath] : [embeddedPath];
+  const resourcesPath = import_node_path.default.join(process.resourcesPath, "config", "builtin-api.json");
+  return portablePath ? [portablePath, embeddedPath, resourcesPath] : [embeddedPath, resourcesPath];
 }
 function readBuiltinApiBundle() {
   for (const filePath of getBuiltinApiBundleCandidatePaths()) {
@@ -68,12 +69,8 @@ var runtimeAPI = {
 var jimengAPI = {
   writeFile: (filePath, content) => import_electron.ipcRenderer.invoke("jimeng:writeFile", { filePath, content })
 };
-var dreaminaCliAPI = {
-  exec: (args, stdin) => import_electron.ipcRenderer.invoke("dreamina:exec", { args, stdin })
-};
 import_electron.contextBridge.exposeInMainWorld("electronAPI", {
   jimeng: jimengAPI,
-  dreaminaCli: dreaminaCliAPI,
   runtime: runtimeAPI,
   storage: {
     getDefaultPath: () => import_electron.ipcRenderer.invoke("storage:getDefaultPath"),
@@ -89,6 +86,7 @@ import_electron.contextBridge.exposeInMainWorld("electronAPI", {
     },
     writeText: (filePath, content) => import_electron.ipcRenderer.invoke("storage:writeText", { filePath, content }),
     saveBinaryFile: (params) => import_electron.ipcRenderer.invoke("storage:saveBinaryFile", params),
+    writeBase64File: (params) => import_electron.ipcRenderer.invoke("storage:writeBase64File", params),
     copyFile: (sourcePath, destPath) => import_electron.ipcRenderer.invoke("storage:copyFile", { sourcePath, destPath }),
     readText: (filePath) => import_electron.ipcRenderer.invoke("storage:readText", { filePath }),
     readBase64: (filePath) => import_electron.ipcRenderer.invoke("storage:readBase64", { filePath }),

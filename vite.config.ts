@@ -19,10 +19,33 @@ export default defineConfig(({ mode }) => ({
     hmr: {
       overlay: false,
     },
+    watch: {
+      ignored: ["**/old-tgz-unpack/**"],
+    },
+    proxy: {
+      "/api/proxy": {
+        target: "http://127.0.0.1:3001",
+        changeOrigin: true,
+        secure: false,
+      },
+      "/api/workflow": {
+        target: "http://127.0.0.1:3001",
+        changeOrigin: true,
+        secure: false,
+      },
+      "/workflow-assets": {
+        target: "http://127.0.0.1:3001",
+        changeOrigin: true,
+        secure: false,
+      },
+    },
   },
   plugins: [react(), mode === "development" && componentTagger()].filter(
     Boolean,
   ),
+  optimizeDeps: {
+    entries: ["index.html", "src/main.tsx"],
+  },
   esbuild: mode === "production" ? { drop: ["console", "debugger"] } : {},
   build: {
     modulePreload: false,
@@ -55,15 +78,20 @@ export default defineConfig(({ mode }) => ({
             return "ui-vendor";
           }
 
-          if (
-            id.includes("docx") ||
-            id.includes("xlsx") ||
-            id.includes("exceljs") ||
-            id.includes("pdfjs-dist") ||
-            id.includes("mammoth") ||
-            id.includes("mermaid")
-          ) {
-            return "document-vendor";
+          if (id.includes("pdfjs-dist")) {
+            return "pdf-vendor";
+          }
+
+          if (id.includes("mammoth") || id.includes("docx")) {
+            return "word-vendor";
+          }
+
+          if (id.includes("xlsx") || id.includes("exceljs")) {
+            return "sheet-vendor";
+          }
+
+          if (id.includes("mermaid")) {
+            return "mermaid-vendor";
           }
 
           if (id.includes("recharts")) {

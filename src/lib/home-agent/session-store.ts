@@ -1,8 +1,16 @@
 import {
+  resolvePersistedAttachmentPreviewUrl,
   stripAttachmentPayloadForHistory,
   type ChatAttachment,
 } from "@/lib/agent/chat-attachments";
-import type { AgentControlMode, CreationMode, HomeAgentMessage, StudioSessionState } from "./types";
+import type {
+  AgentControlMode,
+  ComposerQuestion,
+  ComposerQuestionOption,
+  CreationMode,
+  HomeAgentMessage,
+  StudioSessionState,
+} from "./types";
 import { normalizeArtifactSnapshots } from "./message-artifact-snapshots";
 import { normalizeAutomationMode } from "./automation-mode";
 import { isExpiredRemoteSignedMediaUrl } from "./media-url";
@@ -21,8 +29,10 @@ import {
   readLatestConversationArchiveSession,
   writeConversationArchiveFull,
 } from "./conversation-archive";
+import type { ProductionAssetManifest } from "@/types/project";
 
 const STUDIO_SESSION_KEY = "storyforge-home-agent-session-v1";
+const STUDIO_SESSION_BOOTSTRAP_KEY = "storyforge-home-agent-session-bootstrap-v1";
 const STUDIO_PROJECT_SESSIONS_KEY = "storyforge-home-agent-project-sessions-v1";
 // 记录最近一次被主动清除的 projectId，防止文件系统恢复时把已删除的会话重新写回
 const STUDIO_SESSION_RESET_MARKER_KEY = "storyforge-session-reset-marker-v1";
@@ -32,6 +42,7 @@ let sessionMapCache: Record<string, StudioSessionState> | null = null;
 let activeSessionCache: StudioSessionState | null | undefined = undefined;
 let queuedFullSessionCache: StudioSessionState | null = null;
 let queuedPersistHandle: number | null = null;
+let queuedPersistNeedsFullBackup = false;
 const STORAGE_LEVELS = ["standard", "compact", "minimal"] as const;
 const PROJECT_SESSION_ENTRY_LIMITS = {
   standard: 20,
@@ -40,6 +51,13 @@ const PROJECT_SESSION_ENTRY_LIMITS = {
 } as const;
 
 type StorageLevel = (typeof STORAGE_LEVELS)[number];
+type StudioSessionBootstrapCache = {
+  version: 1;
+  session: StudioSessionState | null;
+  rawMessageCount: number;
+  rawArtifactCount: number;
+  rawAssetManifestCount?: number;
+};
 
 function safeReadJson<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") return fallback;
@@ -64,9 +82,61 @@ function clearQueuedPersistHandle(): void {
   queuedPersistHandle = null;
 }
 
+function readSessionResetMarkerSet(): Set<string> {
+  if (typeof window === "undefined") return new Set();
+  const raw = localStorage.getItem(STUDIO_SESSION_RESET_MARKER_KEY);
+  if (!raw) return new Set();
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed)) {
+      return new Set(parsed.filter((value): value is string => typeof value === "string" && value.trim().length > 0));
+    }
+    if (typeof parsed === "string" && parsed.trim()) {
+      return new Set([parsed]);
+    }
+  } catch {
+    if (raw.trim()) {
+      return new Set([raw]);
+    }
+  }
+
+  return new Set();
+}
+
+function writeSessionResetMarkerSet(projectIds: Iterable<string>): void {
+  if (typeof window === "undefined") return;
+  const next = [...new Set(
+    [...projectIds].filter((projectId): projectId is string => typeof projectId === "string" && projectId.trim().length > 0),
+  )];
+  if (!next.length) {
+    localStorage.removeItem(STUDIO_SESSION_RESET_MARKER_KEY);
+    return;
+  }
+  localStorage.setItem(STUDIO_SESSION_RESET_MARKER_KEY, JSON.stringify(next));
+}
+
 function hasSessionResetMarker(projectId: string | null | undefined): boolean {
   if (typeof window === "undefined" || !projectId) return false;
-  return localStorage.getItem(STUDIO_SESSION_RESET_MARKER_KEY) === projectId;
+  return readSessionResetMarkerSet().has(projectId);
+}
+
+function getSessionProjectId(session: StudioSessionState | null | undefined): string | null {
+  if (!session) return null;
+  if (typeof session.projectId === "string" && session.projectId.trim()) {
+    return session.projectId;
+  }
+  if (
+    typeof session.currentProjectSnapshot?.projectId === "string" &&
+    session.currentProjectSnapshot.projectId.trim()
+  ) {
+    return session.currentProjectSnapshot.projectId;
+  }
+  return null;
+}
+
+function shouldIgnoreDeletedProjectSession(session: StudioSessionState | null | undefined): boolean {
+  return hasSessionResetMarker(getSessionProjectId(session));
 }
 
 function truncateText(value: string | undefined, max: number): string {
@@ -74,6 +144,23 @@ function truncateText(value: string | undefined, max: number): string {
   const trimmed = value.trim();
   if (!trimmed) return "";
   return trimmed.length > max ? `${trimmed.slice(0, Math.max(0, max - 1))}…` : trimmed;
+}
+
+const STORYBOARD_BREAKDOWN_MESSAGE_PREFIX = "以下按导出拆镜 xlsx 的分段结构展示";
+const STORYBOARD_BREAKDOWN_BLOCK_RE = /```json\s*[\s\S]*```/i;
+
+function shouldPreserveStructuredMessageContent(value: string | undefined): boolean {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  return trimmed.includes(STORYBOARD_BREAKDOWN_MESSAGE_PREFIX) && STORYBOARD_BREAKDOWN_BLOCK_RE.test(trimmed);
+}
+
+function compactMessageContent(value: string | undefined, max: number): string {
+  if (shouldPreserveStructuredMessageContent(value)) {
+    return typeof value === "string" ? value.trim() : "";
+  }
+  return truncateText(value, max);
 }
 
 function normalizeAgentControlMode(value: unknown): AgentControlMode {
@@ -89,6 +176,48 @@ function normalizeCreationMode(value: unknown, legacyValue?: unknown): CreationM
 function normalizeDevMode(value: unknown, legacyValue?: unknown): boolean {
   if (typeof value === "boolean") return value;
   return normalizeAgentControlMode(legacyValue) === "script-dev";
+}
+
+function isFullAutoContinuationAssistantMessage(message: HomeAgentMessage): boolean {
+  if (message.role !== "assistant") return false;
+  const content = typeof message.content === "string" ? message.content.trim() : "";
+  return (
+    content.includes("全自动执行已停止。选择当前步骤选项后会继续自动链路") ||
+    content.startsWith("继续全自动链路，将从“") ||
+    content.startsWith("已切换为全自动原创剧本。")
+  );
+}
+
+export function sessionHasFullAutoLineage(
+  session: Pick<StudioSessionState, "automationMode" | "currentProjectSnapshot" | "fullAutoRun" | "messages"> | null | undefined,
+): boolean {
+  if (!session) return false;
+  if (session.fullAutoRun) return true;
+  if (
+    normalizeAutomationMode(
+      session.automationMode ?? session.currentProjectSnapshot?.automationMode,
+    ) === "full-auto"
+  ) {
+    return true;
+  }
+  return Array.isArray(session.messages)
+    ? session.messages.some((message) => {
+        const row = message as HomeAgentMessage;
+        return row.automationOrigin === "full-auto" || isFullAutoContinuationAssistantMessage(row);
+      })
+    : false;
+}
+
+function normalizeSuppressHistoricalMemory(
+  value: unknown,
+  currentProjectSnapshot: StudioSessionState["currentProjectSnapshot"],
+): boolean {
+  if (typeof value === "boolean") return value;
+  return !currentProjectSnapshot;
+}
+
+function normalizeFullAutoChecklistCollapsed(value: unknown): boolean {
+  return typeof value === "boolean" ? value : true;
 }
 
 function pruneExpiredMediaFromAttachment(
@@ -192,7 +321,11 @@ function normalizeAttachment(attachment: unknown): ChatAttachment | null {
     size: typeof record.size === "number" && Number.isFinite(record.size) ? record.size : 0,
     kind: record.kind,
     localPath: typeof record.localPath === "string" ? record.localPath : undefined,
-    previewUrl: typeof record.previewUrl === "string" ? record.previewUrl : undefined,
+    previewUrl: resolvePersistedAttachmentPreviewUrl({
+      kind: record.kind,
+      localPath: typeof record.localPath === "string" ? record.localPath : undefined,
+      previewUrl: typeof record.previewUrl === "string" ? record.previewUrl : undefined,
+    }),
     extractedText: typeof record.extractedText === "string" ? record.extractedText : undefined,
     fallbackDigest: typeof record.fallbackDigest === "string" ? record.fallbackDigest : undefined,
     history: Array.isArray(record.history)
@@ -203,7 +336,11 @@ function normalizeAttachment(attachment: unknown): ChatAttachment | null {
             fileName: typeof entry.fileName === "string" ? entry.fileName : record.fileName,
             label: typeof entry.label === "string" ? entry.label : undefined,
             localPath: typeof entry.localPath === "string" ? entry.localPath : undefined,
-            previewUrl: typeof entry.previewUrl === "string" ? entry.previewUrl : undefined,
+            previewUrl: resolvePersistedAttachmentPreviewUrl({
+              kind: record.kind,
+              localPath: typeof entry.localPath === "string" ? entry.localPath : undefined,
+              previewUrl: typeof entry.previewUrl === "string" ? entry.previewUrl : undefined,
+            }),
             createdAt: typeof entry.createdAt === "string" ? entry.createdAt : new Date().toISOString(),
           }))
       : undefined,
@@ -254,11 +391,13 @@ function persistActiveSessionCache(): void {
 
   if (activeSessionCache === null) {
     localStorage.removeItem(STUDIO_SESSION_KEY);
+    localStorage.removeItem(STUDIO_SESSION_BOOTSTRAP_KEY);
     return;
   }
 
   if (activeSessionCache) {
     tryWriteJson(STUDIO_SESSION_KEY, (level) => compactSessionForStorage(activeSessionCache, level));
+    writeStudioSessionBootstrapCache(activeSessionCache);
   }
 }
 
@@ -278,13 +417,48 @@ function persistProjectSessionCache(activeProjectId = activeSessionCache?.projec
 function flushQueuedSessionPersistence(): void {
   clearQueuedPersistHandle();
   const fullSession = queuedFullSessionCache;
+  const shouldWriteFullBackup = queuedPersistNeedsFullBackup;
   queuedFullSessionCache = null;
+  queuedPersistNeedsFullBackup = false;
   persistActiveSessionCache();
   persistProjectSessionCache();
-  if (fullSession?.projectId) {
+  if (shouldWriteFullBackup && fullSession?.projectId) {
     // Keep the full archive in sync without copying large media folders on debounced saves.
     void writeFullSessionBackup(fullSession, { copyLegacyProjectMedia: false });
   }
+}
+
+function sessionHasInlinePreviewPayload(session: StudioSessionState | null | undefined): boolean {
+  if (!session?.messages?.length) return false;
+
+  return session.messages.some((message) =>
+    (message.attachments ?? []).some((attachment) =>
+      (typeof attachment.previewUrl === "string" && attachment.previewUrl.startsWith("data:")) ||
+      (attachment.history ?? []).some(
+        (entry) => typeof entry.previewUrl === "string" && entry.previewUrl.startsWith("data:"),
+      ),
+    ),
+  );
+}
+
+function normalizedSessionNeedsRewrite(
+  rawSession: StudioSessionState | null | undefined,
+  normalizedSession: StudioSessionState | null | undefined,
+): boolean {
+  if (!rawSession || !normalizedSession) return false;
+  const rawAutomationMode = normalizeAutomationMode(
+    rawSession.automationMode ?? rawSession.currentProjectSnapshot?.automationMode,
+  );
+  if (rawAutomationMode !== normalizedSession.automationMode) {
+    return true;
+  }
+  const rawSnapshotAutomationMode = normalizeAutomationMode(
+    rawSession.currentProjectSnapshot?.automationMode ?? rawSession.automationMode,
+  );
+  return (
+    normalizedSession.currentProjectSnapshot?.automationMode != null &&
+    rawSnapshotAutomationMode !== normalizedSession.currentProjectSnapshot.automationMode
+  );
 }
 
 function scheduleQueuedSessionPersistence(delay = 120): void {
@@ -302,11 +476,11 @@ function scheduleQueuedSessionPersistence(delay = 120): void {
 function messageLimit(level: StorageLevel): { count: number; chars: number } {
   switch (level) {
     case "compact":
-      return { count: 50, chars: 1200 };
+      return { count: 100, chars: 1200 };
     case "minimal":
-      return { count: 20, chars: 600 };
+      return { count: 40, chars: 600 };
     default:
-      return { count: 100, chars: 3200 };
+      return { count: 180, chars: 3200 };
   }
 }
 
@@ -437,6 +611,163 @@ function compactComposerQuestionForStorage(
   };
 }
 
+function normalizeStoredComposerQuestion(
+  question: StudioSessionState["pendingChoiceQuestion"],
+): StudioSessionState["pendingChoiceQuestion"] {
+  return question && typeof question === "object" ? question : null;
+}
+
+function countStoredQuestionOptions(options: ComposerQuestionOption[] | undefined): number {
+  if (!options?.length) return 0;
+  return options.reduce(
+    (total, option) => total + 1 + countStoredQuestionOptions(option.children),
+    0,
+  );
+}
+
+function scoreStoredVideoBridgeQuestionValue(value: string | undefined): number {
+  if (!value) return 0;
+  if (value === "video:analyze" || value === "video:bridge:next-step") return 10;
+  if (value === "video:bridge:entities") return 20;
+  if (value.startsWith("video:bridge:reference-assets")) return 30;
+  if (value === "video:bridge:storyboard" || value === "video:step:storyboard") return 40;
+  if (value === "video:bridge:shots") return 50;
+  if (value.startsWith("video:bridge:prompts")) return 60;
+  if (value === "video:step:render" || value === "video:step:video") return 70;
+  return 0;
+}
+
+function collectStoredVideoBridgeStageScore(options: ComposerQuestionOption[] | undefined): number {
+  if (!options?.length) return 0;
+  return options.reduce((best, option) => {
+    const optionScore = scoreStoredVideoBridgeQuestionValue(option.value);
+    const childScore = collectStoredVideoBridgeStageScore(option.children);
+    return Math.max(best, optionScore, childScore);
+  }, 0);
+}
+
+function inferStoredVideoBridgeQuestionStageScore(question: ComposerQuestion | null): number {
+  if (!question || question.answerKey !== "video-bridge-panel") return 0;
+
+  let stageScore = collectStoredVideoBridgeStageScore(question.options);
+  const stepIndex =
+    typeof question.stepIndex === "number" && Number.isFinite(question.stepIndex)
+      ? Math.max(0, question.stepIndex)
+      : -1;
+  if (stepIndex >= 0) {
+    stageScore = Math.max(stageScore, (stepIndex + 1) * 10);
+  }
+
+  const labelText = `${question.title ?? ""} ${question.description ?? ""}`.toLowerCase();
+  if (labelText.includes("预览") || labelText.includes("导出")) {
+    stageScore = Math.max(stageScore, 70);
+  } else if (labelText.includes("视频生成") || labelText.includes("出片")) {
+    stageScore = Math.max(stageScore, 60);
+  } else if (labelText.includes("提示词") || labelText.includes("镜头包")) {
+    stageScore = Math.max(stageScore, 50);
+  } else if (labelText.includes("分镜")) {
+    stageScore = Math.max(stageScore, 40);
+  } else if (labelText.includes("角色与场景") || labelText.includes("参考图")) {
+    stageScore = Math.max(stageScore, 30);
+  } else if (labelText.includes("脚本拆解")) {
+    stageScore = Math.max(stageScore, 20);
+  }
+
+  return stageScore;
+}
+
+function scoreStoredChoiceQuestionForRecovery(question: ComposerQuestion | null): number {
+  if (!question) return Number.NEGATIVE_INFINITY;
+  if (question.answerKey !== "video-bridge-panel") return 0;
+
+  const stageScore = inferStoredVideoBridgeQuestionStageScore(question);
+  const stepScore =
+    typeof question.stepIndex === "number" && Number.isFinite(question.stepIndex)
+      ? Math.max(0, question.stepIndex + 1)
+      : 0;
+  const statusBadgeCount = question.statusBadges?.length ?? 0;
+  const optionCount = countStoredQuestionOptions(question.options);
+  return stageScore * 100 + stepScore * 10 + statusBadgeCount * 5 + optionCount;
+}
+
+function reconcileStoredChoiceQuestions(
+  pendingChoiceQuestion: StudioSessionState["pendingChoiceQuestion"],
+  interruptedChoiceQuestion: StudioSessionState["pendingChoiceQuestion"],
+): {
+  pendingChoiceQuestion: StudioSessionState["pendingChoiceQuestion"];
+  interruptedChoiceQuestion: StudioSessionState["pendingChoiceQuestion"];
+} {
+  if (!pendingChoiceQuestion || !interruptedChoiceQuestion) {
+    return { pendingChoiceQuestion, interruptedChoiceQuestion };
+  }
+
+  if (
+    pendingChoiceQuestion.answerKey === "video-bridge-panel" &&
+    interruptedChoiceQuestion.answerKey === "video-bridge-panel"
+  ) {
+    const pendingScore = scoreStoredChoiceQuestionForRecovery(pendingChoiceQuestion);
+    const interruptedScore = scoreStoredChoiceQuestionForRecovery(interruptedChoiceQuestion);
+    if (interruptedScore > pendingScore) {
+      return {
+        pendingChoiceQuestion: interruptedChoiceQuestion,
+        interruptedChoiceQuestion,
+      };
+    }
+  }
+
+  return { pendingChoiceQuestion, interruptedChoiceQuestion };
+}
+
+function normalizeConsistentProjectSnapshot(
+  snapshot: StudioSessionState["currentProjectSnapshot"],
+  sessionProjectId: string | undefined,
+  sessionAutomationMode: StudioSessionState["automationMode"] | undefined,
+): StudioSessionState["currentProjectSnapshot"] {
+  if (!snapshot) return null;
+
+  const normalizedSessionProjectId =
+    typeof sessionProjectId === "string" && sessionProjectId.trim()
+      ? sessionProjectId.trim()
+      : undefined;
+  const normalizedSnapshotProjectId =
+    typeof snapshot.projectId === "string" && snapshot.projectId.trim()
+      ? snapshot.projectId.trim()
+      : undefined;
+  const normalizedSourceProjectId =
+    typeof snapshot.sourceProjectId === "string" && snapshot.sourceProjectId.trim()
+      ? snapshot.sourceProjectId.trim()
+      : undefined;
+  const isBridgedVideoSnapshot =
+    normalizedSessionProjectId &&
+    normalizedSnapshotProjectId &&
+    normalizedSessionProjectId !== normalizedSnapshotProjectId &&
+    snapshot.projectKind === "video" &&
+    normalizedSourceProjectId === normalizedSessionProjectId;
+
+  // A project-scoped session can momentarily carry the previous project's
+  // snapshot during a history switch. Dropping that stale snapshot keeps the
+  // message history while forcing the next restore to use the authoritative
+  // project snapshot from storage.
+  if (
+    normalizedSessionProjectId &&
+    normalizedSnapshotProjectId &&
+    normalizedSessionProjectId !== normalizedSnapshotProjectId &&
+    !isBridgedVideoSnapshot
+  ) {
+    return null;
+  }
+
+  return {
+    ...snapshot,
+    projectId: normalizedSnapshotProjectId ?? normalizedSessionProjectId,
+    sourceProjectId: normalizedSourceProjectId,
+    automationMode:
+      sessionAutomationMode === "full-auto"
+        ? "full-auto"
+        : normalizeAutomationMode(snapshot.automationMode ?? sessionAutomationMode),
+  };
+}
+
 function compactProjectSnapshotForStorage(
   snapshot: StudioSessionState["currentProjectSnapshot"],
   level: StorageLevel,
@@ -444,10 +775,12 @@ function compactProjectSnapshotForStorage(
   if (!snapshot) return null;
 
   const limits = artifactLimit(level);
+  const compactedAssetManifest = compactAssetManifestForStorage(snapshot.memory?.assetManifest, level);
 
   return {
     projectId: snapshot.projectId,
     projectKind: snapshot.projectKind,
+    sourceProjectId: snapshot.sourceProjectId,
     automationMode: normalizeAutomationMode(snapshot.automationMode),
     title: truncateText(snapshot.title, level === "minimal" ? 40 : 80) || "未命名项目",
     currentObjective: truncateText(snapshot.currentObjective, level === "minimal" ? 120 : 220),
@@ -466,6 +799,13 @@ function compactProjectSnapshotForStorage(
       actions: artifact.actions?.slice(0, 8),
     })),
     updatedAt: snapshot.updatedAt,
+    ...(compactedAssetManifest
+      ? {
+          memory: {
+            assetManifest: compactedAssetManifest,
+          },
+        }
+      : {}),
   };
 }
 
@@ -482,9 +822,13 @@ function compactSessionForStorage(session: StudioSessionState, level: StorageLev
     creationMode: normalizeCreationMode(session.creationMode, session.agentControlMode),
     automationMode: normalizeAutomationMode(session.automationMode ?? session.currentProjectSnapshot?.automationMode),
     devMode: normalizeDevMode(session.devMode, session.agentControlMode),
+    suppressHistoricalMemory: normalizeSuppressHistoricalMemory(
+      session.suppressHistoricalMemory,
+      session.currentProjectSnapshot ?? null,
+    ),
     messages: session.messages.slice(-limits.count).map((message) => ({
       ...message,
-      content: truncateText(message.content, limits.chars),
+      content: compactMessageContent(message.content, limits.chars),
       artifactSnapshots:
         level === "minimal"
           ? undefined
@@ -517,7 +861,9 @@ function compactSessionForStorage(session: StudioSessionState, level: StorageLev
     draft: truncateText(session.draft, level === "minimal" ? 400 : level === "compact" ? 1000 : 2400),
     qState: compactQuestionStateForStorage(session.qState, level),
     deferredQuestionState: compactQuestionStateForStorage(session.deferredQuestionState, level),
+    pendingWorkflowUploadKind: session.pendingWorkflowUploadKind ?? null,
     pendingChoiceQuestion: compactComposerQuestionForStorage(session.pendingChoiceQuestion, level),
+    interruptedChoiceQuestion: compactComposerQuestionForStorage(session.interruptedChoiceQuestion, level),
     selectedValues: trimStringArray(session.selectedValues, level === "minimal" ? 6 : 12, 120),
     deferredSelectedValues: trimStringArray(session.deferredSelectedValues, level === "minimal" ? 6 : 12, 120),
     deferredDraft: truncateText(
@@ -528,6 +874,7 @@ function compactSessionForStorage(session: StudioSessionState, level: StorageLev
     surfacedTaskFollowupKeys: trimStringArray(session.surfacedTaskFollowupKeys, 40, 120),
     surfacedProjectSuggestionKeys: trimStringArray(session.surfacedProjectSuggestionKeys, 40, 160),
     fullAutoRun: session.fullAutoRun ?? null,
+    fullAutoChecklistCollapsed: normalizeFullAutoChecklistCollapsed(session.fullAutoChecklistCollapsed),
   };
 }
 
@@ -592,6 +939,23 @@ function normalizeQuestionState(
 function normalizeStudioSession(session: StudioSessionState | null): StudioSessionState | null {
   if (!session || typeof session !== "object") return null;
 
+  const normalizedProjectId =
+    typeof session.projectId === "string" && session.projectId.trim()
+      ? session.projectId.trim()
+      : undefined;
+  const resolvedAutomationMode = sessionHasFullAutoLineage(session)
+    ? "full-auto"
+    : normalizeAutomationMode(session.automationMode ?? session.currentProjectSnapshot?.automationMode);
+  const normalizedProjectSnapshot = normalizeConsistentProjectSnapshot(
+    session.currentProjectSnapshot ?? null,
+    normalizedProjectId,
+    resolvedAutomationMode,
+  );
+  const reconciledChoiceQuestions = reconcileStoredChoiceQuestions(
+    normalizeStoredComposerQuestion(session.pendingChoiceQuestion),
+    normalizeStoredComposerQuestion(session.interruptedChoiceQuestion),
+  );
+
   return {
     sessionId: typeof session.sessionId === "string" ? session.sessionId : undefined,
     compactedMessageCount:
@@ -606,8 +970,12 @@ function normalizeStudioSession(session: StudioSessionState | null): StudioSessi
         ? session.mode
         : "idle",
     creationMode: normalizeCreationMode(session.creationMode, session.agentControlMode),
-    automationMode: normalizeAutomationMode(session.automationMode ?? session.currentProjectSnapshot?.automationMode),
+    automationMode: resolvedAutomationMode,
     devMode: normalizeDevMode(session.devMode, session.agentControlMode),
+    suppressHistoricalMemory: normalizeSuppressHistoricalMemory(
+      session.suppressHistoricalMemory,
+      normalizedProjectSnapshot,
+    ),
     messages: Array.isArray(session.messages)
       ? session.messages.map((message): HomeAgentMessage => {
           const row = message as HomeAgentMessage;
@@ -624,17 +992,10 @@ function normalizeStudioSession(session: StudioSessionState | null): StudioSessi
           };
         })
       : [],
-    currentProjectSnapshot: session.currentProjectSnapshot
-      ? {
-          ...session.currentProjectSnapshot,
-          automationMode: normalizeAutomationMode(
-            session.currentProjectSnapshot.automationMode ?? session.automationMode,
-          ),
-        }
-      : null,
+    currentProjectSnapshot: normalizedProjectSnapshot,
     recentMessageSummary:
       typeof session.recentMessageSummary === "string" ? session.recentMessageSummary : "",
-    projectId: typeof session.projectId === "string" ? session.projectId : undefined,
+    projectId: normalizedProjectId,
     ...(typeof session.selectedTextModelKey === "string" && session.selectedTextModelKey.trim()
       ? { selectedTextModelKey: session.selectedTextModelKey.trim() }
       : {}),
@@ -649,10 +1010,12 @@ function normalizeStudioSession(session: StudioSessionState | null): StudioSessi
     draft: typeof session.draft === "string" ? session.draft : "",
     qState: normalizeQuestionState(session.qState, true),
     deferredQuestionState: normalizeQuestionState(session.deferredQuestionState, true),
-    pendingChoiceQuestion:
-      session.pendingChoiceQuestion && typeof session.pendingChoiceQuestion === "object"
-        ? session.pendingChoiceQuestion
+    pendingWorkflowUploadKind:
+      session.pendingWorkflowUploadKind === "adaptation" || session.pendingWorkflowUploadKind === "video"
+        ? session.pendingWorkflowUploadKind
         : null,
+    pendingChoiceQuestion: reconciledChoiceQuestions.pendingChoiceQuestion,
+    interruptedChoiceQuestion: reconciledChoiceQuestions.interruptedChoiceQuestion,
     selectedValues: Array.isArray(session.selectedValues)
       ? session.selectedValues.filter((value): value is string => typeof value === "string")
       : [],
@@ -670,18 +1033,38 @@ function normalizeStudioSession(session: StudioSessionState | null): StudioSessi
       ? session.surfacedProjectSuggestionKeys.filter((value): value is string => typeof value === "string")
       : [],
     fullAutoRun: session.fullAutoRun ?? null,
+    fullAutoChecklistCollapsed: normalizeFullAutoChecklistCollapsed(session.fullAutoChecklistCollapsed),
   };
 }
 
 const BOOTSTRAP_MESSAGE_COUNT = 12;
 const BOOTSTRAP_MESSAGE_CHARS = 900;
+const EMERGENCY_BOOTSTRAP_MESSAGE_COUNT = 4;
+const EMERGENCY_BOOTSTRAP_MESSAGE_CHARS = 280;
+const EMERGENCY_BOOTSTRAP_ARTIFACT_COUNT = 1;
 
 function normalizeStudioSessionForBootstrap(session: StudioSessionState | null): StudioSessionState | null {
   if (!session || typeof session !== "object") return null;
 
+  const normalizedProjectId =
+    typeof session.projectId === "string" && session.projectId.trim()
+      ? session.projectId.trim()
+      : undefined;
+  const resolvedAutomationMode = sessionHasFullAutoLineage(session)
+    ? "full-auto"
+    : normalizeAutomationMode(session.automationMode ?? session.currentProjectSnapshot?.automationMode);
+  const normalizedProjectSnapshot = normalizeConsistentProjectSnapshot(
+    session.currentProjectSnapshot ?? null,
+    normalizedProjectId,
+    resolvedAutomationMode,
+  );
   const rawMessages = Array.isArray(session.messages) ? session.messages : [];
   const bootMessages = rawMessages.slice(-BOOTSTRAP_MESSAGE_COUNT);
   const hiddenMessageCount = Math.max(0, rawMessages.length - bootMessages.length);
+  const reconciledChoiceQuestions = reconcileStoredChoiceQuestions(
+    normalizeStoredComposerQuestion(session.pendingChoiceQuestion),
+    normalizeStoredComposerQuestion(session.interruptedChoiceQuestion),
+  );
 
   return {
     sessionId: typeof session.sessionId === "string" ? session.sessionId : undefined,
@@ -697,14 +1080,18 @@ function normalizeStudioSessionForBootstrap(session: StudioSessionState | null):
         ? session.mode
         : "idle",
     creationMode: normalizeCreationMode(session.creationMode, session.agentControlMode),
-    automationMode: normalizeAutomationMode(session.automationMode ?? session.currentProjectSnapshot?.automationMode),
+    automationMode: resolvedAutomationMode,
     devMode: normalizeDevMode(session.devMode, session.agentControlMode),
+    suppressHistoricalMemory: normalizeSuppressHistoricalMemory(
+      session.suppressHistoricalMemory,
+      normalizedProjectSnapshot,
+    ),
     messages: bootMessages.map((message): HomeAgentMessage => {
       const row = message as HomeAgentMessage;
       const feedback = row.feedback === "up" || row.feedback === "down" ? row.feedback : undefined;
       return {
         ...row,
-        content: truncateText(row.content, BOOTSTRAP_MESSAGE_CHARS),
+        content: compactMessageContent(row.content, BOOTSTRAP_MESSAGE_CHARS),
         feedback,
         artifactSnapshots: normalizeArtifactSnapshots(row.artifactSnapshots),
         attachments: Array.isArray(row.attachments)
@@ -716,12 +1103,12 @@ function normalizeStudioSessionForBootstrap(session: StudioSessionState | null):
           : undefined,
       };
     }),
-    currentProjectSnapshot: compactProjectSnapshotForStorage(session.currentProjectSnapshot ?? null, "minimal"),
+    currentProjectSnapshot: compactProjectSnapshotForStorage(normalizedProjectSnapshot, "minimal"),
     recentMessageSummary: truncateText(
       typeof session.recentMessageSummary === "string" ? session.recentMessageSummary : "",
       1200,
     ),
-    projectId: typeof session.projectId === "string" ? session.projectId : undefined,
+    projectId: normalizedProjectId,
     ...(typeof session.selectedTextModelKey === "string" && session.selectedTextModelKey.trim()
       ? { selectedTextModelKey: session.selectedTextModelKey.trim() }
       : {}),
@@ -736,10 +1123,12 @@ function normalizeStudioSessionForBootstrap(session: StudioSessionState | null):
     draft: typeof session.draft === "string" ? session.draft : "",
     qState: normalizeQuestionState(session.qState, true),
     deferredQuestionState: normalizeQuestionState(session.deferredQuestionState, true),
-    pendingChoiceQuestion:
-      session.pendingChoiceQuestion && typeof session.pendingChoiceQuestion === "object"
-        ? session.pendingChoiceQuestion
+    pendingWorkflowUploadKind:
+      session.pendingWorkflowUploadKind === "adaptation" || session.pendingWorkflowUploadKind === "video"
+        ? session.pendingWorkflowUploadKind
         : null,
+    pendingChoiceQuestion: reconciledChoiceQuestions.pendingChoiceQuestion,
+    interruptedChoiceQuestion: reconciledChoiceQuestions.interruptedChoiceQuestion,
     selectedValues: Array.isArray(session.selectedValues)
       ? session.selectedValues.filter((value): value is string => typeof value === "string")
       : [],
@@ -757,7 +1146,205 @@ function normalizeStudioSessionForBootstrap(session: StudioSessionState | null):
       ? session.surfacedProjectSuggestionKeys.filter((value): value is string => typeof value === "string")
       : [],
     fullAutoRun: session.fullAutoRun ?? null,
+    fullAutoChecklistCollapsed: normalizeFullAutoChecklistCollapsed(session.fullAutoChecklistCollapsed),
   };
+}
+
+function buildStudioSessionBootstrapCache(
+  session: StudioSessionState | null | undefined,
+): StudioSessionBootstrapCache | null {
+  if (!session || typeof session !== "object") return null;
+  const bootstrapSession = normalizeStudioSessionForBootstrap(session);
+  if (!bootstrapSession) return null;
+
+  return {
+    version: 1,
+    session: bootstrapSession,
+    rawMessageCount: Array.isArray(session.messages) ? session.messages.length : 0,
+    rawArtifactCount: Array.isArray(session.currentProjectSnapshot?.artifacts)
+      ? session.currentProjectSnapshot.artifacts.length
+      : 0,
+    rawAssetManifestCount: Array.isArray(session.currentProjectSnapshot?.memory?.assetManifest?.items)
+      ? session.currentProjectSnapshot.memory.assetManifest.items.length
+      : 0,
+  };
+}
+
+function buildEmergencyStudioSessionBootstrapCache(
+  session: StudioSessionState | null | undefined,
+): StudioSessionBootstrapCache | null {
+  const payload = buildStudioSessionBootstrapCache(session);
+  if (!payload?.session) return payload;
+
+  const emergencyMessages = payload.session.messages
+    .slice(-EMERGENCY_BOOTSTRAP_MESSAGE_COUNT)
+    .map((message) => ({
+      ...message,
+      content: truncateText(message.content, EMERGENCY_BOOTSTRAP_MESSAGE_CHARS),
+      attachments: Array.isArray(message.attachments) ? message.attachments.slice(0, 1) : undefined,
+    }));
+
+  return {
+    ...payload,
+    session: {
+      ...payload.session,
+      messages: emergencyMessages,
+      draft: truncateText(payload.session.draft, 160),
+      deferredDraft: truncateText(payload.session.deferredDraft, 120),
+      recentMessageSummary: truncateText(payload.session.recentMessageSummary, 240),
+      selectedValues: trimStringArray(payload.session.selectedValues, 4, 80),
+      deferredSelectedValues: trimStringArray(payload.session.deferredSelectedValues, 4, 80),
+      surfacedTaskIds: trimStringArray(payload.session.surfacedTaskIds, 12, 80),
+      surfacedTaskFollowupKeys: trimStringArray(payload.session.surfacedTaskFollowupKeys, 12, 80),
+      surfacedProjectSuggestionKeys: trimStringArray(payload.session.surfacedProjectSuggestionKeys, 12, 120),
+      currentProjectSnapshot: payload.session.currentProjectSnapshot
+        ? {
+            ...payload.session.currentProjectSnapshot,
+            recommendedActions: trimStringArray(payload.session.currentProjectSnapshot.recommendedActions, 3, 80),
+            artifacts: payload.session.currentProjectSnapshot.artifacts.slice(0, EMERGENCY_BOOTSTRAP_ARTIFACT_COUNT),
+          }
+        : payload.session.currentProjectSnapshot,
+    },
+  };
+}
+
+function buildStudioSessionBootstrapResult(
+  session: StudioSessionState | null,
+  rawMessageCount: number,
+  rawArtifactCount: number,
+  rawAssetManifestCount: number,
+): {
+  session: StudioSessionState | null;
+  needsHydration: boolean;
+} {
+  if (!session) {
+    return { session: null, needsHydration: false };
+  }
+
+  const bootstrapArtifactCount = session.currentProjectSnapshot?.artifacts.length ?? 0;
+  const bootstrapAssetManifestCount = session.currentProjectSnapshot?.memory?.assetManifest?.items.length ?? 0;
+
+  return {
+    session,
+    needsHydration:
+      rawMessageCount > session.messages.length ||
+      rawArtifactCount > bootstrapArtifactCount ||
+      rawAssetManifestCount > bootstrapAssetManifestCount,
+  };
+}
+
+function writeStudioSessionBootstrapCache(session: StudioSessionState | null | undefined): void {
+  if (typeof window === "undefined") return;
+  const payload = buildStudioSessionBootstrapCache(session);
+  if (!payload) {
+    localStorage.removeItem(STUDIO_SESSION_BOOTSTRAP_KEY);
+    return;
+  }
+
+  try {
+    safeWriteJson(STUDIO_SESSION_BOOTSTRAP_KEY, payload);
+    return;
+  } catch (error) {
+    if (!isQuotaExceededError(error)) {
+      return;
+    }
+  }
+
+  try {
+    localStorage.removeItem(STUDIO_SESSION_BOOTSTRAP_KEY);
+  } catch {
+    // Ignore cleanup failures and fall through to the emergency retry.
+  }
+
+  const emergencyPayload = buildEmergencyStudioSessionBootstrapCache(session);
+  if (!emergencyPayload) return;
+
+  try {
+    safeWriteJson(STUDIO_SESSION_BOOTSTRAP_KEY, emergencyPayload);
+  } catch {
+    try {
+      localStorage.removeItem(STUDIO_SESSION_BOOTSTRAP_KEY);
+    } catch {
+      // Ignore cleanup failures. The full session/file backup path still remains available.
+    }
+  }
+}
+
+function assetManifestLimit(
+  level: StorageLevel,
+): { count: number; labelChars: number; metaChars: number; summaryChars: number } {
+  switch (level) {
+    case "compact":
+      return { count: 12, labelChars: 64, metaChars: 100, summaryChars: 160 };
+    case "minimal":
+      return { count: 6, labelChars: 56, metaChars: 80, summaryChars: 120 };
+    default:
+      return { count: 32, labelChars: 80, metaChars: 140, summaryChars: 220 };
+  }
+}
+
+function compactAssetManifestForStorage(
+  manifest: ProductionAssetManifest | null | undefined,
+  level: StorageLevel,
+): ProductionAssetManifest | null {
+  if (!manifest?.items?.length) return null;
+
+  const limits = assetManifestLimit(level);
+  const items = manifest.items
+    .filter((item): item is NonNullable<ProductionAssetManifest["items"]>[number] => Boolean(item))
+    .slice(-limits.count)
+    .map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      label: truncateText(item.label, limits.labelChars) || "素材",
+      url: truncateText(item.url, 600),
+      meta: truncateText(item.meta, limits.metaChars) || undefined,
+      reusable: !!item.reusable,
+      status: item.status,
+      source: truncateText(item.source, 48) || undefined,
+      origin: item.origin,
+      sourceEntityId: truncateText(item.sourceEntityId, 80) || undefined,
+      version: typeof item.version === "number" && Number.isFinite(item.version) ? item.version : undefined,
+    }));
+
+  if (!items.length) return null;
+
+  return {
+    version: truncateText(manifest.version, 24) || undefined,
+    summary: truncateText(manifest.summary, limits.summaryChars) || undefined,
+    updatedAt: truncateText(manifest.updatedAt, 40) || undefined,
+    items,
+  };
+}
+
+function readStudioSessionBootstrapCache(): {
+  session: StudioSessionState | null;
+  needsHydration: boolean;
+} | null {
+  const cached = safeReadJson<StudioSessionBootstrapCache | null>(STUDIO_SESSION_BOOTSTRAP_KEY, null);
+  if (!cached || typeof cached !== "object") return null;
+
+  const session = normalizeStudioSessionForBootstrap(cached.session ?? null);
+  if (shouldIgnoreDeletedProjectSession(normalizeStudioSession(session))) {
+    if (typeof window !== "undefined") {
+      localStorage.removeItem(STUDIO_SESSION_BOOTSTRAP_KEY);
+    }
+    return { session: null, needsHydration: false };
+  }
+  if (!session) return null;
+
+  return buildStudioSessionBootstrapResult(
+    session,
+    typeof cached.rawMessageCount === "number" && Number.isFinite(cached.rawMessageCount)
+      ? Math.max(0, cached.rawMessageCount)
+      : session.messages.length,
+    typeof cached.rawArtifactCount === "number" && Number.isFinite(cached.rawArtifactCount)
+      ? Math.max(0, cached.rawArtifactCount)
+      : session.currentProjectSnapshot?.artifacts.length ?? 0,
+    typeof cached.rawAssetManifestCount === "number" && Number.isFinite(cached.rawAssetManifestCount)
+      ? Math.max(0, cached.rawAssetManifestCount)
+      : session.currentProjectSnapshot?.memory?.assetManifest?.items.length ?? 0,
+  );
 }
 
 function orderProjectSessions(
@@ -781,6 +1368,9 @@ function readProjectSessionMap(): Record<string, StudioSessionState> {
   sessionMapCache = Object.entries(raw).reduce<Record<string, StudioSessionState>>((accumulator, entry) => {
     const [projectId, session] = entry;
     const normalized = normalizeStudioSession(session);
+    if (hasSessionResetMarker(projectId) || shouldIgnoreDeletedProjectSession(normalized)) {
+      return accumulator;
+    }
     if (normalized) accumulator[projectId] = normalized;
     return accumulator;
   }, {});
@@ -794,10 +1384,6 @@ function cacheStudioSession(normalized: StudioSessionState): void {
 
   if (!cachedSession.projectId) return;
 
-  if (hasSessionResetMarker(cachedSession.projectId)) {
-    localStorage.removeItem(STUDIO_SESSION_RESET_MARKER_KEY);
-  }
-
   const sessions = readProjectSessionMap();
   sessions[cachedSession.projectId] = cachedSession;
 }
@@ -806,6 +1392,12 @@ export function readStudioSession(): StudioSessionState | null {
   if (activeSessionCache !== undefined) return activeSessionCache;
 
   activeSessionCache = normalizeStudioSession(safeReadJson<StudioSessionState | null>(STUDIO_SESSION_KEY, null));
+  if (shouldIgnoreDeletedProjectSession(activeSessionCache)) {
+    activeSessionCache = null;
+    if (typeof window !== "undefined") {
+      localStorage.removeItem(STUDIO_SESSION_KEY);
+    }
+  }
   return activeSessionCache;
 }
 
@@ -813,41 +1405,45 @@ export function readStudioSessionBootstrap(): {
   session: StudioSessionState | null;
   needsHydration: boolean;
 } {
+  const cached = readStudioSessionBootstrapCache();
+  if (cached) return cached;
+
   const raw = safeReadJson<StudioSessionState | null>(STUDIO_SESSION_KEY, null);
-  const session = normalizeStudioSessionForBootstrap(raw);
-  if (!session) {
+  if (shouldIgnoreDeletedProjectSession(normalizeStudioSession(raw))) {
+    if (typeof window !== "undefined") {
+      localStorage.removeItem(STUDIO_SESSION_KEY);
+      localStorage.removeItem(STUDIO_SESSION_BOOTSTRAP_KEY);
+    }
     return { session: null, needsHydration: false };
   }
-
-  const rawMessageCount = Array.isArray(raw?.messages) ? raw.messages.length : 0;
-  const rawArtifactCount = Array.isArray(raw?.currentProjectSnapshot?.artifacts)
-    ? raw.currentProjectSnapshot.artifacts.length
-    : 0;
-  const bootstrapArtifactCount = session.currentProjectSnapshot?.artifacts.length ?? 0;
-
-  return {
+  const session = normalizeStudioSessionForBootstrap(raw);
+  const result = buildStudioSessionBootstrapResult(
     session,
-    needsHydration:
-      rawMessageCount > session.messages.length ||
-      rawArtifactCount > bootstrapArtifactCount,
-  };
+    Array.isArray(raw?.messages) ? raw.messages.length : 0,
+    Array.isArray(raw?.currentProjectSnapshot?.artifacts) ? raw.currentProjectSnapshot.artifacts.length : 0,
+    Array.isArray(raw?.currentProjectSnapshot?.memory?.assetManifest?.items)
+      ? raw.currentProjectSnapshot.memory.assetManifest.items.length
+      : 0,
+  );
+  writeStudioSessionBootstrapCache(raw);
+  return result;
 }
 
-export function writeStudioSession(session: StudioSessionState): void {
+export function writeStudioSession(
+  session: StudioSessionState,
+  options?: { persistFullBackup?: boolean },
+): void {
   const normalized = normalizeStudioSession(session);
   if (!normalized) return;
   if (hasSessionResetMarker(normalized.projectId)) return;
   cacheStudioSession(normalized);
 
   tryWriteJson(STUDIO_SESSION_KEY, (level) => compactSessionForStorage(normalized, level));
+  writeStudioSessionBootstrapCache(normalized);
 
   if (!normalized.projectId) return;
 
   // 新会话写入时清除 reset 标记，解除对该项目文件系统恢复的封锁
-  if (hasSessionResetMarker(normalized.projectId)) {
-    localStorage.removeItem(STUDIO_SESSION_RESET_MARKER_KEY);
-  }
-
   const sessions = readProjectSessionMap();
   sessions[normalized.projectId] = normalized;
   const orderedSessions = orderProjectSessions(sessions, normalized.projectId);
@@ -861,15 +1457,22 @@ export function writeStudioSession(session: StudioSessionState): void {
   );
 
   // 异步写入文件系统（完整保存，无截断，作为持久化备份）
+  if (options?.persistFullBackup === false) return;
   void writeFullSessionBackup(normalized, { copyLegacyProjectMedia: true });
 }
 
-export function queueStudioSessionWrite(session: StudioSessionState, delay = 120): void {
+export function queueStudioSessionWrite(
+  session: StudioSessionState,
+  delay = 120,
+  options?: { persistFullBackup?: boolean },
+): void {
   const normalized = normalizeStudioSession(session);
   if (!normalized) return;
   if (hasSessionResetMarker(normalized.projectId)) return;
 
   queuedFullSessionCache = normalized;
+  queuedPersistNeedsFullBackup =
+    queuedPersistNeedsFullBackup || options?.persistFullBackup !== false;
   cacheStudioSession(normalized);
   scheduleQueuedSessionPersistence(delay);
 }
@@ -879,7 +1482,9 @@ export function clearStudioSession(): void {
   clearQueuedPersistHandle();
   activeSessionCache = null;
   queuedFullSessionCache = null;
+  queuedPersistNeedsFullBackup = false;
   localStorage.removeItem(STUDIO_SESSION_KEY);
+  localStorage.removeItem(STUDIO_SESSION_BOOTSTRAP_KEY);
 }
 
 export function __resetSessionStoreCachesForTests(): void {
@@ -887,6 +1492,7 @@ export function __resetSessionStoreCachesForTests(): void {
   activeSessionCache = undefined;
   sessionMapCache = null;
   queuedFullSessionCache = null;
+  queuedPersistNeedsFullBackup = false;
   cachedSessionsDir = undefined;
   invalidateConversationArchiveScanCache();
 }
@@ -895,6 +1501,7 @@ export function __resetSessionStoreCachesForTests(): void {
 export async function writeProjectStudioSession(session: StudioSessionState): Promise<void> {
   const normalized = normalizeStudioSession(session);
   if (!normalized?.projectId) return;
+  if (hasSessionResetMarker(normalized.projectId)) return;
 
   const sessions = readProjectSessionMap();
   sessions[normalized.projectId] = normalized;
@@ -921,8 +1528,11 @@ export function removeProjectStudioSession(projectId: string): void {
   }
   const sessions = readProjectSessionMap();
   delete sessions[projectId];
-  if (activeSessionCache?.projectId === projectId) {
+  const activeProjectId = getSessionProjectId(activeSessionCache ?? readStudioSession());
+  if (activeProjectId === projectId) {
     activeSessionCache = null;
+    localStorage.removeItem(STUDIO_SESSION_KEY);
+    localStorage.removeItem(STUDIO_SESSION_BOOTSTRAP_KEY);
   }
   const ordered = orderProjectSessions(sessions, "");
   tryWriteJson(STUDIO_PROJECT_SESSIONS_KEY, (level) =>
@@ -933,15 +1543,25 @@ export function removeProjectStudioSession(projectId: string): void {
     ),
   );
   // 同步标记：防止文件系统恢复时把已删除的会话重新写回（兜底时序问题）
-  localStorage.setItem(STUDIO_SESSION_RESET_MARKER_KEY, projectId);
+  const markers = readSessionResetMarkerSet();
+  markers.add(projectId);
+  writeSessionResetMarkerSet(markers);
   // 异步清除文件系统备份，防止刷新后通过 _last.json 恢复
   void deleteSessionFile(projectId);
 }
 
 /** 读取最近一次被主动清除的 projectId（用于阻止文件系统恢复）。 */
 export function readSessionResetMarker(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem(STUDIO_SESSION_RESET_MARKER_KEY);
+  const markers = [...readSessionResetMarkerSet()];
+  return markers.at(-1) ?? null;
+}
+
+export function readSessionResetMarkers(): string[] {
+  return [...readSessionResetMarkerSet()];
+}
+
+export function hasSessionResetMarkerForProject(projectId: string | null | undefined): boolean {
+  return hasSessionResetMarker(projectId);
 }
 
 async function deleteSessionFile(projectId: string): Promise<void> {
@@ -987,6 +1607,10 @@ export function readProjectStudioSession(projectId: string): StudioSessionState 
 
 export { readProjectStudioSession as readStudioProjectSession };
 
+export function listStudioProjectSessions(): StudioSessionState[] {
+  return Object.values(readProjectSessionMap());
+}
+
 // ======================== 文件系统持久化（Electron 专用）========================
 // 作为 localStorage 的备份层，解决配额超出导致历史记录丢失的问题
 
@@ -1012,14 +1636,15 @@ async function writeFullSessionBackup(
   session: StudioSessionState,
   options?: { copyLegacyProjectMedia?: boolean },
 ): Promise<void> {
+  const sanitizedSession = normalizeStudioSession(session) ?? session;
   try {
-    await writeConversationArchiveFull(session, undefined, {
+    await writeConversationArchiveFull(sanitizedSession, undefined, {
       copyLegacyProjectMedia: options?.copyLegacyProjectMedia === true,
     });
   } catch {
     // Keep legacy backup as a fallback if the archive layer is unavailable.
   }
-  await writeSessionToFile(session);
+  await writeSessionToFile(sanitizedSession);
 }
 
 async function writeSessionToFile(session: StudioSessionState): Promise<void> {
@@ -1027,7 +1652,7 @@ async function writeSessionToFile(session: StudioSessionState): Promise<void> {
   const dir = await getSessionsDbDir();
   if (!dir || !window.electronAPI?.storage?.writeText) return;
   try {
-    const content = JSON.stringify(session);
+    const content = JSON.stringify(normalizeStudioSession(session) ?? session);
     await window.electronAPI.storage.writeText(`${dir}/${session.projectId}.json`, content);
     await window.electronAPI.storage.writeText(`${dir}/_last.json`, content);
   } catch {
@@ -1037,16 +1662,32 @@ async function writeSessionToFile(session: StudioSessionState): Promise<void> {
 
 /** 从文件系统读取指定项目的会话（用于 localStorage 为空时的恢复） */
 export async function readProjectSessionFromFile(projectId: string): Promise<StudioSessionState | null> {
+  if (hasSessionResetMarker(projectId)) return null;
   const archive = await readConversationArchiveFull(projectId);
   const archiveSession = normalizeStudioSession(archive?.session ?? null);
-  if (archiveSession) return archiveSession;
+  if (archiveSession && !shouldIgnoreDeletedProjectSession(archiveSession)) {
+    if (
+      sessionHasInlinePreviewPayload(archive?.session ?? null) ||
+      normalizedSessionNeedsRewrite(archive?.session ?? null, archiveSession)
+    ) {
+      void writeFullSessionBackup(archiveSession, { copyLegacyProjectMedia: false });
+    }
+    return archiveSession;
+  }
 
   const dir = await getSessionsDbDir();
   if (!dir || !window.electronAPI?.storage?.readText) return null;
   try {
     const result = await window.electronAPI.storage.readText(`${dir}/${projectId}.json`);
     if (!result.ok || !result.exists || !result.content) return null;
-    return normalizeStudioSession(JSON.parse(result.content) as StudioSessionState | null);
+    const rawSession = JSON.parse(result.content) as StudioSessionState | null;
+    const session = normalizeStudioSession(rawSession);
+    if (session) {
+      // A db-backed session without an archive should be re-materialized into
+      // files/conversations so sidebar history and on-disk conversation backups stay aligned.
+      void writeFullSessionBackup(session, { copyLegacyProjectMedia: false });
+    }
+    return shouldIgnoreDeletedProjectSession(session) ? null : session;
   } catch {
     return null;
   }
@@ -1055,14 +1696,19 @@ export async function readProjectSessionFromFile(projectId: string): Promise<Stu
 /** 从文件系统读取最后一次活跃的会话（用于应用重启后恢复） */
 export async function readLastSessionFromFile(): Promise<StudioSessionState | null> {
   const archiveSession = normalizeStudioSession(await readLatestConversationArchiveSession());
-  if (archiveSession) return archiveSession;
+  if (archiveSession && !shouldIgnoreDeletedProjectSession(archiveSession)) return archiveSession;
 
   const dir = await getSessionsDbDir();
   if (!dir || !window.electronAPI?.storage?.readText) return null;
   try {
     const result = await window.electronAPI.storage.readText(`${dir}/_last.json`);
     if (!result.ok || !result.exists || !result.content) return null;
-    return normalizeStudioSession(JSON.parse(result.content) as StudioSessionState | null);
+    const rawSession = JSON.parse(result.content) as StudioSessionState | null;
+    const session = normalizeStudioSession(rawSession);
+    if (session && (sessionHasInlinePreviewPayload(rawSession) || normalizedSessionNeedsRewrite(rawSession, session))) {
+      void writeFullSessionBackup(session, { copyLegacyProjectMedia: false });
+    }
+    return shouldIgnoreDeletedProjectSession(session) ? null : session;
   } catch {
     return null;
   }

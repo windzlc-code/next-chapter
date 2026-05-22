@@ -9,11 +9,73 @@ import type {
 } from "./types";
 import { resolveArtifactSnapshots } from "./message-artifact-snapshots";
 
+const RECENT_PROJECT_RUNTIME_LIMIT = 50;
+const SHORTCUT_PROGRESS_LABELS: Record<string, string> = {
+  generate_outlines: "单集细纲",
+  generate_episode: "分集撰写",
+  generate_episode_batch: "分集撰写",
+  analyze_script_for_video: "剧本拆解 [>] 初始化",
+  compile_video_shot_packets: "编译镜头指令包",
+  prepare_video_prompt_batch: "镜头提示词 [>] 初始化",
+  prepare_segment_video_prompt: "片段提示词 [>] 初始化",
+  generate_video_assets: "镜头视频 [>] 初始化",
+  generate_segment_video: "生成片段视频",
+  refresh_video_assets: "镜头视频 [>] 刷新状态",
+  refresh_segment_video: "刷新片段视频",
+};
+
+export function getWorkflowShortcutProgressLabel(action: string): string | null {
+  return SHORTCUT_PROGRESS_LABELS[action] ?? null;
+}
+
+export function dispatchWorkflowShortcutProgressEvent(
+  action: string,
+  status: "start" | "progress" | "complete",
+  content: string,
+) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent("agent:workflow-progress", {
+      detail: { id: `shortcut-${action}`, status, content },
+    }),
+  );
+}
+
+function shouldReopenPopoverForVideoWorkflowGate(params: {
+  message: string;
+  snapshot: ConversationProjectSnapshot | null | undefined;
+  nextSuggestion: ComposerQuestion | null;
+}): boolean {
+  const { message, snapshot, nextSuggestion } = params;
+  if (!nextSuggestion || snapshot?.projectKind !== "video") return false;
+
+  const normalizedMessage = message.trim();
+  if (!normalizedMessage) return false;
+
+  return [
+    /当前还没有/,
+    /当前还有/,
+    /当前选中的 .*缺少参考图/,
+    /至少需要/,
+    /需要先/,
+    /先整理/,
+    /先补齐/,
+    /才能进入/,
+    /不能切换/,
+    /再进入视频生成会更稳/,
+    /再继续推进视频生成/,
+    /再编译镜头指令包/,
+  ].some((pattern) => pattern.test(normalizedMessage));
+}
+
 function upsertRecentProject(
   recentProjects: ConversationProjectSnapshot[],
   snapshot: ConversationProjectSnapshot,
 ): ConversationProjectSnapshot[] {
-  return [snapshot, ...recentProjects.filter((item) => item.projectId !== snapshot.projectId)].slice(0, 8);
+  return [snapshot, ...recentProjects.filter((item) => item.projectId !== snapshot.projectId)].slice(
+    0,
+    RECENT_PROJECT_RUNTIME_LIMIT,
+  );
 }
 
 function createArtifactRevisionKey(
@@ -68,12 +130,15 @@ const ACTION_ARTIFACT_KIND_FILTERS: Partial<Record<string, ArtifactKind[]>> = {
   review_episode_quality: ["episode-review"],
   rewrite_episode_from_review: ["episode", "episode-review"],
   run_compliance_review: ["compliance"],
+  auto_adjust_compliance: ["compliance"],
   resolve_compliance_revisions: ["compliance"],
   reopen_compliance_revisions: ["compliance"],
   export_project: ["export"],
   analyze_script_for_video: ["video-brief"],
   extract_video_entities: ["characters", "scene-settings"],
   prepare_storyboard_batch: ["storyboard-plan"],
+  prepare_video_prompt_batch: ["video-prompt-batch"],
+  prepare_segment_video_prompt: ["report"],
   export_storyboard_xlsx: ["storyboard-plan"],
   create_video_bridge_artifact: ["video-brief"],
 };
@@ -136,10 +201,19 @@ function resolveDramaStepArtifactKinds(
 export function mergeRuntimeWithWorkflowDelta(
   previous: StudioRuntimeState,
   delta?: WorkflowRuntimeDelta,
+  options?: {
+    deferRecentProjectUpsert?: boolean;
+  },
 ): StudioRuntimeState {
   if (!delta) return previous;
 
   const nextProjectSnapshot = delta.projectSnapshot ?? previous.currentProjectSnapshot;
+  const shouldDeferRecentProjectUpsert = Boolean(
+    options?.deferRecentProjectUpsert &&
+      nextProjectSnapshot &&
+      !previous.currentProjectSnapshot?.projectId &&
+      !previous.recentProjects.some((item) => item.projectId === nextProjectSnapshot.projectId),
+  );
   return {
     ...previous,
     currentDramaProject: delta.dramaProject === undefined ? previous.currentDramaProject : delta.dramaProject,
@@ -148,7 +222,9 @@ export function mergeRuntimeWithWorkflowDelta(
     skillDrafts: delta.skillDrafts ?? previous.skillDrafts,
     maintenanceReports: delta.maintenanceReports ?? previous.maintenanceReports,
     recentProjects: nextProjectSnapshot
-      ? upsertRecentProject(previous.recentProjects, nextProjectSnapshot)
+      ? shouldDeferRecentProjectUpsert
+        ? previous.recentProjects
+        : upsertRecentProject(previous.recentProjects, nextProjectSnapshot)
       : previous.recentProjects,
     recentMessageSummary:
       delta.recentMessageSummary === undefined ? previous.recentMessageSummary : delta.recentMessageSummary,
@@ -218,6 +294,16 @@ function shouldAutoOpenFollowupPopover(params: {
 }): boolean {
   const { action, nextSuggestion, nextProjectSnapshot, preferVideoPopover = false } = params;
   if (!nextSuggestion) return false;
+  if (
+    action === "enter_drama_step" &&
+    nextProjectSnapshot?.projectKind !== "video" &&
+    /^script-/.test(nextSuggestion.answerKey)
+  ) {
+    return true;
+  }
+  if (action === "save_setup" && nextSuggestion.answerKey === "script-creative-plan") {
+    return true;
+  }
   // 走完第一轮后不再自动推进面板，用户自由切换步骤
   if (hasVideoCompletedFirstCycle(nextProjectSnapshot)) return false;
   if (preferVideoPopover && nextProjectSnapshot?.projectKind === "video") {
@@ -229,6 +315,7 @@ function shouldAutoOpenFollowupPopover(params: {
   return [
     "advance_video_workflow_round",
     "analyze_reference_script",
+    "analyze_script_for_video",
     "confirm_adaptation_episode_count",
     "confirm_adaptation_target_market",
     "confirm_adaptation_genres",
@@ -260,13 +347,6 @@ function normalizeWorkflowShortcutError(error: unknown): string {
     return `${message}\n\n下一步建议：打开设置补齐内置 API 配置后，再回到首页继续当前会话。`;
   }
 
-  if (/Dreamina CLI 尚未登录/i.test(message)) {
-    return `${message}\n\n下一步建议：去设置完成 Dreamina 登录，或把侧栏视频通道切回 API 后继续出片。`;
-  }
-
-  if (/Dreamina CLI 未安装|Dreamina CLI 未检测到|当前环境不支持/i.test(message)) {
-    return `${message}\n\n下一步建议：去设置检查本机 CLI 状态，或把侧栏视频通道切回 API。`;
-  }
 
   if (/缺少 .*API Key|缺少 Seedance \/ Gemini 可用 Key|缺少可用 API Key/i.test(message)) {
     return `${message}\n\n下一步建议：去设置补齐 Key，或切换到另一条已可用的视频通道后继续。`;
@@ -277,6 +357,16 @@ function normalizeWorkflowShortcutError(error: unknown): string {
   }
 
   return message;
+}
+
+function isAbortLikeWorkflowError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.name === "AbortError" ||
+    error.message === "Aborted" ||
+    error.message === "请求已取消" ||
+    error.message === "任务已取消"
+  );
 }
 
 function isTimeoutLikeWorkflowError(error: unknown): boolean {
@@ -298,36 +388,69 @@ function formatArtifactSection(title: string, content: string): string {
   return `${title}：\n${content}`;
 }
 
+function stripSegmentPromptDetailsForChat(summary: string): string {
+  const detailSectionMarkers = [
+    "最终提示词稳定性：",
+    "最终提示词日志：",
+    "### 片段 ",
+  ];
+  const cutoffIndex = detailSectionMarkers.reduce<number>((earliestIndex, marker) => {
+    const markerIndex = summary.indexOf(marker);
+    if (markerIndex < 0) return earliestIndex;
+    if (earliestIndex < 0) return markerIndex;
+    return Math.min(earliestIndex, markerIndex);
+  }, -1);
+
+  if (cutoffIndex < 0) return summary;
+  return summary.slice(0, cutoffIndex).trimEnd();
+}
+
 function buildWorkflowAssistantDisplaySummary(params: {
   action: string;
   summary: string;
   nextSnapshot: ConversationProjectSnapshot | null | undefined;
 }): string {
-  const { action, summary, nextSnapshot } = params;
+  const { action, summary } = params;
   const trimmedSummary = summary.trim();
   if (!trimmedSummary) return "";
+
+  if (action === "prepare_segment_video_prompt") {
+    return stripSegmentPromptDetailsForChat(trimmedSummary);
+  }
 
   if (action !== "extract_video_entities") {
     return trimmedSummary;
   }
 
-  const lead = trimmedSummary.split(/\n\s*\n/, 1)[0]?.trim() || trimmedSummary;
-  const characterNames = extractArtifactDisplayContent(nextSnapshot, "characters");
-  const sceneNames = extractArtifactDisplayContent(nextSnapshot, "scene-settings");
+  return trimmedSummary;
+  /*
+  const lead = trimmedSummary;
+  const characterNames = "";
+  const sceneNames = "";
   const sections = [
     formatArtifactSection("角色", characterNames),
     formatArtifactSection("场景", sceneNames),
   ].filter(Boolean);
 
   return [lead, ...sections].filter(Boolean).join("\n\n");
+  */
 }
 
 function hasInlineMediaOutput(result: Pick<WorkflowActionResult, "imageUrls" | "videoUrls">): boolean {
   return Boolean(result.imageUrls?.length || result.videoUrls?.length);
 }
 
-function shouldSuppressWorkflowAssistantSummary(action: string): boolean {
+function shouldAlwaysShowWorkflowAssistantSummary(action: string): boolean {
   return action === "generate_video_assets";
+}
+
+function shouldSuppressWorkflowAssistantSummary(action: string): boolean {
+  return (
+    action === "generate_video_assets" ||
+    action === "generate_video_reference_assets" ||
+    action === "generate_segment_video" ||
+    action === "refresh_segment_video"
+  );
 }
 
 function pushWorkflowAssistantSummary(params: {
@@ -339,23 +462,51 @@ function pushWorkflowAssistantSummary(params: {
   summary: string;
 }): void {
   const { action, input, ui, previousSnapshot, nextSnapshot, summary } = params;
-  const displaySummary = buildWorkflowAssistantDisplaySummary({
+  const payload = buildWorkflowAssistantMessagePayload({
+    action,
+    input,
+    previousSnapshot,
+    nextSnapshot,
+    summary,
+  });
+  if (!payload) return;
+  ui.pushAssistant(
+    payload.content,
+    payload.artifactIds,
+    payload.artifactSnapshots,
+  );
+}
+
+export function buildWorkflowAssistantMessagePayload(params: {
+  action: string;
+  input: Record<string, unknown>;
+  previousSnapshot: ConversationProjectSnapshot | null | undefined;
+  nextSnapshot: ConversationProjectSnapshot | null | undefined;
+  summary: string;
+}): {
+  content: string;
+  artifactIds: string[];
+  artifactSnapshots: ConversationArtifact[];
+} | null {
+  const { action, input, previousSnapshot, nextSnapshot, summary } = params;
+  const content = buildWorkflowAssistantDisplaySummary({
     action,
     summary,
     nextSnapshot,
   });
-  if (!displaySummary) return;
+  if (!content) return null;
   const artifactIds = collectActionScopedArtifactIds({
     action,
     input,
     previousSnapshot,
     nextSnapshot,
   });
-  ui.pushAssistant(
-    displaySummary,
+
+  return {
+    content,
     artifactIds,
-    resolveArtifactSnapshots(nextSnapshot ?? null, artifactIds),
-  );
+    artifactSnapshots: resolveArtifactSnapshots(nextSnapshot ?? null, artifactIds),
+  };
 }
 
 function updateWorkflowSuggestionUi(params: {
@@ -438,8 +589,9 @@ export function buildWorkflowContinuationPrompt(params: {
     summary.trim() || "(empty summary)",
     "",
     "Continue in the same conversation instead of restarting the workflow.",
-    "If you need user input, call AskUserQuestion in the same turn.",
-    "Do not ask plain-text questions without AskUserQuestion.",
+    "First identify the current workflow stage from the project snapshot before replying.",
+    "Do not jump to a later workflow stage. Stay inside the current stage until it is complete.",
+    "End the reply with forward guidance: either a short next-step recommendation or an AskUserQuestion for the current step.",
   ];
 
   if (action === "export_project") {
@@ -481,7 +633,7 @@ export function buildWorkflowContinuationPrompt(params: {
 
   if (projectSnapshot?.projectKind === "video") {
     lines.push(
-      "Continue the video workflow step-by-step, collecting any missing details through AskUserQuestion before the next action.",
+      "Continue the video workflow step-by-step, collecting only the missing details for the current stage before the next action.",
     );
   }
 
@@ -497,6 +649,9 @@ export async function runWorkflowShortcut(params: {
   userBubble: string;
   allowAutoFollowup?: boolean;
   surfaceNextSuggestion?: boolean;
+  skipAssistantSummary?: boolean;
+  skipInitialProgressEvent?: boolean;
+  deferRecentProjectUpsert?: boolean;
   onError?: () => void;
   onErrorMessage?: (message: string, error: unknown) => void;
 }): Promise<WorkflowShortcutCompletion | null> {
@@ -509,6 +664,9 @@ export async function runWorkflowShortcut(params: {
     userBubble,
     allowAutoFollowup = false,
     surfaceNextSuggestion = true,
+    skipAssistantSummary = false,
+    skipInitialProgressEvent = false,
+    deferRecentProjectUpsert = false,
     onError,
     onErrorMessage,
   } = params;
@@ -521,56 +679,38 @@ export async function runWorkflowShortcut(params: {
   ui.resetComposerDraft();
   ui.setStreaming(true);
 
-  const SHORTCUT_PROGRESS_LABELS: Record<string, string> = {
-    generate_outlines: "单集细纲",
-    generate_episode: "分集撰写",
-    generate_episode_batch: "分集撰写",
-    analyze_script_for_video: "剧本拆解 [>] 初始化",
-    compile_video_shot_packets: "编译镜头指令包",
-    prepare_video_prompt_batch: "生成视频提示词批次",
-    prepare_segment_video_prompt: "片段提示词 [>] 初始化",
-    generate_segment_video: "生成片段视频",
-    refresh_segment_video: "刷新片段视频",
-  };
-  const shortcutProgressLabel = SHORTCUT_PROGRESS_LABELS[action] ?? null;
-  if (shortcutProgressLabel && typeof window !== "undefined") {
-    window.dispatchEvent(
-      new CustomEvent("agent:workflow-progress", {
-        detail: { id: `shortcut-${action}`, status: "start", content: shortcutProgressLabel },
-      }),
-    );
+  const shortcutProgressLabel = getWorkflowShortcutProgressLabel(action);
+  if (shortcutProgressLabel && !skipInitialProgressEvent) {
+    dispatchWorkflowShortcutProgressEvent(action, "start", shortcutProgressLabel);
   }
 
   try {
     const onProgress = (partial: WorkflowActionResult) => {
-      if (shortcutProgressLabel && partial.summary?.trim() && typeof window !== "undefined") {
-        window.dispatchEvent(
-          new CustomEvent("agent:workflow-progress", {
-            detail: {
-              id: `shortcut-${action}`,
-              status: "progress",
-              content: partial.summary.trim(),
-            },
-          }),
-        );
+      if (shortcutProgressLabel && partial.summary?.trim()) {
+        dispatchWorkflowShortcutProgressEvent(action, "progress", partial.summary.trim());
       }
       if (partial.data) {
-        const partialRuntime = mergeRuntimeWithWorkflowDelta(runtime, partial.data);
+        const partialRuntime = mergeRuntimeWithWorkflowDelta(runtime, partial.data, {
+          deferRecentProjectUpsert,
+        });
         ui.commitRuntime(partialRuntime, partial.data.projectSnapshot?.projectId);
       }
     };
 
     const result = await runAction(action, input, runtime, onProgress);
     const nextProjectSnapshot = result.projectSnapshot ?? result.data?.projectSnapshot ?? null;
-    const nextRuntime = result.data ? mergeRuntimeWithWorkflowDelta(runtime, result.data) : runtime;
+    const nextRuntime = result.data
+      ? mergeRuntimeWithWorkflowDelta(runtime, result.data, { deferRecentProjectUpsert })
+      : runtime;
     const nextSuggestion = nextProjectSnapshot ? ui.getSuggestedQuestion(nextProjectSnapshot, nextRuntime) : null;
 
     if (result.data) {
       ui.commitRuntime(nextRuntime, nextProjectSnapshot?.projectId);
     }
 
-    const shouldAlwaysShowSummary = action === "generate_video_assets";
+    const shouldAlwaysShowSummary = shouldAlwaysShowWorkflowAssistantSummary(action);
     if (
+      !skipAssistantSummary &&
       (shouldAlwaysShowSummary || !hasInlineMediaOutput(result)) &&
       !shouldSuppressWorkflowAssistantSummary(action)
     ) {
@@ -604,27 +744,35 @@ export async function runWorkflowShortcut(params: {
     };
   } catch (error) {
     onError?.();
+    if (isAbortLikeWorkflowError(error)) {
+      return null;
+    }
+    const normalizedMessage = normalizeWorkflowShortcutError(error);
     if (surfaceNextSuggestion) {
       const nextSuggestion = runtime.currentProjectSnapshot
         ? ui.getSuggestedQuestion(runtime.currentProjectSnapshot, runtime)
         : null;
       if (nextSuggestion) {
-        ui.setSuggested(nextSuggestion);
+        if (shouldReopenPopoverForVideoWorkflowGate({
+          message: normalizedMessage,
+          snapshot: runtime.currentProjectSnapshot,
+          nextSuggestion,
+        })) {
+          ui.setPopoverQuestion(nextSuggestion, runtime.currentProjectSnapshot);
+          ui.setSuggested(null);
+        } else {
+          ui.setSuggested(nextSuggestion);
+        }
       }
     }
-    const normalizedMessage = normalizeWorkflowShortcutError(error);
     if (isTimeoutLikeWorkflowError(error)) {
       onErrorMessage?.(normalizedMessage, error);
     }
     ui.pushAssistant(normalizedMessage);
     return null;
   } finally {
-    if (shortcutProgressLabel && typeof window !== "undefined") {
-      window.dispatchEvent(
-        new CustomEvent("agent:workflow-progress", {
-          detail: { id: `shortcut-${action}`, status: "complete", content: "" },
-        }),
-      );
+    if (shortcutProgressLabel) {
+      dispatchWorkflowShortcutProgressEvent(action, "complete", "");
     }
     ui.setStreaming(false);
   }
@@ -638,6 +786,8 @@ export async function runWorkflowShortcutChain(params: {
   userBubble: string;
   allowAutoFollowup?: boolean;
   surfaceNextSuggestion?: boolean;
+  deferRecentProjectUpsert?: boolean;
+  skipInitialProgressEvent?: boolean;
   onError?: () => void;
   onErrorMessage?: (message: string, error: unknown) => void;
 }): Promise<WorkflowShortcutCompletion | null> {
@@ -649,6 +799,8 @@ export async function runWorkflowShortcutChain(params: {
     userBubble,
     allowAutoFollowup = false,
     surfaceNextSuggestion = true,
+    deferRecentProjectUpsert = false,
+    skipInitialProgressEvent = false,
     onError,
     onErrorMessage,
   } = params;
@@ -661,19 +813,30 @@ export async function runWorkflowShortcutChain(params: {
   ui.resetComposerDraft();
   ui.setStreaming(true);
 
-  try {
-    let nextRuntime = runtime;
-    let nextProjectId = runtime.currentProjectSnapshot?.projectId;
-    let nextProjectSnapshot = runtime.currentProjectSnapshot;
-    let nextSuggestion: ComposerQuestion | null = null;
-    let lastAction = steps.at(-1)?.action ?? "";
-    const summaries: string[] = [];
+  const finalAction = steps.at(-1)?.action ?? "";
+  const shortcutProgressLabel = getWorkflowShortcutProgressLabel(finalAction);
+  if (shortcutProgressLabel && !skipInitialProgressEvent) {
+    dispatchWorkflowShortcutProgressEvent(finalAction, "start", shortcutProgressLabel);
+  }
 
+  let nextRuntime = runtime;
+  let nextProjectId = runtime.currentProjectSnapshot?.projectId;
+  let nextProjectSnapshot = runtime.currentProjectSnapshot;
+  let nextSuggestion: ComposerQuestion | null = null;
+  let lastAction = finalAction;
+  const summaries: string[] = [];
+
+  try {
     for (const step of steps) {
       const stepRuntime = nextRuntime;
       const stepOnProgress = (partial: WorkflowActionResult) => {
+        if (shortcutProgressLabel && partial.summary?.trim()) {
+          dispatchWorkflowShortcutProgressEvent(finalAction, "progress", partial.summary.trim());
+        }
         if (partial.data) {
-          const partialRuntime = mergeRuntimeWithWorkflowDelta(stepRuntime, partial.data);
+          const partialRuntime = mergeRuntimeWithWorkflowDelta(stepRuntime, partial.data, {
+            deferRecentProjectUpsert,
+          });
           ui.commitRuntime(partialRuntime, partial.data.projectSnapshot?.projectId);
         }
       };
@@ -684,14 +847,16 @@ export async function runWorkflowShortcutChain(params: {
       nextProjectSnapshot = stepSnapshot ?? nextProjectSnapshot;
 
       if (result.data) {
-        nextRuntime = mergeRuntimeWithWorkflowDelta(nextRuntime, result.data);
+        nextRuntime = mergeRuntimeWithWorkflowDelta(nextRuntime, result.data, {
+          deferRecentProjectUpsert,
+        });
         nextProjectId = stepSnapshot?.projectId ?? nextProjectId;
       }
 
       nextSuggestion = stepSnapshot ? ui.getSuggestedQuestion(stepSnapshot, nextRuntime) : nextSuggestion;
 
       if (
-        !hasInlineMediaOutput(result) &&
+        (shouldAlwaysShowWorkflowAssistantSummary(step.action) || !hasInlineMediaOutput(result)) &&
         !shouldSuppressWorkflowAssistantSummary(step.action) &&
         result.summary.trim()
       ) {
@@ -730,21 +895,48 @@ export async function runWorkflowShortcutChain(params: {
     };
   } catch (error) {
     onError?.();
-    if (surfaceNextSuggestion) {
-      const nextSuggestion = runtime.currentProjectSnapshot
-        ? ui.getSuggestedQuestion(runtime.currentProjectSnapshot, runtime)
-        : null;
-      if (nextSuggestion) {
-        ui.setSuggested(nextSuggestion);
-      }
+    if (isAbortLikeWorkflowError(error)) {
+      return null;
     }
     const normalizedMessage = normalizeWorkflowShortcutError(error);
+    if (summaries.length > 0) {
+      pushWorkflowAssistantSummary({
+        action: lastAction,
+        input: steps.at(-1)?.input ?? {},
+        ui,
+        previousSnapshot: runtime.currentProjectSnapshot,
+        nextSnapshot: nextProjectSnapshot,
+        summary: summaries.join("\n\n"),
+      });
+    }
+    if (surfaceNextSuggestion) {
+      const fallbackSuggestion = nextProjectSnapshot
+        ? ui.getSuggestedQuestion(nextProjectSnapshot, nextRuntime)
+        : runtime.currentProjectSnapshot
+          ? ui.getSuggestedQuestion(runtime.currentProjectSnapshot, runtime)
+          : null;
+      if (fallbackSuggestion) {
+        if (shouldReopenPopoverForVideoWorkflowGate({
+          message: normalizedMessage,
+          snapshot: nextProjectSnapshot ?? runtime.currentProjectSnapshot,
+          nextSuggestion: fallbackSuggestion,
+        })) {
+          ui.setPopoverQuestion(fallbackSuggestion, nextProjectSnapshot ?? runtime.currentProjectSnapshot);
+          ui.setSuggested(null);
+        } else {
+          ui.setSuggested(fallbackSuggestion);
+        }
+      }
+    }
     if (isTimeoutLikeWorkflowError(error)) {
       onErrorMessage?.(normalizedMessage, error);
     }
     ui.pushAssistant(normalizedMessage);
     return null;
   } finally {
+    if (shortcutProgressLabel) {
+      dispatchWorkflowShortcutProgressEvent(finalAction, "complete", "");
+    }
     ui.setStreaming(false);
   }
 }

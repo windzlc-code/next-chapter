@@ -382,6 +382,9 @@ export interface ComplianceWorkspaceRiskPhrase {
   segmentIndex: number;
   replacement?: string;
   status: "pending" | "resolved";
+  normalizedText?: string;
+  sourceStart?: number;
+  sourceEnd?: number;
 }
 
 export interface ComplianceWorkspaceRiskSpan {
@@ -425,6 +428,8 @@ export interface ComplianceWorkspaceExportMeta {
 export interface ComplianceWorkspace {
   sourceText: string;
   paletteText: string;
+  reviewBaselineSourceText: string;
+  reviewBaselineReviewedAt?: string | null;
   reviewMode: ComplianceReviewMode;
   strictness: ComplianceStrictness;
   model: ComplianceWorkspaceModel;
@@ -546,6 +551,8 @@ export function createEmptyComplianceWorkspace(): ComplianceWorkspace {
   return {
     sourceText: "",
     paletteText: "",
+    reviewBaselineSourceText: "",
+    reviewBaselineReviewedAt: null,
     reviewMode: "text",
     strictness: "standard",
     model: "gemini-3.1-pro-preview",

@@ -1,5 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { extractAssistantProjectTitle } from "./project-title";
+import { buildAutoSessionProjectTitle, extractAssistantProjectTitle } from "./project-title";
+
+describe("buildAutoSessionProjectTitle", () => {
+  it("derives a concise initial title from a fresh request", () => {
+    const result = buildAutoSessionProjectTitle("帮我起草一个新故事");
+
+    expect(result).toBe("新故事");
+  });
+
+  it("keeps the actual subject phrase instead of the request verb", () => {
+    const result = buildAutoSessionProjectTitle("我想做一个都市悬疑短剧，节奏要更快一点");
+
+    expect(result).toBe("都市悬疑短剧");
+  });
+
+  it("falls back when the input is only a vague control command", () => {
+    const result = buildAutoSessionProjectTitle("继续执行");
+
+    expect(result).toBe("新会话项目");
+  });
+});
 
 describe("extractAssistantProjectTitle", () => {
   it("extracts a tentative title on the next line", () => {

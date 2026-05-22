@@ -1,13 +1,19 @@
 import * as React from "react";
+import { flushSync } from "react-dom";
 import type { MessageInput } from "@/lib/agent/types";
-import { readStudioProjectSession, readProjectSessionFromFile, readSessionResetMarker } from "@/lib/home-agent/session-store";
-import { buildOpenProjectSessionState } from "./home-agent-conversation-state";
+import {
+  hasSessionResetMarkerForProject,
+  readStudioProjectSession,
+  readProjectSessionFromFile,
+} from "@/lib/home-agent/session-store";
+import { buildOpenProjectSessionState, hasStaleSavedReviewQuestion } from "./home-agent-conversation-state";
 import type {
   ComposerQuestion,
   ConversationProjectSnapshot,
   AutomationMode,
   CreationMode,
   HomeAgentMessage,
+  PendingWorkflowUploadKind,
   StudioSessionState,
   StudioQuestionState,
   StudioRuntimeState,
@@ -30,14 +36,13 @@ import {
   normalizeVideoGenerationPrefs,
 } from "@/lib/home-agent/video-models";
 import { formatAskUserQuestionFallback } from "./home-agent-send-flow";
+import {
+  normalizeWorkflowBoundAskUserQuestionRequest,
+  resolveWorkflowBoundComposerQuestion,
+} from "./home-agent-ask-user-question-guard";
+import { resolvePendingWorkflowUploadKind } from "./home-agent-session-utils";
 
 const { useCallback, useEffect, useRef, startTransition } = React;
-
-type DreaminaCapabilityState = {
-  ready: boolean;
-  available: boolean;
-  message?: string;
-};
 
 type RestoredTaskFollowupSuppression = {
   sessionId: string;
@@ -45,13 +50,35 @@ type RestoredTaskFollowupSuppression = {
 };
 
 function hasPendingInteraction(session: StudioSessionState | null | undefined): boolean {
-  return Boolean(session?.qState || session?.deferredQuestionState || session?.pendingChoiceQuestion);
+  return Boolean(
+    session?.qState ||
+      session?.deferredQuestionState ||
+      resolvePendingWorkflowUploadKind(session) ||
+      session?.pendingChoiceQuestion ||
+      session?.interruptedChoiceQuestion,
+  );
 }
 
 function getPendingInteractionPriority(session: StudioSessionState | null | undefined): number {
+  if (resolvePendingWorkflowUploadKind(session)) return 2;
   if (session?.qState || session?.deferredQuestionState) return 2;
+  if (session?.interruptedChoiceQuestion) return 1;
   if (session?.pendingChoiceQuestion) return 1;
   return 0;
+}
+
+function shouldHydrateProjectSessionFromFile(
+  session: StudioSessionState | null | undefined,
+): boolean {
+  if (!session) return true;
+  if (hasPendingInteraction(session)) return true;
+
+  const messageCount = Array.isArray(session.messages) ? session.messages.length : 0;
+  const artifactCount = Array.isArray(session.currentProjectSnapshot?.artifacts)
+    ? session.currentProjectSnapshot.artifacts.length
+    : 0;
+
+  return messageCount >= 100 || artifactCount >= 10 || (session.compactedMessageCount ?? 0) > 0;
 }
 
 export function selectRecoveredProjectSession(
@@ -82,6 +109,8 @@ export function selectRecoveredProjectSession(
 export function useHomeAgentRecoveryFlow(params: {
   handoffRef: React.MutableRefObject<boolean>;
   engineRef: React.MutableRefObject<{ interrupt?: () => void } | null>;
+  runtimeRef: React.MutableRefObject<StudioRuntimeState>;
+  projectHydrationInFlightRef?: React.MutableRefObject<string | null>;
   loadProjectStore: () => Promise<typeof import("@/lib/home-agent/project-store")>;
   flushSessionRef: React.MutableRefObject<() => void>;
   beforeProjectOpen?: (projectId: string) => void;
@@ -96,10 +125,13 @@ export function useHomeAgentRecoveryFlow(params: {
   setVideoGenerationPrefs: React.Dispatch<React.SetStateAction<VideoGenerationPrefs>>;
   setQState: React.Dispatch<React.SetStateAction<StudioQuestionState | null>>;
   setDeferredQuestionState: React.Dispatch<React.SetStateAction<StudioQuestionState | null>>;
+  setPendingWorkflowUploadKind: React.Dispatch<React.SetStateAction<PendingWorkflowUploadKind | null>>;
   setPopoverOverride: React.Dispatch<React.SetStateAction<ComposerQuestion | null>>;
+  setInterruptedChoiceQuestion: React.Dispatch<React.SetStateAction<ComposerQuestion | null>>;
   setSuggested: React.Dispatch<React.SetStateAction<ComposerQuestion | null>>;
   setSelectedValues: React.Dispatch<React.SetStateAction<string[]>>;
   setDeferredSelectedValues: React.Dispatch<React.SetStateAction<string[]>>;
+  setFullAutoChecklistCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
   setStreaming: React.Dispatch<React.SetStateAction<boolean>>;
   setMode: React.Dispatch<React.SetStateAction<"idle" | "active" | "recovering" | "maintenance-review">>;
   setMessages: React.Dispatch<React.SetStateAction<HomeAgentMessage[]>>;
@@ -107,6 +139,7 @@ export function useHomeAgentRecoveryFlow(params: {
   setRuntime: React.Dispatch<React.SetStateAction<StudioRuntimeState>>;
   setMetaReady: React.Dispatch<React.SetStateAction<boolean>>;
   resetComposerDraft: (value?: string) => void;
+  getComposerDraftSnapshot: () => string;
   setDeferredDraft: React.Dispatch<React.SetStateAction<string>>;
   previousQuestionStepRef: React.MutableRefObject<string | null>;
   clearSurfacedTasks: () => void;
@@ -115,9 +148,6 @@ export function useHomeAgentRecoveryFlow(params: {
   restoredTaskFollowupSuppressionRef: React.MutableRefObject<RestoredTaskFollowupSuppression | null>;
   surfacedProjectSuggestionKeysRef: React.MutableRefObject<Set<string>>;
   restoredProjectSuggestionKeysRef: React.MutableRefObject<Set<string>>;
-  dreaminaCapability: DreaminaCapabilityState;
-  flashMaintenanceHint: (message: string, duration?: number) => void;
-  surfacedDreaminaHintRef: React.MutableRefObject<boolean>;
   send: (prompt: MessageInput, shown?: string) => Promise<void>;
   createQuestionState: (request: AskUserQuestionRequest) => StudioQuestionState;
   mk: (role: HomeAgentMessage["role"], content: string) => HomeAgentMessage;
@@ -130,6 +160,8 @@ export function useHomeAgentRecoveryFlow(params: {
   const {
     handoffRef,
     engineRef,
+    runtimeRef,
+    projectHydrationInFlightRef,
     loadProjectStore,
     flushSessionRef,
     beforeProjectOpen,
@@ -144,10 +176,13 @@ export function useHomeAgentRecoveryFlow(params: {
     setVideoGenerationPrefs,
     setQState,
     setDeferredQuestionState,
+    setPendingWorkflowUploadKind,
     setPopoverOverride,
+    setInterruptedChoiceQuestion,
     setSuggested,
     setSelectedValues,
     setDeferredSelectedValues,
+    setFullAutoChecklistCollapsed,
     setStreaming,
     setMode,
     setMessages,
@@ -155,6 +190,7 @@ export function useHomeAgentRecoveryFlow(params: {
     setRuntime,
     setMetaReady,
     resetComposerDraft,
+    getComposerDraftSnapshot,
     setDeferredDraft,
     previousQuestionStepRef,
     clearSurfacedTasks,
@@ -162,26 +198,38 @@ export function useHomeAgentRecoveryFlow(params: {
     surfacedTaskFollowupIdsRef,
     restoredTaskFollowupSuppressionRef,
     surfacedProjectSuggestionKeysRef,
-    restoredProjectSuggestionKeysRef,
-    dreaminaCapability,
-    flashMaintenanceHint,
-    surfacedDreaminaHintRef,
-    send,
+    restoredProjectSuggestionKeysRef,    send,
     createQuestionState,
     mk,
     mergeRecentProjects,
   } = params;
   const openProjectVersionRef = useRef(0);
+  const clearProjectHydrationInFlight = useCallback(
+    (projectId: string) => {
+      if (projectHydrationInFlightRef?.current === projectId) {
+        projectHydrationInFlightRef.current = null;
+      }
+    },
+    [projectHydrationInFlightRef],
+  );
   const cancelPendingProjectOpen = useCallback(() => {
     openProjectVersionRef.current += 1;
-  }, []);
+    if (projectHydrationInFlightRef) {
+      projectHydrationInFlightRef.current = null;
+    }
+  }, [projectHydrationInFlightRef]);
 
   const openProject = useCallback(
     async (projectId: string) => {
       const openVersion = openProjectVersionRef.current + 1;
       openProjectVersionRef.current = openVersion;
+      const runtimeState = runtimeRef?.current;
+      const hadCurrentProjectBeforeOpen = Boolean(runtimeState?.currentProjectSnapshot?.projectId);
       // 切换前先同步保存当前项目状态，防止防抖保存被取消导致状态丢失
       flushSessionRef.current();
+      if (projectHydrationInFlightRef) {
+        projectHydrationInFlightRef.current = projectId;
+      }
 
       beforeProjectOpen?.(projectId);
       engineRef.current?.interrupt?.();
@@ -192,6 +240,7 @@ export function useHomeAgentRecoveryFlow(params: {
         setStreaming(false);
         setQState(null);
         setDeferredQuestionState(null);
+        setPendingWorkflowUploadKind(null);
         setPopoverOverride(null);
         setSuggested(null);
         setSelectedValues([]);
@@ -200,12 +249,44 @@ export function useHomeAgentRecoveryFlow(params: {
       });
 
       // 优先从 localStorage 读取（同步，无延迟）
-      const isReset = readSessionResetMarker() === projectId;
+      const isReset = hasSessionResetMarkerForProject(projectId);
       const localSession = readStudioProjectSession(projectId);
       const cachedSnapshot = localSession?.currentProjectSnapshot ?? null;
+      const recentSnapshot =
+        runtimeState?.recentProjects.find((snapshot) => snapshot.projectId === projectId) ?? null;
+
+      if (!cachedSnapshot && recentSnapshot) {
+        startTransition(() => {
+          setAutomationMode(recentSnapshot.automationMode === "full-auto" ? "full-auto" : "manual");
+          setActiveProjectId(projectId);
+          setMode("recovering");
+          setPendingWorkflowUploadKind(resolvePendingWorkflowUploadKind(localSession));
+          setRuntime((prev) => ({
+            ...prev,
+            suppressHistoricalMemory: true,
+            currentProjectSnapshot: recentSnapshot,
+            currentDramaProject: null,
+            currentVideoProject: null,
+            recentProjects: mergeRecentProjects(prev.recentProjects, recentSnapshot),
+            fullAutoRun: null,
+          }));
+        });
+      }
 
       // 并行启动文件系统读取，不阻塞 UI 渲染
-      const fileSessionPromise = isReset ? Promise.resolve(null) : readProjectSessionFromFile(projectId);
+      const fileSessionPromise = (() => {
+        if (isReset || !shouldHydrateProjectSessionFromFile(localSession)) {
+          return Promise.resolve(null);
+        }
+        if (typeof window === "undefined") {
+          return readProjectSessionFromFile(projectId);
+        }
+        return new Promise<StudioSessionState | null>((resolve) => {
+          window.setTimeout(() => {
+            void readProjectSessionFromFile(projectId).then(resolve).catch(() => resolve(null));
+          }, localSession ? 900 : 0);
+        });
+      })();
 
       // 快速路径：localStorage 有快照时立即渲染，无需等待任何 async 操作
       if (cachedSnapshot) {
@@ -240,10 +321,15 @@ export function useHomeAgentRecoveryFlow(params: {
           setVideoGenerationPrefs(nextVideoPrefs);
           setQState(nextState.qState);
           setDeferredQuestionState(nextState.deferredQuestionState);
+          setPendingWorkflowUploadKind(nextState.pendingWorkflowUploadKind ?? null);
           setPopoverOverride(nextState.popoverOverride);
+          setInterruptedChoiceQuestion(
+            nextState.pendingWorkflowUploadKind ? null : (localSession?.interruptedChoiceQuestion ?? null),
+          );
           setSuggested(nextState.suggested);
           setSelectedValues(nextState.selectedValues);
           setDeferredSelectedValues(nextState.deferredSelectedValues);
+          setFullAutoChecklistCollapsed(nextState.fullAutoChecklistCollapsed);
           setMode(nextState.mode);
           setMessages(nextState.messages);
           resetComposerDraft(nextState.draft);
@@ -261,6 +347,7 @@ export function useHomeAgentRecoveryFlow(params: {
           setRuntime((prev) => ({
             ...prev,
             sessionId: nextState.sessionId,
+            suppressHistoricalMemory: true,
             currentProjectSnapshot: cachedSnapshot,
             currentDramaProject: null, // use-home-agent-conversation-effects 会后台补充
             currentVideoProject: null, // use-home-agent-conversation-effects 会后台补充
@@ -281,8 +368,32 @@ export function useHomeAgentRecoveryFlow(params: {
       });
       if (openProjectVersionRef.current !== openVersion) return;
 
-      const snapshot = source.snapshot ?? cachedSnapshot;
-      if (!snapshot) return;
+      const snapshot =
+        source.snapshot ??
+        (source.videoProject?.id === projectId
+          ? store.createVideoSnapshot(source.videoProject)
+          : source.dramaProject?.id === projectId
+            ? store.createDramaSnapshot(source.dramaProject)
+            : cachedSnapshot);
+      if (!snapshot) {
+        clearProjectHydrationInFlight(projectId);
+        if (!hadCurrentProjectBeforeOpen) {
+          startTransition(() => {
+            setActiveProjectId(undefined);
+            setMode("idle");
+            setPendingWorkflowUploadKind(null);
+            setRuntime((prev) => ({
+              ...prev,
+              currentProjectSnapshot: null,
+              currentDramaProject: null,
+              currentVideoProject: null,
+            }));
+          });
+        }
+        return;
+      }
+
+      clearProjectHydrationInFlight(projectId);
 
       if (!cachedSnapshot) {
         // 慢速路径：没有缓存快照，现在才渲染 UI
@@ -329,7 +440,11 @@ export function useHomeAgentRecoveryFlow(params: {
           setVideoGenerationPrefs(nextVideoPrefs);
           setQState(nextState.qState);
           setDeferredQuestionState(nextState.deferredQuestionState);
+          setPendingWorkflowUploadKind(nextState.pendingWorkflowUploadKind ?? null);
           setPopoverOverride(nextState.popoverOverride);
+          setInterruptedChoiceQuestion(
+            nextState.pendingWorkflowUploadKind ? null : (localSession?.interruptedChoiceQuestion ?? null),
+          );
           setSuggested(nextState.suggested);
           setSelectedValues(nextState.selectedValues);
           setDeferredSelectedValues(nextState.deferredSelectedValues);
@@ -350,6 +465,7 @@ export function useHomeAgentRecoveryFlow(params: {
           setRuntime((prev) => ({
             ...prev,
             sessionId: nextState.sessionId,
+            suppressHistoricalMemory: true,
             currentProjectSnapshot: snapshot,
             currentDramaProject: source.dramaProject,
             currentVideoProject: source.videoProject,
@@ -365,6 +481,7 @@ export function useHomeAgentRecoveryFlow(params: {
             if (prev.currentProjectSnapshot?.projectId !== projectId) return prev;
             return {
               ...prev,
+              suppressHistoricalMemory: true,
               currentProjectSnapshot: snapshot,
               currentDramaProject: source.dramaProject,
               currentVideoProject: source.videoProject,
@@ -374,12 +491,29 @@ export function useHomeAgentRecoveryFlow(params: {
       }
 
       // 后台等待文件系统数据，仅在有更多消息时静默补充（localStorage 被清除的恢复场景）
+      if (localSession && source.videoProject && hasStaleSavedReviewQuestion(localSession)) {
+        startTransition(() => {
+          const nextState = buildOpenProjectSessionState({
+            savedSession: localSession,
+            snapshot,
+            videoProject: source.videoProject,
+            buildBrief: brief,
+            createAssistantMessage: (content) => mk("assistant", content),
+            getSuggestedQuestion: recQuestion,
+          });
+          setPendingWorkflowUploadKind(nextState.pendingWorkflowUploadKind ?? null);
+          setPopoverOverride(nextState.popoverOverride);
+          setSuggested(nextState.suggested);
+        });
+      }
+
       void fileSessionPromise.then((fileSession) => {
         if (openProjectVersionRef.current !== openVersion) return;
         if (!fileSession) return;
         const savedSession = selectRecoveredProjectSession(localSession, fileSession);
         if (!savedSession || savedSession === localSession) return;
-        startTransition(() => {
+        const shouldPreserveLiveDraft = getComposerDraftSnapshot() !== (localSession?.draft ?? "");
+        flushSync(() => {
           const nextState = buildOpenProjectSessionState({
             savedSession,
             snapshot,
@@ -391,6 +525,21 @@ export function useHomeAgentRecoveryFlow(params: {
           setMessages(nextState.messages);
           setCompactedMessageCount(nextState.compactedMessageCount);
           setAutomationMode(nextState.automationMode);
+          setFullAutoChecklistCollapsed(nextState.fullAutoChecklistCollapsed);
+          if (!shouldPreserveLiveDraft) {
+            setQState(nextState.qState);
+            setDeferredQuestionState(nextState.deferredQuestionState);
+            setPendingWorkflowUploadKind(nextState.pendingWorkflowUploadKind ?? null);
+            setPopoverOverride(nextState.popoverOverride);
+            resetComposerDraft(nextState.draft);
+            setDeferredDraft(nextState.deferredDraft);
+            setSelectedValues(nextState.selectedValues);
+            setDeferredSelectedValues(nextState.deferredSelectedValues);
+            setSuggested(nextState.suggested);
+            setInterruptedChoiceQuestion(
+              nextState.pendingWorkflowUploadKind ? null : (savedSession.interruptedChoiceQuestion ?? null),
+            );
+          }
           setRuntime((prev) => ({
             ...prev,
             recentMessageSummary: savedSession.recentMessageSummary ?? prev.recentMessageSummary,
@@ -400,28 +549,40 @@ export function useHomeAgentRecoveryFlow(params: {
       }).catch(() => {});
 
       // 切换项目后异步刷新完整项目列表，确保工作流中途创建的项目不会从侧边栏消失
-      void store.listRecentConversationSnapshots(20, { fast: true }).then((items) => {
-        if (openProjectVersionRef.current !== openVersion) return;
-        startTransition(() => {
-          setRuntime((prev) => ({ ...prev, recentProjects: items }));
-        });
-      }).catch(() => {});
-
-      if (dreaminaCapability.available && snapshot.projectKind === "video") {
-        flashMaintenanceHint("已接入 Dreamina CLI，可直接使用 Seedance 2.0", 2400);
-        surfacedDreaminaHintRef.current = true;
+      const shouldRefreshRecentProjects = !runtimeState?.recentProjects.some(
+        (item) => item.projectId === projectId,
+      );
+      if (shouldRefreshRecentProjects) {
+        void store.listRecentConversationSnapshots(160, { fast: true }).then((items) => {
+          if (openProjectVersionRef.current !== openVersion) return;
+          const filteredItems = items.filter(
+            (item) => item.projectId && !hasSessionResetMarkerForProject(item.projectId),
+          );
+          startTransition(() => {
+            setRuntime((prev) => {
+              const shouldPreserveRicherList =
+                filteredItems.length > 0 &&
+                prev.recentProjects.length > filteredItems.length &&
+                filteredItems.every((item) => prev.recentProjects.some((project) => project.projectId === item.projectId));
+              if (shouldPreserveRicherList) {
+                return prev;
+              }
+              return { ...prev, recentProjects: filteredItems };
+            });
+          });
+        }).catch(() => {});
       }
       setMetaReady(false);
     },
     [
+      clearProjectHydrationInFlight,
       clearSurfacedTasks,
-      dreaminaCapability.available,
       engineRef,
-      flashMaintenanceHint,
       loadProjectStore,
       mergeRecentProjects,
       mk,
       previousQuestionStepRef,
+      getComposerDraftSnapshot,
       resetComposerDraft,
       setActiveProjectId,
       setAutomationMode,
@@ -436,10 +597,13 @@ export function useHomeAgentRecoveryFlow(params: {
       setDeferredDraft,
       setDeferredQuestionState,
       setDeferredSelectedValues,
+      setFullAutoChecklistCollapsed,
       setMessages,
       setMetaReady,
       setMode,
+      setPendingWorkflowUploadKind,
       setPopoverOverride,
+      setInterruptedChoiceQuestion,
       setQState,
       setRuntime,
       setSelectedValues,
@@ -450,9 +614,10 @@ export function useHomeAgentRecoveryFlow(params: {
       surfacedTaskIdsRef,
       surfacedProjectSuggestionKeysRef,
       restoredProjectSuggestionKeysRef,
-      surfacedDreaminaHintRef,
       beforeProjectOpen,
       flushSessionRef,
+      runtimeRef,
+      projectHydrationInFlightRef,
     ],
   );
 
@@ -476,34 +641,49 @@ export function useHomeAgentRecoveryFlow(params: {
       const detail = (event as CustomEvent<AskUserQuestionRequest>).detail;
       if (!detail?.questions?.length) return;
 
-      // 将问题内容同步写入聊天流，弹窗和文本同时出现
-      const fallbackText = formatAskUserQuestionFallback(detail);
+      // 先将完整问题文本写入聊天流，再弹出结构化选择窗。
+      const normalizedRequest = normalizeWorkflowBoundAskUserQuestionRequest(detail, runtimeRef.current);
+      const workflowQuestion = resolveWorkflowBoundComposerQuestion(
+        normalizedRequest,
+        runtimeRef.current,
+      );
+      const fallbackText = formatAskUserQuestionFallback(normalizedRequest);
       if (fallbackText.trim()) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: crypto.randomUUID(),
-            role: "assistant" as const,
-            content: fallbackText,
-            createdAt: new Date().toISOString(),
-            status: "complete",
-          },
-        ]);
+        flushSync(() => {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              role: "assistant" as const,
+              content: fallbackText,
+              createdAt: new Date().toISOString(),
+              status: "complete",
+            },
+          ]);
+        });
       }
 
-      startTransition(() => {
-        setPopoverOverride(null);
-        setSuggested(null);
-        setQState(createQuestionState(detail));
-        setSelectedValues([]);
-        resetComposerDraft("");
-        setMode("active");
-      });
+      window.setTimeout(() => {
+        startTransition(() => {
+          setSuggested(null);
+          setSelectedValues([]);
+          resetComposerDraft("");
+          setMode("active");
+          setInterruptedChoiceQuestion(null);
+          if (workflowQuestion) {
+            setQState(null);
+            setPopoverOverride(workflowQuestion);
+            return;
+          }
+          setPopoverOverride(null);
+          setQState(createQuestionState(normalizedRequest));
+        });
+      }, 0);
     };
 
     window.addEventListener("agent:ask-user-question", onAsk);
     return () => window.removeEventListener("agent:ask-user-question", onAsk);
-  }, [createQuestionState, resetComposerDraft, setMessages, setMode, setPopoverOverride, setQState, setSelectedValues, setSuggested]);
+  }, [createQuestionState, resetComposerDraft, runtimeRef, setInterruptedChoiceQuestion, setMessages, setMode, setPopoverOverride, setQState, setSelectedValues, setSuggested]);
 
   return { openProject, cancelPendingProjectOpen };
 }

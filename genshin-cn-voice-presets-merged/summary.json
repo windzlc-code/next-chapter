@@ -1,0 +1,337 @@
+﻿{
+  "source_roots": [
+    "E:\\Other\\work\\22\\next-chapter_0.4.3_007\\genshin-cn-voice-presets",
+    "E:\\Other\\work\\22\\next-chapter_0.4.3_007\\genshin-cn-voice-presets-v2",
+    "https://huggingface.co/datasets/simon3000/genshin-voice"
+  ],
+  "primary_audio_source": "E:\\Other\\work\\22\\next-chapter_0.4.3_007\\genshin-cn-voice-presets-v2",
+  "output_root": "E:\\Other\\work\\22\\next-chapter_0.4.3_007\\genshin-cn-voice-presets-merged",
+  "built_at": "2026-05-20 00:44:34",
+  "merge_strategy": "Curated merge with similarity pruning, high-contrast archetype additions, restored age-layer timbres, and a final strict pass that removes clips whose performance no longer matches the target folder name closely enough.",
+  "total_downloaded_files": 104,
+  "category_counts": [
+    {
+      "id": "C01",
+      "source_id": "B_F01",
+      "group_path": [
+        "基础音色",
+        "女声"
+      ],
+      "title": "萝莉 高亮灵动",
+      "folder": "01_萝莉_高亮灵动",
+      "description": "高亮、小精灵感强，和其他女声区分度非常大。",
+      "count": 5
+    },
+    {
+      "id": "C02",
+      "source_id": "B_F02",
+      "group_path": [
+        "基础音色",
+        "女声"
+      ],
+      "title": "幼态 轻气软萌",
+      "folder": "02_幼态_轻气软萌",
+      "description": "更奶、更轻、更软，和萝莉高亮、少女元气明显分开。",
+      "count": 5
+    },
+    {
+      "id": "C03",
+      "source_id": "B_F03",
+      "group_path": [
+        "基础音色",
+        "女声"
+      ],
+      "title": "少女 明亮元气",
+      "folder": "03_少女_明亮元气",
+      "description": "年轻、明快、生活感强。",
+      "count": 5
+    },
+    {
+      "id": "C04",
+      "source_id": "B_F05",
+      "group_path": [
+        "基础音色",
+        "女声"
+      ],
+      "title": "少女 清冷收束",
+      "folder": "04_少女_清冷收束",
+      "description": "偏冷、偏薄、偏克制，和元气线分得开。",
+      "count": 5
+    },
+    {
+      "id": "C05",
+      "source_id": "B_F07",
+      "group_path": [
+        "基础音色",
+        "女声"
+      ],
+      "title": "成女 低温锋利",
+      "folder": "05_成女_低温锋利",
+      "description": "御姐、低温、锋利、压迫感更重。",
+      "count": 4
+    },
+    {
+      "id": "C06",
+      "source_id": "B_F08",
+      "group_path": [
+        "基础音色",
+        "女声"
+      ],
+      "title": "成女 慵懒磁性",
+      "folder": "06_成女_慵懒磁性",
+      "description": "更厚、更松、更有胸声和成熟磁性。",
+      "count": 4
+    },
+    {
+      "id": "C07",
+      "source_id": "B_M02",
+      "group_path": [
+        "基础音色",
+        "男声"
+      ],
+      "title": "少年 温柔书卷",
+      "folder": "07_少年_温柔书卷",
+      "description": "书卷感、温柔感明显，和冷感、痞气线差异大。",
+      "count": 5
+    },
+    {
+      "id": "C08",
+      "source_id": "B_M03",
+      "group_path": [
+        "基础音色",
+        "男声"
+      ],
+      "title": "少年 冷感锐薄",
+      "folder": "08_少年_冷感锐薄",
+      "description": "年轻男声里最冷、最薄、最锋利的一档。",
+      "count": 4
+    },
+    {
+      "id": "C09",
+      "source_id": "B_M04",
+      "group_path": [
+        "基础音色",
+        "男声"
+      ],
+      "title": "青年 温润知性",
+      "folder": "09_青年_温润知性",
+      "description": "理性、平顺、温润，适合学者和知性男声。",
+      "count": 4
+    },
+    {
+      "id": "C10",
+      "source_id": "B_M05",
+      "group_path": [
+        "基础音色",
+        "男声"
+      ],
+      "title": "青年 沉稳权威",
+      "folder": "10_青年_沉稳权威",
+      "description": "低频更重，成熟稳健，权威感强。",
+      "count": 5
+    },
+    {
+      "id": "C11",
+      "source_id": "B_M06",
+      "group_path": [
+        "基础音色",
+        "男声"
+      ],
+      "title": "青年 痞气张力",
+      "folder": "11_青年_痞气张力",
+      "description": "外放、挑衅、痞气，和沉稳权威完全相反。",
+      "count": 5
+    },
+    {
+      "id": "C12",
+      "source_id": "S02",
+      "group_path": [
+        "角色状态型"
+      ],
+      "title": "长者权威 老成叙事",
+      "folder": "12_长者权威_老成叙事",
+      "description": "更像长者、阅历者、讲述者的状态。",
+      "count": 5
+    },
+    {
+      "id": "C13",
+      "source_id": "S03",
+      "group_path": [
+        "角色状态型"
+      ],
+      "title": "反派阴冷 操控轻蔑",
+      "folder": "13_反派阴冷_操控轻蔑",
+      "description": "阴冷、威胁、操控局势的反派感。",
+      "count": 2
+    },
+    {
+      "id": "C14",
+      "source_id": "S04",
+      "group_path": [
+        "角色状态型"
+      ],
+      "title": "油滑世故 圆滑商贩感",
+      "folder": "14_油滑世故_圆滑商贩感",
+      "description": "圆滑、讨巧、会来事，世故感明显。",
+      "count": 2
+    },
+    {
+      "id": "C15",
+      "source_id": "S05",
+      "group_path": [
+        "角色状态型"
+      ],
+      "title": "死气沉沉 低能量疲态",
+      "folder": "15_死气沉沉_低能量疲态",
+      "description": "无力、塌、低活性，像被掏空。",
+      "count": 3
+    },
+    {
+      "id": "C16",
+      "source_id": "S06",
+      "group_path": [
+        "角色状态型"
+      ],
+      "title": "病弱虚浮 轻气气短",
+      "folder": "16_病弱虚浮_轻气气短",
+      "description": "更虚、更飘、更病弱，和单纯低能量分开。",
+      "count": 2
+    },
+    {
+      "id": "C17",
+      "source_id": "S08",
+      "group_path": [
+        "角色状态型"
+      ],
+      "title": "市井大叔 粗砺烟火",
+      "folder": "17_市井大叔_粗砺烟火",
+      "description": "粗糙、烟火味、大叔感，和权威长者完全不同。",
+      "count": 2
+    },
+    {
+      "id": "C18",
+      "source_id": "P01",
+      "group_path": [
+        "表演质感型"
+      ],
+      "title": "戏精张力 舞台感强",
+      "folder": "18_戏精张力_舞台感强",
+      "description": "强表演、抑扬顿挫大，舞台味很重。",
+      "count": 3
+    },
+    {
+      "id": "C19",
+      "source_id": "P02",
+      "group_path": [
+        "表演质感型"
+      ],
+      "title": "梦呓空灵 疏离悬浮",
+      "folder": "19_梦呓空灵_疏离悬浮",
+      "description": "空灵、梦感、悬浮感明显。",
+      "count": 2
+    },
+    {
+      "id": "C20",
+      "source_id": "P03",
+      "group_path": [
+        "表演质感型"
+      ],
+      "title": "怒意爆发 高张力喊话",
+      "folder": "20_怒意爆发_高张力喊话",
+      "description": "情绪冲高、爆发力强，适合冲突场景。",
+      "count": 3
+    },
+    {
+      "id": "C21",
+      "source_id": "B_F06",
+      "group_path": [
+        "角色气质型"
+      ],
+      "title": "名门御姐 贵气控场",
+      "folder": "21_名门御姐_贵气控场",
+      "description": "成熟、贵气、高位感明显，更偏从容掌控而不是刀锋冷压。",
+      "count": 5
+    },
+    {
+      "id": "C22",
+      "source_id": "HF_ROWSET_BJ01",
+      "group_path": [
+        "角色气质型"
+      ],
+      "title": "病娇甜冷 偏执贴脸",
+      "folder": "22_病娇甜冷_偏执贴脸",
+      "description": "表层甜近、内里执拗，像亲昵里的危险感，不走病弱路线。",
+      "count": 4
+    },
+    {
+      "id": "C23",
+      "source_id": "HF_ROWSET_QS01",
+      "group_path": [
+        "角色气质型"
+      ],
+      "title": "审讯控场 冷面压声",
+      "folder": "23_审讯控场_冷面压声",
+      "description": "更像法庭、审问桌、判决席的低温控场，不走反派威胁或单纯御姐冷压。",
+      "count": 2
+    },
+    {
+      "id": "C24",
+      "source_id": "HF_ROWSET_WW01",
+      "group_path": [
+        "角色气质型"
+      ],
+      "title": "危险亲近 玩味牵引",
+      "folder": "24_危险亲近_玩味牵引",
+      "description": "主动靠近、话里留钩、像把人往局里带，不走病娇占有欲或油滑商贩腔。",
+      "count": 2
+    },
+    {
+      "id": "C25",
+      "source_id": "B_M07",
+      "group_path": [
+        "基础音色",
+        "男声"
+      ],
+      "title": "中年 沉厚老练",
+      "folder": "12_中年_沉厚老练",
+      "description": "颗粒更重、阅历感更深，从青年成熟线再往上推一档，但不走长者叙事状态。",
+      "count": 4
+    },
+    {
+      "id": "C26",
+      "source_id": "B_M08",
+      "group_path": [
+        "基础音色",
+        "男声"
+      ],
+      "title": "年长 苍劲从容",
+      "folder": "13_年长_苍劲从容",
+      "description": "更慢、更稳、更苍劲，是基础层里的年长老成线，不等同于讲述者或审讯状态。",
+      "count": 5
+    },
+    {
+      "id": "C27",
+      "source_id": "B_F09",
+      "group_path": [
+        "基础音色",
+        "女声"
+      ],
+      "title": "熟龄女 端雅稳叙",
+      "folder": "07_熟龄女_端雅稳叙",
+      "description": "更像经历过事的成熟女声，气息更稳、句子更长，不走御姐冷压或慵懒磁性。",
+      "count": 3
+    },
+    {
+      "id": "C28",
+      "source_id": "B_F10",
+      "group_path": [
+        "基础音色",
+        "女声"
+      ],
+      "title": "长者女 师者讲述",
+      "folder": "08_长者女_师者讲述",
+      "description": "更偏长者、导师、授课感，语气有指导和解释意味，和少女俏皮或戏精张力明显分开。",
+      "count": 4
+    }
+  ]
+}

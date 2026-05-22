@@ -10,14 +10,19 @@ import type {
   WorkflowActionResult,
 } from "@/lib/home-agent/types";
 import {
+  buildLegacyVideoImageStylePrefs,
+  buildVideoImageStyleSummary,
   DEFAULT_HOME_AGENT_IMAGE_GENERATION_PREFS,
+  getVideoImageGenerationBatchLimit,
   normalizeVideoImageGenerationPrefs,
 } from "@/lib/home-agent/image-models";
 import {
   DEFAULT_HOME_AGENT_VIDEO_GENERATION_PREFS,
+  HOME_AGENT_VIDEO_GENERATION_BATCH_LIMIT,
   normalizeHomeAgentVideoModelKey,
   normalizeVideoGenerationPrefs,
 } from "@/lib/home-agent/video-models";
+import { normalizeHomeAgentTextModelKey } from "@/lib/home-agent/text-models";
 import {
   buildCompactMediaStatusHeading,
   buildMediaContentSummary,
@@ -33,21 +38,149 @@ import type {
 } from "@/types/project";
 import {
   buildWorkflowContinuationPrompt,
+  dispatchWorkflowShortcutProgressEvent,
+  getWorkflowShortcutProgressLabel,
   runWorkflowShortcut,
   runWorkflowShortcutChain,
 } from "@/lib/home-agent/workflow-shortcut-runner";
 import type { AutoResearchPlan } from "@/lib/home-agent/auto-research";
 import { launchHomeAgentAutoResearchTasks, type HomeAgentApiConfigModule } from "./home-agent-engine-runtime";
 import { createWorkflowShortcutUiBridge } from "./home-agent-workflow-ui";
-import { buildVideoBridgeRetryQuestion, recQuestion } from "./home-agent-project-questions";
-import { buildProjectSuggestionKey } from "./home-agent-session-utils";
+import { buildVideoAnalyzeInterruptQuestion } from "./home-agent-interrupt-recovery";
+import {
+  buildVideoBridgeRetryQuestion,
+  listFailedSegmentVideoLabels,
+  listGeneratableSegmentVideoLabels,
+  recQuestion,
+} from "./home-agent-project-questions";
+import {
+  buildProjectSuggestionKey,
+  resolveSessionProjectIdForSnapshot,
+} from "./home-agent-session-utils";
 import type { BackgroundResearchGroup } from "./home-agent-task-utils";
-import { abortOutlineGeneration } from "@/lib/home-agent/services/drama-workflow-service";
-import { abortVideoWorkflowGeneration } from "@/lib/home-agent/services/video-workflow-service";
+import { shouldForceSilentWorkflowShortcut } from "./workflow-shortcut-silence";
+import {
+  resolveWorkflowImageStartTargets,
+  resolveWorkflowSegmentVideoStartTargets,
+} from "./workflow-media-events";
 
-type PushMessage = (role: HomeAgentMessage["role"], content: string) => void;
+type PushMessage = (
+  role: HomeAgentMessage["role"],
+  content: string,
+  artifactIds?: string[],
+  attachments?: import("@/lib/agent/chat-attachments").ChatAttachment[],
+  artifactSnapshots?: import("@/lib/home-agent/types").ConversationArtifact[],
+  messageExtras?: Partial<Pick<HomeAgentMessage, "automationOrigin" | "workflowRefresh">>,
+) => void;
 
 type VideoBridgeResearchMode = "all" | "targetPlatform" | "shotStyle" | "outputGoal";
+
+type VideoBridgeResearchProject = Pick<
+  NonNullable<StudioRuntimeState["currentVideoProject"]>,
+  "artStyle" | "imageGenerationPrefs" | "referenceStyleSummary"
+>;
+
+const DEFAULT_BATCH_MEDIA_SUBMISSION_GUARD_DELAY_MS =
+  import.meta.env.MODE === "test" ? 0 : 3000;
+
+let dramaWorkflowServiceModulePromise:
+  | Promise<typeof import("@/lib/home-agent/services/drama-workflow-service")>
+  | null = null;
+let videoWorkflowServiceModulePromise:
+  | Promise<typeof import("@/lib/home-agent/services/video-workflow-service")>
+  | null = null;
+
+function abortOutlineGenerationLazy(): void {
+  if (!dramaWorkflowServiceModulePromise) {
+    dramaWorkflowServiceModulePromise = import("@/lib/home-agent/services/drama-workflow-service");
+  }
+  void dramaWorkflowServiceModulePromise
+    .then(({ abortOutlineGeneration }) => {
+      abortOutlineGeneration();
+    })
+    .catch(() => undefined);
+}
+
+function abortVideoWorkflowGenerationLazy(): void {
+  if (!videoWorkflowServiceModulePromise) {
+    videoWorkflowServiceModulePromise = import("@/lib/home-agent/services/video-workflow-service");
+  }
+  void videoWorkflowServiceModulePromise
+    .then(({ abortVideoWorkflowGeneration }) => {
+      abortVideoWorkflowGeneration();
+    })
+    .catch(() => undefined);
+}
+
+type BatchMediaShortcutSubmissionGuard = {
+  delayMs: number;
+  startMessage: string;
+  progressLabel: string | null;
+};
+
+function buildBatchMediaShortcutSubmissionGuard(
+  action: string,
+  delayMs: number,
+  kind: "image" | "video",
+): BatchMediaShortcutSubmissionGuard {
+  const seconds = Math.max(1, Math.ceil(delayMs / 1000));
+  return {
+    delayMs,
+    startMessage:
+      kind === "image"
+        ? `已进入 ${seconds} 秒防误触保护，倒计时结束后才会提交生图请求；这段时间内仍可撤回。`
+        : `已进入 ${seconds} 秒防误触保护，倒计时结束后才会提交生视频请求；这段时间内仍可撤回。`,
+    progressLabel: getWorkflowShortcutProgressLabel(action),
+  };
+}
+
+function resolveBatchMediaShortcutSubmissionGuard(params: {
+  action: string;
+  input: Record<string, unknown>;
+  runtime: StudioRuntimeState;
+  delayMs: number;
+  stepCount?: number;
+}): BatchMediaShortcutSubmissionGuard | null {
+  const { action, delayMs } = params;
+  if (delayMs <= 0) return null;
+
+  if (
+    action === "generate_project_image" ||
+    action === "generate_video_reference_assets" ||
+    action === "generate_storyboard_frames"
+  ) {
+    return buildBatchMediaShortcutSubmissionGuard(action, delayMs, "image");
+  }
+
+  if (action === "generate_video_assets") {
+    return buildBatchMediaShortcutSubmissionGuard(action, delayMs, "video");
+  }
+
+  if (action === "generate_segment_video") {
+    return buildBatchMediaShortcutSubmissionGuard(action, delayMs, "video");
+  }
+
+  return null;
+}
+
+function buildGuardedWorkflowStartProgressText(params: {
+  action: string;
+  input: Record<string, unknown>;
+  runtime: StudioRuntimeState;
+  userBubble: string;
+  submissionGuard: BatchMediaShortcutSubmissionGuard | null;
+}): string | null {
+  const { action, input, runtime, userBubble, submissionGuard } = params;
+  if (!submissionGuard) return null;
+
+  const startSummary = buildWorkflowMediaStartSummary({
+    action,
+    input,
+    runtime,
+    promptText: userBubble,
+  });
+  return [startSummary, submissionGuard.startMessage].filter(Boolean).join("\n\n");
+}
 
 function shouldReopenVideoWorkflowPopover(
   completion: {
@@ -93,7 +226,7 @@ function buildWorkflowMediaStartSummary(params: {
     action === "generate_video_reference_assets" ||
     action === "generate_storyboard_frames"
   ) {
-    const count = Array.isArray(input.targetIds) && input.targetIds.length ? input.targetIds.length : 1;
+    const { count, targetIds } = resolveWorkflowImageStartTargets({ action, input, runtime });
     const targetLabel =
       action === "generate_storyboard_frames"
         ? "分镜图"
@@ -105,7 +238,7 @@ function buildWorkflowMediaStartSummary(params: {
       promptText: String(input.imagePrompt || input.prompt || promptText || ""),
       imageKind: String(input.imageKind || ""),
       runtime,
-      targetIds: Array.isArray(input.targetIds) ? input.targetIds.map(String) : undefined,
+      targetIds,
     });
     return [
       buildCompactMediaStatusHeading({
@@ -156,6 +289,38 @@ function buildWorkflowMediaStartSummary(params: {
       ]
         .filter(Boolean)
         .join(" · "),
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (action === "generate_segment_video") {
+    const { count, segmentLabels, targetLabels } = resolveWorkflowSegmentVideoStartTargets({
+      input,
+      runtime,
+    });
+    const contentSummary = targetLabels?.slice(0, 3).join(" 路 ");
+    const model =
+      String(input.selectedVideoModelKey || input.videoModelKey || "").trim() ||
+      (typeof input.videoGenerationPrefs === "object" &&
+      input.videoGenerationPrefs &&
+      "modelKey" in input.videoGenerationPrefs
+        ? String(input.videoGenerationPrefs.modelKey || "").trim()
+        : "");
+    return [
+      buildCompactMediaStatusHeading({
+        phase: "start",
+        fallbackLabel: "片段视频",
+        contentSummary,
+      }),
+      [
+        `数量 ${count}`,
+        contentSummary ? `内容 ${contentSummary}` : "",
+        model ? `模型 ${model}` : "",
+        segmentLabels?.length ? `片段 ${segmentLabels.join(" / ")}` : "",
+      ]
+        .filter(Boolean)
+        .join(" 路 "),
     ]
       .filter(Boolean)
       .join("\n");
@@ -260,10 +425,30 @@ function getVideoBridgeResearchAction(mode: VideoBridgeResearchMode): string {
 export function buildVideoBridgeResearchPlan(
   snapshot: ConversationProjectSnapshot | null,
   mode: VideoBridgeResearchMode,
+  project?: VideoBridgeResearchProject | null,
 ): AutoResearchPlan {
+  const resolvedStyleSummary = project
+    ? buildVideoImageStyleSummary({
+        ...(project.artStyle ? buildLegacyVideoImageStylePrefs(project.artStyle) : {}),
+        ...(project.imageGenerationPrefs ?? {}),
+      })
+    : "";
+  const referenceStyleSummary =
+    typeof project?.referenceStyleSummary === "string" && project.referenceStyleSummary.trim()
+      ? project.referenceStyleSummary.trim()
+      : "";
+  const visualContext = [
+    resolvedStyleSummary ? `当前已经确认的画面风格偏好是 ${resolvedStyleSummary}` : null,
+    referenceStyleSummary ? `参考图风格摘要：${referenceStyleSummary}` : null,
+  ]
+    .filter(Boolean)
+    .join("。");
   const projectContext = snapshot
     ? `当前视频项目《${snapshot.title}》，当前阶段是 ${snapshot.derivedStage}，当前目标是 ${snapshot.currentObjective || snapshot.agentSummary}。`
     : "当前正在补齐一个视频项目的前置桥接参数。";
+
+  const effectiveProjectContext = visualContext ? `${projectContext}${visualContext}銆?` : projectContext;
+  void effectiveProjectContext;
 
   const specs: Record<Exclude<VideoBridgeResearchMode, "all">, { id: string; title: string; prompt: string }> = {
     targetPlatform: {
@@ -304,9 +489,33 @@ export function buildVideoBridgeResearchPlan(
   };
 }
 
+function buildVideoBridgeResearchPromptPrefix(
+  project: VideoBridgeResearchProject | null | undefined,
+): string {
+  if (!project) return "";
+
+  const styleSummary = buildVideoImageStyleSummary({
+    ...(project.artStyle ? buildLegacyVideoImageStylePrefs(project.artStyle) : {}),
+    ...(project.imageGenerationPrefs ?? {}),
+  });
+  const referenceStyleSummary =
+    typeof project.referenceStyleSummary === "string" && project.referenceStyleSummary.trim()
+      ? project.referenceStyleSummary.trim()
+      : "";
+
+  const lines = [
+    styleSummary ? `当前已经确认的画面风格偏好：${styleSummary}` : "",
+    referenceStyleSummary ? `参考图风格摘要：${referenceStyleSummary}` : "",
+    "请在补平台、镜头风格与出片目标时显式结合以上视觉线索，不要忽略已经确认的参考图风格。",
+  ].filter(Boolean);
+
+  return lines.length ? `${lines.join("\n")}\n\n` : "";
+}
+
 function dispatchWorkflowMediaEvents(params: {
   imageUrls?: string[];
   videoUrls?: string[];
+  mediaEventId?: string;
   actionLabel?: string;
   imageDetail?: {
     action?: string;
@@ -329,7 +538,7 @@ function dispatchWorkflowMediaEvents(params: {
 }) {
   if (typeof window === "undefined") return;
 
-  const { imageUrls, videoUrls, actionLabel, imageDetail, videoDetail } = params;
+  const { imageUrls, videoUrls, mediaEventId, actionLabel, imageDetail, videoDetail } = params;
   // 有图片任务时始终 dispatch，即使全部失败（imageUrls 为空），让 handleImageGenerated 负责 finalize
   if (imageDetail?.action && (
     imageDetail.action === "generate_project_image" ||
@@ -340,6 +549,7 @@ function dispatchWorkflowMediaEvents(params: {
       new CustomEvent("agent:image-generated", {
         detail: {
           imageUrls,
+          ...(mediaEventId ? { mediaEventId } : {}),
           ...(actionLabel ? { actionLabel } : {}),
           ...(imageDetail ? imageDetail : {}),
         },
@@ -352,6 +562,7 @@ function dispatchWorkflowMediaEvents(params: {
       new CustomEvent("agent:video-generated", {
         detail: {
           videoUrls,
+          ...(mediaEventId ? { mediaEventId } : {}),
           ...(videoDetail ? videoDetail : {}),
         },
       }),
@@ -364,10 +575,11 @@ function dispatchWorkflowMediaStartEvent(params: {
   input: Record<string, unknown>;
   runtime: StudioRuntimeState;
   promptText?: string;
+  mediaEventId?: string;
 }) {
   if (typeof window === "undefined") return;
 
-  const { action, input, runtime, promptText } = params;
+  const { action, input, runtime, promptText, mediaEventId } = params;
   const targetCount = Array.isArray(input.targetIds) ? input.targetIds.length : 0;
 
   if (
@@ -375,17 +587,13 @@ function dispatchWorkflowMediaStartEvent(params: {
     action === "generate_video_reference_assets" ||
     action === "generate_storyboard_frames"
   ) {
-    const fallbackCount =
-      action === "generate_project_image"
-        ? 1
-        : action === "generate_video_reference_assets"
-          ? (runtime.currentVideoProject?.characters.length ?? 0) + (runtime.currentVideoProject?.sceneSettings.length ?? 0)
-          : runtime.currentVideoProject?.scenes.length ?? 1;
+    const { count, targetIds } = resolveWorkflowImageStartTargets({ action, input, runtime });
 
     window.dispatchEvent(
       new CustomEvent("agent:image-generating-start", {
         detail: {
-          count: Math.max(1, targetCount || fallbackCount || 1),
+          count,
+          ...(mediaEventId ? { mediaEventId } : {}),
           action,
           modelFamily: String(input.selectedImageModelFamily || input.modelFamily || ""),
           resolution: typeof input.resolution === "string"
@@ -403,12 +611,12 @@ function dispatchWorkflowMediaStartEvent(params: {
             promptText: String(input.imagePrompt || input.prompt || promptText || ""),
             imageKind: String(input.imageKind || ""),
             runtime,
-            targetIds: Array.isArray(input.targetIds) ? input.targetIds.map(String) : undefined,
+            targetIds,
           }),
           targetLabels: buildWorkflowMediaTargetLabels({
             action,
             runtime,
-            targetIds: Array.isArray(input.targetIds) ? input.targetIds.map(String) : undefined,
+            targetIds,
           }),
         },
       }),
@@ -424,6 +632,7 @@ function dispatchWorkflowMediaStartEvent(params: {
         detail: {
           count,
           sceneCount: count,
+          ...(mediaEventId ? { mediaEventId } : {}),
           action,
           model: typeof input.selectedVideoModelKey === "string"
             ? input.selectedVideoModelKey
@@ -458,12 +667,53 @@ function dispatchWorkflowMediaStartEvent(params: {
   }
 
   if (action === "generate_segment_video") {
+    const { count, segmentLabels, targetLabels } = resolveWorkflowSegmentVideoStartTargets({
+      input,
+      runtime,
+    });
+    const contentSummary = targetLabels?.slice(0, 3).join(" 路 ");
+    window.dispatchEvent(
+      new CustomEvent("agent:video-generating-start", {
+        detail: {
+          count,
+          sceneCount: count,
+          ...(mediaEventId ? { mediaEventId } : {}),
+          action,
+          model: typeof input.selectedVideoModelKey === "string"
+            ? input.selectedVideoModelKey
+            : typeof input.videoGenerationPrefs === "object" &&
+                input.videoGenerationPrefs &&
+                "modelKey" in input.videoGenerationPrefs
+              ? String(input.videoGenerationPrefs.modelKey || "")
+              : "",
+          resolution:
+            typeof input.videoGenerationPrefs === "object" &&
+            input.videoGenerationPrefs &&
+            "resolution" in input.videoGenerationPrefs
+              ? String(input.videoGenerationPrefs.resolution || "")
+              : "",
+          mode:
+            typeof input.videoGenerationPrefs === "object" &&
+            input.videoGenerationPrefs &&
+            "mode" in input.videoGenerationPrefs
+              ? String(input.videoGenerationPrefs.mode || "")
+              : "",
+          contentSummary,
+          targetLabels,
+        },
+      }),
+    );
+    return;
+  }
+
+  if (action === "generate_segment_video") {
     const segmentLabel = typeof input.segmentLabel === "string" ? input.segmentLabel : "";
     window.dispatchEvent(
       new CustomEvent("agent:video-generating-start", {
         detail: {
           count: 1,
           sceneCount: 1,
+          ...(mediaEventId ? { mediaEventId } : {}),
           action,
           model: typeof input.selectedVideoModelKey === "string"
             ? input.selectedVideoModelKey
@@ -526,6 +776,7 @@ export function useHomeAgentWorkflowShortcuts(params: {
   selectedVideoModelKey?: VideoGenerationModelKey;
   videoGenerationPrefs?: VideoGenerationPrefs;
   restoreInterruptedChoiceQuestion?: (question: ComposerQuestion | null) => boolean;
+  batchMediaSubmissionGuardDelayMs?: number;
 }) {
   const fallbackBackgroundResearchGroupsRef = useRef<BackgroundResearchGroup[]>([]);
   const {
@@ -553,6 +804,7 @@ export function useHomeAgentWorkflowShortcuts(params: {
     selectedVideoModelKey = DEFAULT_HOME_AGENT_VIDEO_GENERATION_PREFS.modelKey,
     videoGenerationPrefs = DEFAULT_HOME_AGENT_VIDEO_GENERATION_PREFS,
     restoreInterruptedChoiceQuestion,
+    batchMediaSubmissionGuardDelayMs = DEFAULT_BATCH_MEDIA_SUBMISSION_GUARD_DELAY_MS,
   } = params;
   const workflowShortcutInFlightRef = useRef(false);
   const wasInterruptedRef = useRef(false);
@@ -577,6 +829,7 @@ export function useHomeAgentWorkflowShortcuts(params: {
 
       return {
         ...input,
+        textModel: normalizeHomeAgentTextModelKey(selectedTextModelKey),
         selectedImageModelFamily: normalizedImagePrefs.familyKey,
         modelFamily: normalizedImagePrefs.familyKey,
         imageGenerationPrefs: normalizedImagePrefs,
@@ -627,14 +880,45 @@ export function useHomeAgentWorkflowShortcuts(params: {
     setMode("active");
   }, [setMode]);
 
+  const surfaceWorkflowShortcutStartUi = useCallback(
+    (
+      action: string,
+      userBubble: string,
+      options?: {
+        skipUserBubble?: boolean;
+        skipProgress?: boolean;
+        progressText?: string | null;
+      },
+    ) => {
+      if (!options?.skipUserBubble && userBubble.trim()) {
+        push("user", userBubble);
+      }
+      if (!options?.skipProgress) {
+        const shortcutProgressLabel = options?.progressText ?? getWorkflowShortcutProgressLabel(action);
+        if (shortcutProgressLabel) {
+          dispatchWorkflowShortcutProgressEvent(action, "start", shortcutProgressLabel);
+          return true;
+        }
+      }
+      return false;
+    },
+    [push],
+  );
+
   const commitWorkflowRuntime = useCallback(
     (nextRuntime: StudioRuntimeState, nextProjectId?: string) => {
+      runtimeRef.current = nextRuntime;
       setRuntime(nextRuntime);
-      if (nextProjectId) {
-        setActiveProjectId(nextProjectId);
+      const nextSessionProjectId = resolveSessionProjectIdForSnapshot({
+        currentSessionProjectId: activeProjectIdRef.current,
+        snapshot: nextRuntime.currentProjectSnapshot,
+        fallbackProjectId: nextProjectId,
+      });
+      if (nextSessionProjectId) {
+        setActiveProjectId(nextSessionProjectId);
       }
     },
-    [setActiveProjectId, setRuntime],
+    [runtimeRef, setActiveProjectId, setRuntime],
   );
 
   const getSuggestedQuestion = useCallback(
@@ -696,7 +980,19 @@ export function useHomeAgentWorkflowShortcuts(params: {
   );
 
   const restoreCurrentInterruptQuestion = useCallback(() => {
-    const restoreQuestion = interruptRestoreQuestionRef.current;
+    const storedRestoreQuestion = interruptRestoreQuestionRef.current;
+    let restoreQuestion = storedRestoreQuestion;
+    if (
+      storedRestoreQuestion &&
+      (storedRestoreQuestion.answerKey === "video-analyze-resume" ||
+        storedRestoreQuestion.answerKey === "video-analyze-retry-missing")
+    ) {
+      restoreQuestion =
+        buildVideoAnalyzeInterruptQuestion(
+          runtimeRef.current.currentProjectSnapshot,
+          runtimeRef.current.currentVideoProject,
+        ) ?? storedRestoreQuestion;
+    }
     if (!restoreQuestion) return false;
     if (restoreInterruptedChoiceQuestion) {
       return restoreInterruptedChoiceQuestion(restoreQuestion);
@@ -709,6 +1005,7 @@ export function useHomeAgentWorkflowShortcuts(params: {
   }, [
     resetComposerDraft,
     restoreInterruptedChoiceQuestion,
+    runtimeRef,
     setMode,
     setPopoverOverride,
     setSuggested,
@@ -758,12 +1055,16 @@ export function useHomeAgentWorkflowShortcuts(params: {
       try {
         const snapshot = runtimeRef.current.currentProjectSnapshot;
         const planOverride = buildVideoBridgeResearchPlan(snapshot, mode);
+        const taskPromptPrefix = buildVideoBridgeResearchPromptPrefix(
+          runtimeRef.current.currentVideoProject,
+        );
         const launched = await launchHomeAgentAutoResearchTasks({
           prompt: planOverride.kickoff,
           runtime: runtimeRef.current,
           loadApiConfigModule,
           selectedTextModelKey,
           planOverride,
+          taskPromptPrefix,
         });
 
         if (!launched?.taskIds.length) {
@@ -822,6 +1123,8 @@ export function useHomeAgentWorkflowShortcuts(params: {
       runtimeRef,
       selectedTextModelKey,
       setActiveWorkflowAction,
+      setPopoverOverride,
+      setSuggested,
       setStreaming,
     ],
   );
@@ -834,6 +1137,10 @@ export function useHomeAgentWorkflowShortcuts(params: {
       options?: {
         restoreQuestionOnInterrupt?: ComposerQuestion | null;
         restoreQuestionOnCancel?: ComposerQuestion | null;
+        restoreQuestionOnError?: ComposerQuestion | null;
+        restoreQuestionAfterRun?: ComposerQuestion | null;
+        skipUserBubble?: boolean;
+        skipAssistantSummary?: boolean;
       },
     ) => {
       if (workflowShortcutInFlightRef.current) {
@@ -844,25 +1151,63 @@ export function useHomeAgentWorkflowShortcuts(params: {
       wasInterruptedRef.current = false;
       interruptRestoreQuestionRef.current = options?.restoreQuestionOnInterrupt ?? null;
       const restoreQuestionOnCancel = options?.restoreQuestionOnCancel ?? null;
+      const restoreQuestionOnError = options?.restoreQuestionOnError ?? null;
+      const restoreQuestionAfterRun = options?.restoreQuestionAfterRun ?? null;
       const abortController = new AbortController();
       activeAbortControllerRef.current = abortController;
       const originProjectId = runtimeRef.current.currentProjectSnapshot?.projectId ?? activeProjectIdRef.current;
+      const deferRecentProjectUpsert = !originProjectId;
+      const forceSilent = shouldForceSilentWorkflowShortcut(action);
+      const skipUserBubble = forceSilent || Boolean(options?.skipUserBubble);
+      const skipAssistantSummary = forceSilent || Boolean(options?.skipAssistantSummary);
+      const skipSilentLlmContinuation = skipUserBubble && skipAssistantSummary;
+      const submissionGuard = resolveBatchMediaShortcutSubmissionGuard({
+        action,
+        input,
+        runtime: runtimeRef.current,
+        delayMs: batchMediaSubmissionGuardDelayMs,
+      });
+      const guardedStartProgressText = buildGuardedWorkflowStartProgressText({
+        action,
+        input,
+        runtime: runtimeRef.current,
+        userBubble,
+        submissionGuard,
+      });
       clearChoiceUi();
       activateConversation();
       setActiveWorkflowAction(action);
       setStreaming(true);
+      const surfacedShortcutProgress = surfaceWorkflowShortcutStartUi(action, userBubble, {
+        skipUserBubble,
+        skipProgress: forceSilent,
+        progressText: guardedStartProgressText,
+      });
       void (async () => {
         const generatedImageUrls: string[] = [];
         const generatedImageLabels: string[] = [];
         const generatedVideoUrls: string[] = [];
+        let shortcutProgressDelegated = false;
         try {
           const contentSummary = buildMediaContentSummary({
             action,
             promptText: userBubble,
             imageKind: String(input.imageKind || ""),
             runtime: runtimeRef.current,
-            targetIds: Array.isArray(input.targetIds) ? input.targetIds.map(String) : undefined,
+            targetIds:
+              action === "generate_segment_video"
+                ? resolveWorkflowSegmentVideoStartTargets({
+                    input,
+                    runtime: runtimeRef.current,
+                  }).segmentLabels
+                : Array.isArray(input.targetIds)
+                  ? input.targetIds.map(String)
+                  : undefined,
           });
+          const batchMediaEventId =
+            typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+              ? crypto.randomUUID()
+              : `workflow-media-${Date.now()}-${Math.random().toString(36).slice(2)}`;
           const workflow = await loadWorkflowActionsModule();
           const runActionAndCapture = async (
             nextAction: string,
@@ -870,15 +1215,20 @@ export function useHomeAgentWorkflowShortcuts(params: {
             nextRuntime: StudioRuntimeState,
             nextOnProgress?: import("@/lib/home-agent/types").WorkflowActionProgressCallback,
           ) => {
+            const preparedInput = {
+              ...decorateWorkflowInput(nextInput, abortController.signal),
+              mediaEventId: batchMediaEventId,
+            };
             dispatchWorkflowMediaStartEvent({
               action: nextAction,
-              input: nextInput,
+              input: preparedInput,
               runtime: nextRuntime,
               promptText: userBubble,
+              mediaEventId: batchMediaEventId,
             });
             const result = (await workflow.runWorkflowAction(
               nextAction,
-              nextInput,
+              preparedInput,
               nextRuntime,
               nextOnProgress,
             )) as WorkflowActionResult;
@@ -898,6 +1248,15 @@ export function useHomeAgentWorkflowShortcuts(params: {
             clearChoiceUi,
             commitRuntime: commitWorkflowRuntime,
             getSuggestedQuestion,
+            getAssistantMessageExtras: () => ({
+              workflowRefresh: {
+                mode: "shortcut",
+                action,
+                input: { ...input },
+                userBubble,
+                projectId: originProjectId ?? null,
+              },
+            }),
             push,
             resetComposerDraft,
             setPopoverQuestion: setWorkflowPopoverQuestion,
@@ -905,22 +1264,31 @@ export function useHomeAgentWorkflowShortcuts(params: {
             setSuggested,
           }), originProjectId);
 
+          shortcutProgressDelegated = surfacedShortcutProgress;
           let finalCompletion = await runWorkflowShortcut({
             action,
             input: decorateWorkflowInput(input, abortController.signal),
             runtime: runtimeRef.current,
+            deferRecentProjectUpsert,
             runAction: runActionAndCapture,
             ui,
-            userBubble,
+            userBubble: "",
             allowAutoFollowup: creationMode === "fast",
             surfaceNextSuggestion: true,
+            skipAssistantSummary,
+            skipInitialProgressEvent: surfacedShortcutProgress,
             onErrorMessage: (_message, error) => {
               if (isTimeoutLikeError(error)) {
                 restoreCurrentInterruptQuestion();
               }
             },
           });
-          if (finalCompletion && isWorkflowOriginActive(originProjectId)) {
+          if (
+            finalCompletion &&
+            isWorkflowOriginActive(originProjectId) &&
+            !wasInterruptedRef.current &&
+            !abortController.signal.aborted
+          ) {
             if (
               action === "export_video_asset_bundle" &&
               restoreQuestionOnCancel &&
@@ -940,6 +1308,7 @@ export function useHomeAgentWorkflowShortcuts(params: {
                 action: finalCompletion.pendingFollowup.action,
                 input: decorateWorkflowInput(finalCompletion.pendingFollowup.input, abortController.signal),
                 runtime: finalCompletion.runtime,
+                deferRecentProjectUpsert,
                 runAction: runActionAndCapture,
                 ui,
                 userBubble: "",
@@ -951,14 +1320,24 @@ export function useHomeAgentWorkflowShortcuts(params: {
                   }
                 },
               });
-            } else if (!finalCompletion.nextSuggestion) {
+            } else if (!finalCompletion.nextSuggestion && !skipSilentLlmContinuation) {
               await continueWorkflowInLlmMode(finalCompletion);
             }
+          } else if (
+            isWorkflowOriginActive(originProjectId) &&
+            !wasInterruptedRef.current &&
+            !abortController.signal.aborted &&
+            restoreQuestionOnError
+          ) {
+            setMode("active");
+            setPopoverOverride(restoreQuestionOnError);
+            setSuggested(null);
           }
           if (isWorkflowOriginActive(originProjectId)) {
             dispatchWorkflowMediaEvents({
               imageUrls: generatedImageUrls,
               videoUrls: generatedVideoUrls,
+              mediaEventId: batchMediaEventId,
               actionLabel: userBubble.trim() || action,
               imageDetail: {
                 action,
@@ -975,20 +1354,34 @@ export function useHomeAgentWorkflowShortcuts(params: {
                 model: selectedVideoModelKey,
                 resolution: videoGenerationPrefs.resolution,
                 mode: videoGenerationPrefs.mode,
+                aspectRatio: videoGenerationPrefs.aspectRatio || imageGenerationPrefs.aspectRatio,
                 provider: "",
                 contentSummary,
               },
             });
           }
           if (
+            finalCompletion &&
             isWorkflowOriginActive(originProjectId) &&
-            shouldReopenVideoWorkflowPopover(finalCompletion) &&
-            !hasRunningVideoGenerationTasks(finalCompletion?.runtime?.currentVideoProject ?? runtimeRef.current.currentVideoProject)
+            !wasInterruptedRef.current &&
+            !abortController.signal.aborted
           ) {
-            setPopoverOverride(finalCompletion.nextSuggestion);
-            setSuggested(null);
+            if (restoreQuestionAfterRun) {
+              setMode("active");
+              setPopoverOverride(restoreQuestionAfterRun);
+              setSuggested(null);
+            } else if (
+              shouldReopenVideoWorkflowPopover(finalCompletion) &&
+              !hasRunningVideoGenerationTasks(finalCompletion?.runtime?.currentVideoProject ?? runtimeRef.current.currentVideoProject)
+            ) {
+              setWorkflowPopoverQuestion(finalCompletion.nextSuggestion, finalCompletion.projectSnapshot);
+              setSuggested(null);
+            }
           }
         } finally {
+          if (surfacedShortcutProgress && !shortcutProgressDelegated) {
+            dispatchWorkflowShortcutProgressEvent(action, "complete", "");
+          }
           const ownsActiveExecution = activeAbortControllerRef.current === abortController;
           if (ownsActiveExecution) {
             activeAbortControllerRef.current = null;
@@ -1030,10 +1423,12 @@ export function useHomeAgentWorkflowShortcuts(params: {
       videoGenerationPrefs,
       restoreInterruptedChoiceQuestion,
       restoreCurrentInterruptQuestion,
+      surfaceWorkflowShortcutStartUi,
       scopeWorkflowUiToOriginProject,
       isWorkflowOriginActive,
       setMode,
       setWorkflowPopoverQuestion,
+      batchMediaSubmissionGuardDelayMs,
     ],
   );
 
@@ -1043,6 +1438,10 @@ export function useHomeAgentWorkflowShortcuts(params: {
       userBubble: string,
       options?: {
         restoreQuestionOnInterrupt?: ComposerQuestion | null;
+        restoreQuestionOnCancel?: ComposerQuestion | null;
+        restoreQuestionOnError?: ComposerQuestion | null;
+        restoreQuestionAfterRun?: ComposerQuestion | null;
+        skipUserBubble?: boolean;
       },
     ) => {
       if (workflowShortcutInFlightRef.current) {
@@ -1052,28 +1451,77 @@ export function useHomeAgentWorkflowShortcuts(params: {
       workflowShortcutInFlightRef.current = true;
       wasInterruptedRef.current = false;
       interruptRestoreQuestionRef.current = options?.restoreQuestionOnInterrupt ?? null;
+      const restoreQuestionOnError = options?.restoreQuestionOnError ?? null;
+      const restoreQuestionAfterRun = options?.restoreQuestionAfterRun ?? null;
       const abortController = new AbortController();
       activeAbortControllerRef.current = abortController;
       const originProjectId = runtimeRef.current.currentProjectSnapshot?.projectId ?? activeProjectIdRef.current;
+      const deferRecentProjectUpsert = !originProjectId;
+      const finalAction = steps.at(-1)?.action ?? "workflow";
+      const submissionGuard = resolveBatchMediaShortcutSubmissionGuard({
+        action: finalAction,
+        input: steps.at(-1)?.input ?? {},
+        runtime: runtimeRef.current,
+        delayMs: batchMediaSubmissionGuardDelayMs,
+        stepCount: steps.length,
+      });
+      const chainedSegmentLabels =
+        finalAction === "generate_segment_video"
+          ? steps
+              .filter((step) => step.action === "generate_segment_video")
+              .map((step) =>
+                typeof step.input.segmentLabel === "string" ? step.input.segmentLabel.trim() : "",
+              )
+              .filter(Boolean)
+          : [];
+      const chainedStartInput =
+        finalAction === "generate_segment_video" && chainedSegmentLabels.length > 1
+          ? {
+              ...(steps.at(-1)?.input ?? {}),
+              targetSegmentLabels: chainedSegmentLabels,
+            }
+          : (steps.at(-1)?.input ?? {});
+      const guardedStartProgressText = buildGuardedWorkflowStartProgressText({
+        action: finalAction,
+        input: chainedStartInput,
+        runtime: runtimeRef.current,
+        userBubble,
+        submissionGuard,
+      });
       clearChoiceUi();
       activateConversation();
       setActiveWorkflowAction(steps.at(-1)?.action ?? null);
       setStreaming(true);
+      const surfacedShortcutProgress = surfaceWorkflowShortcutStartUi(finalAction, userBubble, {
+        skipUserBubble: Boolean(options?.skipUserBubble),
+        skipProgress: false,
+        progressText: guardedStartProgressText,
+      });
       void (async () => {
         const generatedImageUrls: string[] = [];
         const generatedImageLabels: string[] = [];
         const generatedVideoUrls: string[] = [];
+        let shortcutProgressDelegated = false;
         try {
-          const finalAction = steps.at(-1)?.action || "workflow";
           const contentSummary = buildMediaContentSummary({
             action: finalAction,
             promptText: userBubble,
             imageKind: String(steps.at(-1)?.input?.imageKind || ""),
             runtime: runtimeRef.current,
-            targetIds: Array.isArray(steps.at(-1)?.input?.targetIds)
-              ? (steps.at(-1)?.input?.targetIds as unknown[]).map(String)
-              : undefined,
+            targetIds:
+              finalAction === "generate_segment_video"
+                ? resolveWorkflowSegmentVideoStartTargets({
+                    input: steps.at(-1)?.input ?? {},
+                    runtime: runtimeRef.current,
+                  }).segmentLabels
+                : Array.isArray(steps.at(-1)?.input?.targetIds)
+                  ? (steps.at(-1)?.input?.targetIds as unknown[]).map(String)
+                  : undefined,
           });
+          const batchMediaEventId =
+            typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+              ? crypto.randomUUID()
+              : `workflow-media-${Date.now()}-${Math.random().toString(36).slice(2)}`;
           const workflow = await loadWorkflowActionsModule();
           const runActionAndCapture = async (
             nextAction: string,
@@ -1081,15 +1529,20 @@ export function useHomeAgentWorkflowShortcuts(params: {
             nextRuntime: StudioRuntimeState,
             nextOnProgress?: import("@/lib/home-agent/types").WorkflowActionProgressCallback,
           ) => {
+            const preparedInput = {
+              ...decorateWorkflowInput(nextInput, abortController.signal),
+              mediaEventId: batchMediaEventId,
+            };
             dispatchWorkflowMediaStartEvent({
               action: nextAction,
-              input: nextInput,
+              input: preparedInput,
               runtime: nextRuntime,
               promptText: userBubble,
+              mediaEventId: batchMediaEventId,
             });
             const result = (await workflow.runWorkflowAction(
               nextAction,
-              nextInput,
+              preparedInput,
               nextRuntime,
               nextOnProgress,
             )) as WorkflowActionResult;
@@ -1109,6 +1562,14 @@ export function useHomeAgentWorkflowShortcuts(params: {
             clearChoiceUi,
             commitRuntime: commitWorkflowRuntime,
             getSuggestedQuestion,
+            getAssistantMessageExtras: () => ({
+              workflowRefresh: {
+                mode: "chain",
+                steps: steps.map((step) => ({ action: step.action, input: { ...step.input } })),
+                userBubble,
+                projectId: originProjectId ?? null,
+              },
+            }),
             push,
             resetComposerDraft,
             setPopoverQuestion: setWorkflowPopoverQuestion,
@@ -1116,15 +1577,18 @@ export function useHomeAgentWorkflowShortcuts(params: {
             setSuggested,
           }), originProjectId);
 
+          shortcutProgressDelegated = surfacedShortcutProgress;
           let finalCompletion = await runWorkflowShortcutChain({
             runtime: runtimeRef.current,
+            deferRecentProjectUpsert,
             runAction: runActionAndCapture,
+            skipInitialProgressEvent: surfacedShortcutProgress,
             steps: steps.map((step) => ({
               ...step,
               input: decorateWorkflowInput(step.input, abortController.signal),
             })),
             ui,
-            userBubble,
+            userBubble: options?.skipUserBubble ? "" : userBubble,
             allowAutoFollowup: creationMode === "fast",
             surfaceNextSuggestion: true,
             onErrorMessage: (_message, error) => {
@@ -1133,12 +1597,18 @@ export function useHomeAgentWorkflowShortcuts(params: {
               }
             },
           });
-          if (finalCompletion && isWorkflowOriginActive(originProjectId)) {
+          if (
+            finalCompletion &&
+            isWorkflowOriginActive(originProjectId) &&
+            !wasInterruptedRef.current &&
+            !abortController.signal.aborted
+          ) {
             if (finalCompletion.pendingFollowup) {
               finalCompletion = await runWorkflowShortcut({
                 action: finalCompletion.pendingFollowup.action,
                 input: decorateWorkflowInput(finalCompletion.pendingFollowup.input, abortController.signal),
                 runtime: finalCompletion.runtime,
+                deferRecentProjectUpsert,
                 runAction: runActionAndCapture,
                 ui,
                 userBubble: "",
@@ -1153,11 +1623,21 @@ export function useHomeAgentWorkflowShortcuts(params: {
             } else if (!finalCompletion.nextSuggestion) {
               await continueWorkflowInLlmMode(finalCompletion);
             }
+          } else if (
+            isWorkflowOriginActive(originProjectId) &&
+            !wasInterruptedRef.current &&
+            !abortController.signal.aborted &&
+            restoreQuestionOnError
+          ) {
+            setMode("active");
+            setPopoverOverride(restoreQuestionOnError);
+            setSuggested(null);
           }
           if (isWorkflowOriginActive(originProjectId)) {
             dispatchWorkflowMediaEvents({
               imageUrls: generatedImageUrls,
               videoUrls: generatedVideoUrls,
+              mediaEventId: batchMediaEventId,
               actionLabel: userBubble.trim() || steps.at(-1)?.action || "workflow",
               imageDetail: {
                 action: steps.at(-1)?.action || "workflow",
@@ -1174,20 +1654,34 @@ export function useHomeAgentWorkflowShortcuts(params: {
                 model: selectedVideoModelKey,
                 resolution: videoGenerationPrefs.resolution,
                 mode: videoGenerationPrefs.mode,
+                aspectRatio: videoGenerationPrefs.aspectRatio || imageGenerationPrefs.aspectRatio,
                 provider: "",
                 contentSummary,
               },
             });
           }
           if (
+            finalCompletion &&
             isWorkflowOriginActive(originProjectId) &&
-            shouldReopenVideoWorkflowPopover(finalCompletion) &&
-            !hasRunningVideoGenerationTasks(finalCompletion?.runtime?.currentVideoProject ?? runtimeRef.current.currentVideoProject)
+            !wasInterruptedRef.current &&
+            !abortController.signal.aborted
           ) {
-            setPopoverOverride(finalCompletion.nextSuggestion);
-            setSuggested(null);
+            if (restoreQuestionAfterRun) {
+              setMode("active");
+              setPopoverOverride(restoreQuestionAfterRun);
+              setSuggested(null);
+            } else if (
+              shouldReopenVideoWorkflowPopover(finalCompletion) &&
+              !hasRunningVideoGenerationTasks(finalCompletion?.runtime?.currentVideoProject ?? runtimeRef.current.currentVideoProject)
+            ) {
+              setWorkflowPopoverQuestion(finalCompletion.nextSuggestion, finalCompletion.projectSnapshot);
+              setSuggested(null);
+            }
           }
         } finally {
+          if (surfacedShortcutProgress && !shortcutProgressDelegated) {
+            dispatchWorkflowShortcutProgressEvent(finalAction, "complete", "");
+          }
           const ownsActiveExecution = activeAbortControllerRef.current === abortController;
           if (ownsActiveExecution) {
             activeAbortControllerRef.current = null;
@@ -1227,9 +1721,12 @@ export function useHomeAgentWorkflowShortcuts(params: {
       selectedVideoModelKey,
       videoGenerationPrefs,
       restoreCurrentInterruptQuestion,
+      surfaceWorkflowShortcutStartUi,
       scopeWorkflowUiToOriginProject,
       isWorkflowOriginActive,
+      setMode,
       setWorkflowPopoverQuestion,
+      batchMediaSubmissionGuardDelayMs,
     ],
   );
 
@@ -1269,8 +1766,8 @@ export function useHomeAgentWorkflowShortcuts(params: {
     backgroundResearchGroupsRef.current.forEach((group) => {
       group.status = "cancelled";
     });
-    abortOutlineGeneration();
-    abortVideoWorkflowGeneration();
+    abortOutlineGenerationLazy();
+    abortVideoWorkflowGenerationLazy();
     dispatchWorkflowMediaCancelledEvent();
     setActiveWorkflowAction(null);
     setStreaming(false);

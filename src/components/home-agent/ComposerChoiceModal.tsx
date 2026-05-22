@@ -2,7 +2,7 @@
 import { ComposerChoicePanel, DevOptionsPanel } from "./composer-choice-panel";
 import type { ComposerQuestion } from "@/lib/home-agent/types";
 import { cn } from "@/lib/utils";
-import type { VideoGenerationMode, VideoImageGenerationPrefs } from "@/types/project";
+import type { VideoGenerationMode } from "@/types/project";
 
 export interface ComposerWorkflowProgress {
   title: string;
@@ -26,16 +26,14 @@ interface ComposerChoiceModalProps {
   onSelect: (value: string, label: string) => void;
   onConfirm?: () => void;
   onBack?: () => void;
+  onReset?: () => void;
   onDismiss?: () => void;
   canConfirm?: boolean;
   tone?: "light" | "dark";
   devMode?: boolean;
+  showVideoModeBadge?: boolean;
   devVideoGenerationMode?: VideoGenerationMode;
-  devImageViewMode?: VideoImageGenerationPrefs["viewMode"];
   onDevVideoGenerationModeChange?: (mode: VideoGenerationMode) => void;
-  onDevImageViewModeChange?: (
-    mode: NonNullable<VideoImageGenerationPrefs["viewMode"]>,
-  ) => void;
 }
 
 /**
@@ -49,14 +47,14 @@ export default function ComposerChoiceModal({
   onSelect,
   onConfirm,
   onBack,
+  onReset,
   onDismiss,
   canConfirm = false,
   tone = "dark",
   devMode = false,
+  showVideoModeBadge,
   devVideoGenerationMode,
-  devImageViewMode,
   onDevVideoGenerationModeChange,
-  onDevImageViewModeChange,
 }: ComposerChoiceModalProps) {
   const titleId = useId();
   const descriptionId = useId();
@@ -70,9 +68,7 @@ export default function ComposerChoiceModal({
             devOptions={[]}
             onSelect={onSelect}
             devVideoGenerationMode={devVideoGenerationMode}
-            devImageViewMode={devImageViewMode}
             onDevVideoGenerationModeChange={onDevVideoGenerationModeChange}
-            onDevImageViewModeChange={onDevImageViewModeChange}
           />
         </div>
       </div>
@@ -87,6 +83,9 @@ export default function ComposerChoiceModal({
       aria-modal="false"
       aria-labelledby={titleId}
       aria-describedby={descriptionId}
+      data-composer-choice-modal="true"
+      data-composer-question-answer-key={question.answerKey}
+      data-composer-question-id={question.id}
       className={cn(
         "pointer-events-auto absolute bottom-[calc(100%+6px)] left-0 z-[60] w-[min(96vw,540px)] overflow-visible border-0 bg-transparent p-0 shadow-none outline-none",
       )}
@@ -103,14 +102,14 @@ export default function ComposerChoiceModal({
           onSelect={onSelect}
           onConfirm={onConfirm}
           onBack={onBack}
+          onReset={onReset}
           onDismiss={onDismiss}
           canConfirm={canConfirm}
           tone={tone}
           devMode={devMode}
+          showVideoModeBadge={showVideoModeBadge}
           devVideoGenerationMode={devVideoGenerationMode}
-          devImageViewMode={devImageViewMode}
           onDevVideoGenerationModeChange={onDevVideoGenerationModeChange}
-          onDevImageViewModeChange={onDevImageViewModeChange}
         />
       </div>
     </div>

@@ -7,11 +7,13 @@ import type {
   StudioSessionState,
 } from "@/lib/home-agent/types";
 import type { PersistedVideoProject } from "@/hooks/use-local-persistence";
+import { resolvePendingWorkflowUploadKind } from "./home-agent-session-utils";
 
 export function buildResetRuntimeState(previous: StudioRuntimeState): StudioRuntimeState {
   return {
     ...previous,
     sessionId: crypto.randomUUID(),
+    suppressHistoricalMemory: true,
     currentProjectSnapshot: null,
     currentDramaProject: null,
     currentVideoProject: null,
@@ -32,6 +34,12 @@ function isStaleReviewQuestion(q: ComposerQuestion | null | undefined): boolean 
   );
 }
 
+export function hasStaleSavedReviewQuestion(
+  session: Pick<StudioSessionState, "pendingChoiceQuestion" | "interruptedChoiceQuestion"> | null | undefined,
+): boolean {
+  return isStaleReviewQuestion(session?.pendingChoiceQuestion ?? session?.interruptedChoiceQuestion ?? null);
+}
+
 export function buildOpenProjectSessionState(params: {
   savedSession: StudioSessionState | null;
   snapshot: ConversationProjectSnapshot;
@@ -44,16 +52,34 @@ export function buildOpenProjectSessionState(params: {
   ) => ComposerQuestion | null;
 }) {
   const { savedSession, snapshot, videoProject, buildBrief, createAssistantMessage, getSuggestedQuestion } = params;
+  const recoveredWorkflowQuestion = getSuggestedQuestion(snapshot, videoProject);
+  const shouldPromoteRecoveredWorkflowQuestion =
+    snapshot.projectKind === "video" &&
+    recoveredWorkflowQuestion?.presentation === "card";
 
   if (savedSession) {
+    const pendingWorkflowUploadKind = resolvePendingWorkflowUploadKind(savedSession);
+    const savedChoiceQuestion =
+      savedSession.pendingChoiceQuestion ?? savedSession.interruptedChoiceQuestion ?? null;
+    const shouldRebuildWorkflowQuestion =
+      !pendingWorkflowUploadKind && isStaleReviewQuestion(savedChoiceQuestion);
+    const restoredChoiceQuestion =
+      pendingWorkflowUploadKind || shouldRebuildWorkflowQuestion ? null : savedChoiceQuestion;
     return {
       creationMode: "fast" as const,
       automationMode: savedSession.automationMode ?? snapshot.automationMode ?? "manual",
       devMode: savedSession.devMode ?? false,
       qState: savedSession.qState ?? null,
       deferredQuestionState: savedSession.deferredQuestionState ?? null,
-      popoverOverride: isStaleReviewQuestion(savedSession.pendingChoiceQuestion) ? null : (savedSession.pendingChoiceQuestion ?? null),
-      suggested: null,
+      pendingWorkflowUploadKind,
+      popoverOverride:
+        restoredChoiceQuestion ?? (shouldRebuildWorkflowQuestion && shouldPromoteRecoveredWorkflowQuestion
+          ? recoveredWorkflowQuestion
+          : null),
+      suggested:
+        restoredChoiceQuestion || !shouldRebuildWorkflowQuestion || shouldPromoteRecoveredWorkflowQuestion
+          ? null
+          : recoveredWorkflowQuestion,
       selectedValues: savedSession.selectedValues ?? [],
       deferredSelectedValues: savedSession.deferredSelectedValues ?? [],
       selectedTextModelKey: savedSession.selectedTextModelKey,
@@ -74,6 +100,7 @@ export function buildOpenProjectSessionState(params: {
       surfacedTaskIds: savedSession.surfacedTaskIds ?? [],
       surfacedTaskFollowupKeys: savedSession.surfacedTaskFollowupKeys ?? [],
       surfacedProjectSuggestionKeys: savedSession.surfacedProjectSuggestionKeys ?? [],
+      fullAutoChecklistCollapsed: savedSession.fullAutoChecklistCollapsed ?? true,
       previousQuestionStep: savedSession.qState
         ? `${savedSession.qState.request.id}:${savedSession.qState.currentIndex}`
         : null,
@@ -88,8 +115,9 @@ export function buildOpenProjectSessionState(params: {
     devMode: false,
     qState: null,
     deferredQuestionState: null,
-    popoverOverride: null,
-    suggested: getSuggestedQuestion(snapshot, videoProject),
+    pendingWorkflowUploadKind: null,
+    popoverOverride: shouldPromoteRecoveredWorkflowQuestion ? recoveredWorkflowQuestion : null,
+    suggested: shouldPromoteRecoveredWorkflowQuestion ? null : recoveredWorkflowQuestion,
     selectedValues: [],
     deferredSelectedValues: [],
     selectedTextModelKey: undefined,
@@ -105,6 +133,7 @@ export function buildOpenProjectSessionState(params: {
     surfacedTaskIds: [],
     surfacedTaskFollowupKeys: [],
     surfacedProjectSuggestionKeys: [],
+    fullAutoChecklistCollapsed: true,
     previousQuestionStep: null,
     sessionId: crypto.randomUUID(),
     fullAutoRun: null,

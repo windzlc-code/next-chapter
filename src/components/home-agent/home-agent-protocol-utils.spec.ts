@@ -28,4 +28,15 @@ describe("home-agent protocol text sanitization", () => {
 
     expect(textOf(content)).toBe("可见结论");
   });
+
+  it("removes unterminated tool-call payloads before they leak parameter text", () => {
+    expect(
+      stripHiddenThoughtBlocks([
+        "好的，继续处理。",
+        "<function_calls>",
+        "<invoke name=\"HomeStudioWorkflow\">",
+        "<parameter name=\"imagePrompt\">A 25-year-old female office worker, gentle and kind personality, professional business att",
+      ].join("\n")),
+    ).toBe("好的，继续处理。");
+  });
 });

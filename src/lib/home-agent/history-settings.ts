@@ -8,7 +8,7 @@ export interface HistorySettings {
 }
 
 const DEFAULT_HISTORY_SETTINGS: HistorySettings = {
-  maxCount: 50,
+  maxCount: 160,
   autoDelete: true,
 };
 
@@ -19,7 +19,7 @@ export function getHistorySettings(): HistorySettings {
     const parsed = JSON.parse(saved) as Partial<HistorySettings>;
     return {
       maxCount:
-        typeof parsed.maxCount === "number" && parsed.maxCount >= 5 && parsed.maxCount <= 200
+        typeof parsed.maxCount === "number" && parsed.maxCount >= 5 && parsed.maxCount <= 400
           ? parsed.maxCount
           : DEFAULT_HISTORY_SETTINGS.maxCount,
       autoDelete:

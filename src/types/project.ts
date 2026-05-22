@@ -24,11 +24,23 @@ export interface Scene {
   enhancedVideoPrompt?: string; // cached result from prepare_video_prompt_batch
 }
 
+export type SegmentVideoFailureRoute =
+  | "pass"
+  | "local_repair"
+  | "regenerate"
+  | "escalate";
+
 export interface VideoFailureInfo {
   message: string;
   provider?: string;
   stage?: "submit" | "status" | string;
   updatedAt: string;
+  route?: SegmentVideoFailureRoute;
+  auditId?: string;
+  auditSummary?: string;
+  historyEntryId?: string;
+  historySegmentLabel?: string;
+  previewVideoUrl?: string;
 }
 
 export interface VideoHistoryEntry {
@@ -102,6 +114,7 @@ export type ProductionAssetKind =
   | "scene-reference"
   | "time-variant"
   | "storyboard-frame"
+  | "segment-continuity-grid"
   | "video-segment";
 
 export type ProductionAssetStatus = "ready" | "needs-review" | "failed";
@@ -120,6 +133,13 @@ export interface ProductionAssetRecord {
   sceneId?: string;
   sceneNumber?: number;
   version?: number;
+  variantLabel?: string;
+  view?: string;
+  emotion?: string;
+  stateTag?: string;
+  continuityRole?: "primary" | "opening-anchor" | "ending-anchor" | "continuity-frame" | "relay" | "supporting";
+  qualityScore?: number;
+  sourceRefs?: string[];
   createdAt?: string;
   updatedAt?: string;
 }
@@ -155,6 +175,64 @@ export interface VideoWorldModelCharacter {
   referenceAssetIds: string[];
 }
 
+export interface VideoWorldModelRelationship {
+  id: string;
+  sourceCharacterId: string;
+  targetCharacterId: string;
+  label: string;
+  strength: number;
+  derivedFromSceneIds: string[];
+}
+
+export interface VideoWorldModelProp {
+  id: string;
+  label: string;
+  status: string;
+  holderCharacterId?: string;
+  sceneIds: string[];
+  referenceAssetIds: string[];
+}
+
+export interface VideoWorldModelCharacterState {
+  characterId: string;
+  name: string;
+  costumeId?: string;
+  costumeLabel?: string;
+  position: string;
+  emotion: string;
+  knowledgeState: string;
+  injuryState: string;
+  abilityState: string;
+}
+
+export interface VideoWorldModelPropState {
+  propId: string;
+  label: string;
+  status: string;
+  holderCharacterId?: string;
+}
+
+export interface VideoWorldModelStateSnapshot {
+  id: string;
+  sceneId: string;
+  sceneNumber: number;
+  segmentLabel?: string;
+  location: string;
+  timeOfDay: string;
+  openingHook: string;
+  closingHook: string;
+  keyAction: string;
+  characterStates: VideoWorldModelCharacterState[];
+  propStates: VideoWorldModelPropState[];
+}
+
+export interface VideoWorldNarrativeConstraint {
+  id: string;
+  type: "knowledge" | "prop" | "costume" | "injury" | "ability" | "location" | "continuity";
+  statement: string;
+  appliesToSceneIds: string[];
+}
+
 export interface VideoWorldModelScene {
   id: string;
   name: string;
@@ -169,6 +247,11 @@ export interface VideoWorldModel {
   continuityRules: string[];
   characters: VideoWorldModelCharacter[];
   scenes: VideoWorldModelScene[];
+  relationships?: VideoWorldModelRelationship[];
+  props?: VideoWorldModelProp[];
+  stateTimeline?: VideoWorldModelStateSnapshot[];
+  narrativeConstraints?: VideoWorldNarrativeConstraint[];
+  continuityInvariants?: string[];
 }
 
 export interface ShotPacketCharacterRef {
@@ -183,6 +266,32 @@ export interface ShotPacketBackgroundRef {
   name: string;
   assetIds: string[];
   timeVariant?: string;
+}
+
+export interface VideoShotReferencePlan {
+  summary: string;
+  orderedAssetIds: string[];
+  orderedKinds: string[];
+  continuityFrameFirst: boolean;
+  relayVideoPreferred: boolean;
+}
+
+export interface VideoShotGenerationPolicy {
+  preferredMode: "img2video" | "text2video";
+  preferSegmentChain: boolean;
+  preferContinuityFrameAsFirstFrame: boolean;
+  localRepairBudget: number;
+  regenerateBudget: number;
+  totalPassBudget: number;
+}
+
+export interface VideoShotQaSpec {
+  requiresSymbolicPass: boolean;
+  minTotalScore: number;
+  minContinuityScore: number;
+  minIdentityScore: number;
+  minSemanticScore: number;
+  minVisualScore: number;
 }
 
 export interface VideoShotPacket {
@@ -201,6 +310,16 @@ export interface VideoShotPacket {
   promptSeed: string;
   forbiddenChanges: string[];
   renderMode: "img2video" | "text2video";
+  startState?: string;
+  endState?: string;
+  previousAnchor?: string;
+  nextAnchor?: string;
+  requiredEntities?: string[];
+  requiredProps?: string[];
+  referencePlan?: VideoShotReferencePlan;
+  generationPolicy?: VideoShotGenerationPolicy;
+  qaSpec?: VideoShotQaSpec;
+  derivedConstraints?: string[];
   reviewStatus?: string;
 }
 
@@ -224,6 +343,10 @@ export type VideoImageAspectRatio =
   | "16:9"
   | "9:16"
   | "1:1"
+  | "4:3"
+  | "3:4"
+  | "4:5"
+  | "5:4"
   | "2:3"
   | "3:2";
 
@@ -253,7 +376,11 @@ export interface VideoImageGenerationPrefs {
   customStylePrompt?: string;
 }
 
-export type VideoGenerationModelKey = "doubao-seedance-1-5-pro";
+export type VideoGenerationModelKey =
+  | "doubao-seedance-1-5-pro"
+  | "doubao-seedance-2-0-260128"
+  | "doubao-seedance-2-0-fast-260128"
+  | "happyhorse-1.0";
 
 export type VideoGenerationResolution = "480p" | "720p" | "1080p" | "2k" | "4k";
 
@@ -292,19 +419,26 @@ export const ART_STYLE_LABELS: Record<VideoImageStylePreset, string> = {
   'custom': '自定义',
 };
 
-export type VideoModel = 'seedance-1.5-pro' | 'seedance-2.0' | 'seedance-2.0-fast' | 'sora-2';
+export type VideoModel =
+  | 'seedance-1.5-pro'
+  | 'seedance-2.0'
+  | 'seedance-2.0-fast'
+  | 'happyhorse-1.0'
+  | 'sora-2';
 
 export const VIDEO_MODEL_LABELS: Record<VideoModel, string> = {
   'seedance-1.5-pro': '即梦 1.5 Pro',
   'seedance-2.0': '即梦 Seedance 2.0',
   'seedance-2.0-fast': '即梦 Seedance 2.0 Fast',
+  'happyhorse-1.0': 'HappyHorse 1.0',
   'sora-2': 'Sora 2',
 };
 
 export const VIDEO_MODEL_API_MAP: Record<VideoModel, string> = {
   'seedance-1.5-pro': 'doubao-seedance-1-5-pro', // Will be mapped based on resolution
-  'seedance-2.0': 'seedance2.0',
-  'seedance-2.0-fast': 'seedance2.0fast',
+  'seedance-2.0': 'doubao-seedance-2-0-260128',
+  'seedance-2.0-fast': 'doubao-seedance-2-0-fast-260128',
+  'happyhorse-1.0': 'happyhorse-1.0',
   'sora-2': 'sora-2', // Will be mapped to sora-2 or sora-2-pro based on resolution
 };
 
@@ -333,6 +467,15 @@ export interface SegmentVideoPrompt {
   maxDurationForModel: number;
   sceneIds: string[];
   generatedAt: string;
+  debug?: {
+    source: "model";
+    promptLength: number;
+    shotCount: number;
+    shotCoverageComplete: boolean;
+    referenceImageCount?: number;
+    videoMode?: VideoGenerationMode;
+    provider?: string;
+  };
 }
 
 export interface SegmentVideoStatus {
@@ -341,6 +484,145 @@ export interface SegmentVideoStatus {
   taskId?: string;
   provider?: string;
   failure?: VideoFailureInfo;
+  submittedPrompt?: string;
+  referenceImageUrls?: string[];
+  usedContinuityFrame?: boolean;
+  usedRelayVideo?: boolean;
+  updatedAt: string;
+}
+
+export interface VideoAuditDimensionScore {
+  score: number;
+  passed: boolean;
+  reason: string;
+}
+
+export interface VideoAuditPacket {
+  id: string;
+  targetType: "segment" | "shot";
+  targetId: string;
+  segmentLabel?: string;
+  sceneIds: string[];
+  provider?: string;
+  submittedPrompt: string;
+  referenceImageUrls: string[];
+  usedContinuityFrame: boolean;
+  usedRelayVideo: boolean;
+  symbolicPassed: boolean;
+  totalScore: number;
+  status: SegmentVideoFailureRoute;
+  scores: {
+    continuity: VideoAuditDimensionScore;
+    identity: VideoAuditDimensionScore;
+    semantic: VideoAuditDimensionScore;
+    visual: VideoAuditDimensionScore;
+  };
+  visualInspection?: {
+    inspected: boolean;
+    frameCount: number;
+    summary: string;
+    subtitleVisible: boolean;
+    watermarkVisible: boolean;
+    deliverableReady: boolean;
+    qualityTier?: "golden" | "usable" | "borderline" | "fail";
+    goldenSampleVersion?: string;
+    strengths?: string[];
+    goldenSignals?: string[];
+    fixPriorities?: string[];
+    issues: string[];
+  };
+  issues: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SegmentContinuityGridImage {
+  imageUrl: string;
+  recapText?: string;
+  frameUrls?: string[];
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface ArchivedSegmentVideoCandidate {
+  id: string;
+  segmentLabel: string;
+  videoUrl: string;
+  failureReason: string;
+  provider?: string;
+  taskId?: string;
+  submittedPrompt?: string;
+  referenceImageUrls?: string[];
+  usedContinuityFrame?: boolean;
+  usedRelayVideo?: boolean;
+  route?: VideoRepairTask["route"];
+  auditId?: string;
+  qaSummary?: string;
+  issues?: string[];
+  qualityTier?: "golden" | "usable" | "borderline" | "fail";
+  archivedAt: string;
+  promotedAt?: string;
+}
+
+export interface VideoRepairTask {
+  id: string;
+  targetType: "segment" | "shot";
+  targetId: string;
+  segmentLabel?: string;
+  route: SegmentVideoFailureRoute;
+  status: "pending" | "applied" | "completed" | "exhausted";
+  reason: string;
+  auditId?: string;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface VideoAutomationReferenceTargetState {
+  targetId: string;
+  targetType: "character-primary" | "character-variant" | "scene-primary" | "scene-variant";
+  entityId: string;
+  variantId?: string;
+  status: "pending" | "ready" | "retryable" | "blocked" | "exhausted";
+  attemptCount: number;
+  retryBudget: number;
+  dependencyTargetIds?: string[];
+  lastError?: string;
+  lastTriedAt?: string;
+  lastSucceededAt?: string;
+  generatedUrl?: string;
+  qualityScore?: number;
+  sourceRefs?: string[];
+  lastQaSummary?: string;
+  lastQaScore?: number;
+  lastQaPassed?: boolean;
+  lastQaQualityTier?: "golden" | "usable" | "borderline" | "fail";
+  lastQaGoldenSampleVersion?: string;
+  lastQaStrengths?: string[];
+  lastQaGoldenSignals?: string[];
+  lastQaFixPriorities?: string[];
+  lastQaIssues?: string[];
+  lastQaAt?: string;
+}
+
+export interface VideoAutomationSegmentState {
+  totalPasses: number;
+  localRepairCount: number;
+  regenerateCount: number;
+  exhausted?: boolean;
+  latestAuditId?: string;
+  latestRepairTaskId?: string;
+}
+
+export interface VideoAutomationState {
+  strategy: "quality-first";
+  segmentPassBudget: number;
+  localRepairBudget: number;
+  regenerateBudget: number;
+  assetPrimaryRetryBudget: number;
+  assetVariantRetryBudget: number;
+  segments: Record<string, VideoAutomationSegmentState>;
+  referenceTargets: Record<string, VideoAutomationReferenceTargetState>;
   updatedAt: string;
 }
 

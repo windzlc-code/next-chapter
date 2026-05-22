@@ -318,6 +318,7 @@ export function isVideoAssetBundleExportCancelledSummary(summary: string): boole
 export async function exportVideoAssetBundle(
   project: PersistedVideoProject,
   manifest: ProductionAssetManifest | null | undefined,
+  preferredDirectory?: string | null,
 ): Promise<VideoAssetBundleExportResult> {
   const storage = window.electronAPI?.storage;
   if (!storage?.selectFolder) {
@@ -339,7 +340,7 @@ export async function exportVideoAssetBundle(
     };
   }
 
-  const destRoot = await storage.selectFolder();
+  const destRoot = preferredDirectory?.trim() ? preferredDirectory.trim() : await storage.selectFolder();
   if (!destRoot) {
     return {
       status: "cancelled",

@@ -9,6 +9,9 @@ export async function exportScenesToXlsx(
   title?: string,
   characters: CharacterSetting[] = [],
   sceneSettings: SceneSetting[] = [],
+  options?: {
+    directoryPath?: string;
+  },
 ) {
   if (scenes.length === 0) return;
 
@@ -192,9 +195,29 @@ export async function exportScenesToXlsx(
   });
   const fileName = title ? `${title.slice(0, 30)}_分镜.xlsx` : "分镜脚本.xlsx";
 
+  const directoryPath = options?.directoryPath?.trim();
+  if (directoryPath) {
+    const writer = window.electronAPI?.jimeng?.writeFile;
+    if (!writer) {
+      throw new Error("当前环境不支持直接写入 xlsx 文件。");
+    }
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let binary = "";
+    bytes.forEach((byte) => {
+      binary += String.fromCharCode(byte);
+    });
+    const filePath = `${directoryPath.replace(/[\\/]+$/, "")}/${fileName}`;
+    const result = await writer(filePath, btoa(binary));
+    if (!result.ok) {
+      throw new Error(result.error || "导出 xlsx 失败。");
+    }
+    return { status: "saved" as const, filePath };
+  }
+
   const anchor = document.createElement("a");
   anchor.href = URL.createObjectURL(blob);
   anchor.download = fileName;
   anchor.click();
   URL.revokeObjectURL(anchor.href);
+  return { status: "saved" as const };
 }

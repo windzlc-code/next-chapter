@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { PersistedVideoProject } from "@/hooks/use-local-persistence";
-import { deriveVideoAssetManifest } from "./video-production-memory";
+import {
+  deriveVideoAssetManifest,
+  deriveVideoShotPackets,
+  deriveVideoWorldModel,
+  synchronizeVideoProductionState,
+} from "./video-production-memory";
 
 function createProject(): PersistedVideoProject {
   return {
@@ -22,7 +27,7 @@ function createProject(): PersistedVideoProject {
         dialogue: "",
         cameraDirection: "wide shot",
         duration: 5,
-        storyboardUrl: "https://example.com/storyboard-1.jpg",
+        storyboardUrl: "https://cdn.storyforge.test/storyboard-1.jpg",
       },
       {
         id: "scene-2",
@@ -34,8 +39,8 @@ function createProject(): PersistedVideoProject {
         dialogue: "",
         cameraDirection: "close shot",
         duration: 5,
-        storyboardUrl: "https://example.com/storyboard-2.jpg",
-        videoUrl: "https://example.com/video-2.mp4",
+        storyboardUrl: "https://cdn.storyforge.test/storyboard-2.jpg",
+        videoUrl: "https://cdn.storyforge.test/video-2.mp4",
       },
     ],
     characters: [
@@ -43,7 +48,7 @@ function createProject(): PersistedVideoProject {
         id: "char-1",
         name: "沈昭",
         description: "红衣剑客",
-        imageUrl: "https://example.com/char-main.jpg",
+        imageUrl: "https://cdn.storyforge.test/char-main.jpg",
         isAIGenerated: true,
         source: "auto",
       },
@@ -51,7 +56,7 @@ function createProject(): PersistedVideoProject {
         id: "char-2",
         name: "沈昭",
         description: "黑衣分身",
-        imageUrl: "https://example.com/char-alt.jpg",
+        imageUrl: "https://cdn.storyforge.test/char-alt.jpg",
         isAIGenerated: true,
         source: "auto",
       },
@@ -61,7 +66,7 @@ function createProject(): PersistedVideoProject {
         id: "setting-1",
         name: "仙界",
         description: "夜色下的仙宫",
-        imageUrl: "https://example.com/scene.jpg",
+        imageUrl: "https://cdn.storyforge.test/scene.jpg",
         isAIGenerated: true,
         source: "auto",
       },
@@ -142,5 +147,98 @@ describe("deriveVideoAssetManifest", () => {
 
     expect(manifest.items.some((item) => item.id === "manual:other-image")).toBe(true);
     expect(manifest.items.some((item) => item.id === "manual:expired-video")).toBe(false);
+  });
+
+  it("preserves derived asset timestamps when only workflow step metadata changes", () => {
+    const project = createProject();
+    const firstManifest = deriveVideoAssetManifest(project);
+    const firstStoryboard = firstManifest.items.find((item) => item.id === "shot:scene-1:storyboard");
+
+    project.assetManifest = firstManifest;
+    project.currentStep = 4;
+    project.analysisSummary = "已切换到视频生成阶段。";
+    project.updatedAt = "2026-04-03T05:00:00.000Z";
+
+    const nextManifest = deriveVideoAssetManifest(project);
+    const nextStoryboard = nextManifest.items.find((item) => item.id === "shot:scene-1:storyboard");
+
+    expect(nextStoryboard?.url).toBe(firstStoryboard?.url);
+    expect(nextStoryboard?.createdAt).toBe(firstStoryboard?.createdAt);
+    expect(nextStoryboard?.updatedAt).toBe(firstStoryboard?.updatedAt);
+  });
+});
+
+describe("video production memory derivation", () => {
+  it("builds an executable world model with relationships, props, and timeline snapshots", () => {
+    const worldModel = deriveVideoWorldModel(createProject());
+
+    expect(Array.isArray(worldModel.relationships)).toBe(true);
+    expect(Array.isArray(worldModel.props)).toBe(true);
+    expect(worldModel.stateTimeline?.map((snapshot) => snapshot.segmentLabel)).toEqual(["1-1", "1-2"]);
+    expect(worldModel.stateTimeline?.[0]?.characterStates.length).toBeGreaterThan(0);
+    expect(worldModel.narrativeConstraints?.length).toBeGreaterThan(0);
+    expect(worldModel.continuityInvariants?.length).toBeGreaterThan(0);
+  });
+
+  it("derives shot packets with reference plans and QA policies", () => {
+    const shotPackets = deriveVideoShotPackets(createProject());
+
+    expect(shotPackets).toHaveLength(2);
+    expect(shotPackets[0]).toMatchObject({
+      startState: expect.any(String),
+      endState: expect.any(String),
+      referencePlan: {
+        orderedAssetIds: expect.any(Array),
+        continuityFrameFirst: true,
+        relayVideoPreferred: true,
+      },
+      generationPolicy: {
+        preferSegmentChain: true,
+      },
+      qaSpec: {
+        minTotalScore: 85,
+        minContinuityScore: 85,
+      },
+    });
+    expect(shotPackets[1]?.requiredEntities?.length).toBeGreaterThan(0);
+  });
+
+  it("materializes reference-target automation state for primary and dependent assets", () => {
+    const project = synchronizeVideoProductionState({
+      ...createProject(),
+      characters: [
+        {
+          id: "char-1",
+          name: "Hero",
+          description: "Lead",
+          imageUrl: "",
+          isAIGenerated: false,
+          source: "auto",
+          costumes: [
+            {
+              id: "cost-1",
+              label: "战损",
+              description: "外套破损",
+              isAIGenerated: false,
+            },
+          ],
+        },
+      ],
+      sceneSettings: [],
+    });
+
+    expect(project.automationState?.referenceTargets).toEqual(
+      expect.objectContaining({
+        "reference-character:char-1": expect.objectContaining({
+          status: "pending",
+          retryBudget: 3,
+        }),
+        "reference-character-variant:char-1:cost-1": expect.objectContaining({
+          status: "blocked",
+          dependencyTargetIds: ["reference-character:char-1"],
+          retryBudget: 2,
+        }),
+      }),
+    );
   });
 });

@@ -1,8 +1,13 @@
 import type { AskUserQuestionRequest } from "@/lib/agent/tools/ask-user-question";
-import { readStudioSessionBootstrap } from "@/lib/home-agent/session-store";
+import { normalizeAutomationMode } from "@/lib/home-agent/automation-mode";
+import { listStudioProjectSessions, readStudioSessionBootstrap } from "@/lib/home-agent/session-store";
+import { isAdaptationUploadInstructionMessage } from "@/lib/home-agent/adaptation-workflow-kickoff";
+import { isVideoWorkflowUploadInstructionMessage } from "@/lib/home-agent/video-workflow-kickoff";
 import type {
+  AutomationMode,
   ComposerQuestion,
   ConversationProjectSnapshot,
+  PendingWorkflowUploadKind,
   StudioQuestionState,
   StudioRuntimeState,
   StudioSessionState,
@@ -14,24 +19,172 @@ export function createInitialStudioSeed(): {
   needsSessionHydration: boolean;
 } {
   const { session, needsHydration } = readStudioSessionBootstrap();
+  const recentProjectSessions = listStudioProjectSessions();
+  const recoveredFallbackSession =
+    recentProjectSessions.find(
+      (candidate) => hasSavedSessionContent(candidate) || Boolean(candidate.currentProjectSnapshot),
+    ) ?? null;
+  const seedSession =
+    hasSavedSessionContent(session) || Boolean(session?.currentProjectSnapshot)
+      ? session
+      : recoveredFallbackSession;
+  const seedNeedsHydration =
+    seedSession === session
+      ? needsHydration
+      : Boolean(
+          seedSession &&
+            (
+              (seedSession.compactedMessageCount ?? 0) > 0 ||
+              seedSession.messages.length >= 100 ||
+              (seedSession.currentProjectSnapshot?.artifacts.length ?? 0) >= 10
+            ),
+        );
 
   return {
-    session,
+    session: seedSession,
     runtime: {
-      sessionId: session?.sessionId ?? crypto.randomUUID(),
-      currentProjectSnapshot: session?.currentProjectSnapshot ?? null,
+      sessionId: seedSession?.sessionId ?? crypto.randomUUID(),
+      suppressHistoricalMemory: true,
+      currentProjectSnapshot: seedSession?.currentProjectSnapshot ?? null,
       currentDramaProject: null,
       currentVideoProject: null,
       currentSetupDraft: null,
       skillDrafts: [],
       maintenanceReports: [],
       recentProjects: [],
-      recentProjectSessions: [],
-      recentMessageSummary: session?.recentMessageSummary ?? "",
-      fullAutoRun: session?.fullAutoRun ?? null,
+      recentProjectSessions,
+      recentMessageSummary: seedSession?.recentMessageSummary ?? "",
+      fullAutoRun: seedSession?.fullAutoRun ?? null,
     },
-    needsSessionHydration: needsHydration,
+    needsSessionHydration: seedNeedsHydration,
   };
+}
+
+const trimProjectId = (value: unknown): string =>
+  typeof value === "string" ? value.trim() : "";
+
+export function shouldKeepSessionProjectIdForBridgedVideo(params: {
+  currentSessionProjectId?: string | null;
+  snapshot?: Pick<
+    ConversationProjectSnapshot,
+    "projectId" | "projectKind" | "sourceProjectId"
+  > | null;
+}): boolean {
+  const normalizedSessionProjectId = trimProjectId(params.currentSessionProjectId);
+  const normalizedSnapshotProjectId = trimProjectId(params.snapshot?.projectId);
+  const normalizedSourceProjectId = trimProjectId(params.snapshot?.sourceProjectId);
+  return Boolean(
+    normalizedSessionProjectId &&
+      normalizedSnapshotProjectId &&
+      params.snapshot?.projectKind === "video" &&
+      normalizedSnapshotProjectId !== normalizedSessionProjectId &&
+      normalizedSourceProjectId === normalizedSessionProjectId,
+  );
+}
+
+export function resolveSessionProjectIdForSnapshot(params: {
+  currentSessionProjectId?: string | null;
+  snapshot?: Pick<
+    ConversationProjectSnapshot,
+    "projectId" | "projectKind" | "sourceProjectId"
+  > | null;
+  fallbackProjectId?: string | null;
+}): string | null {
+  const normalizedSessionProjectId = trimProjectId(params.currentSessionProjectId);
+  if (
+    shouldKeepSessionProjectIdForBridgedVideo({
+      currentSessionProjectId: normalizedSessionProjectId,
+      snapshot: params.snapshot,
+    })
+  ) {
+    return normalizedSessionProjectId || null;
+  }
+
+  const normalizedSnapshotProjectId = trimProjectId(params.snapshot?.projectId);
+  if (normalizedSnapshotProjectId) {
+    return normalizedSnapshotProjectId;
+  }
+
+  const normalizedFallbackProjectId = trimProjectId(params.fallbackProjectId);
+  if (normalizedFallbackProjectId) {
+    return normalizedFallbackProjectId;
+  }
+
+  return normalizedSessionProjectId || null;
+}
+
+function collectHiddenBridgedVideoProjectIds(params: {
+  recentProjects: ConversationProjectSnapshot[];
+  recentProjectSessions?: Array<
+    Pick<StudioSessionState, "projectId" | "currentProjectSnapshot">
+  >;
+  currentProjectSnapshot?: Pick<
+    ConversationProjectSnapshot,
+    "projectId" | "projectKind" | "sourceProjectId"
+  > | null;
+  currentSessionProjectId?: string | null;
+}): Set<string> {
+  const {
+    recentProjects,
+    recentProjectSessions = [],
+    currentProjectSnapshot = null,
+    currentSessionProjectId = null,
+  } = params;
+  const visibleProjectIds = new Set(
+    recentProjects
+      .map((project) => trimProjectId(project.projectId))
+      .filter(Boolean),
+  );
+  const hiddenProjectIds = new Set<string>();
+
+  const collectFromSnapshot = (
+    sessionProjectId: string | null | undefined,
+    snapshot:
+      | Pick<ConversationProjectSnapshot, "projectId" | "projectKind" | "sourceProjectId">
+      | null
+      | undefined,
+  ) => {
+    const normalizedSessionProjectId = trimProjectId(sessionProjectId);
+    const normalizedSnapshotProjectId = trimProjectId(snapshot?.projectId);
+    const normalizedSourceProjectId = trimProjectId(snapshot?.sourceProjectId);
+    if (
+      snapshot?.projectKind === "video" &&
+      normalizedSourceProjectId &&
+      normalizedSourceProjectId !== normalizedSnapshotProjectId &&
+      (
+        visibleProjectIds.has(normalizedSourceProjectId) ||
+        normalizedSessionProjectId === normalizedSourceProjectId ||
+        normalizedSourceProjectId === trimProjectId(currentSessionProjectId)
+      )
+    ) {
+      hiddenProjectIds.add(normalizedSnapshotProjectId);
+      return;
+    }
+    if (
+      !normalizedSessionProjectId ||
+      !normalizedSnapshotProjectId ||
+      !shouldKeepSessionProjectIdForBridgedVideo({
+        currentSessionProjectId: normalizedSessionProjectId,
+        snapshot,
+      })
+    ) {
+      return;
+    }
+    if (
+      !visibleProjectIds.has(normalizedSessionProjectId) &&
+      normalizedSessionProjectId !== trimProjectId(currentSessionProjectId)
+    ) {
+      return;
+    }
+    hiddenProjectIds.add(normalizedSnapshotProjectId);
+  };
+
+  for (const session of recentProjectSessions) {
+    collectFromSnapshot(session.projectId, session.currentProjectSnapshot);
+  }
+  collectFromSnapshot(currentSessionProjectId, currentProjectSnapshot);
+
+  return hiddenProjectIds;
 }
 
 export function summarizeRecoveryArtifacts(snapshot: ConversationProjectSnapshot): string {
@@ -71,6 +224,8 @@ export function hasSavedSessionContent(session: StudioSessionState | null | unde
   return Boolean(
     session?.messages?.length ||
       session?.qState ||
+      session?.pendingChoiceQuestion ||
+      session?.interruptedChoiceQuestion ||
       session?.draft?.trim() ||
       session?.selectedValues?.length ||
       session?.selectedImageModelFamily ||
@@ -78,6 +233,73 @@ export function hasSavedSessionContent(session: StudioSessionState | null | unde
       session?.selectedVideoModelKey ||
       session?.videoGenerationPrefs,
   );
+}
+
+export function resolveComposerDraftSnapshot(liveDraft: string, persistedDraft: string): string {
+  return liveDraft === persistedDraft ? persistedDraft : liveDraft;
+}
+
+export function didSessionScopedProjectSwitch(
+  hasObservedProjectSelection: boolean,
+  previousProjectId: string | undefined,
+  nextProjectId: string | undefined,
+): boolean {
+  if (!hasObservedProjectSelection) return false;
+  return previousProjectId !== nextProjectId;
+}
+
+export function normalizePendingWorkflowUploadKind(value: unknown): PendingWorkflowUploadKind | null {
+  return value === "adaptation" || value === "video" ? value : null;
+}
+
+function hasLegacyPendingWorkflowUploadQuestion(
+  session: StudioSessionState | null | undefined,
+  label: "adaptation" | "video",
+): boolean {
+  const question = session?.pendingChoiceQuestion ?? session?.interruptedChoiceQuestion ?? null;
+  if (!question) return false;
+
+  const text = [
+    question.title,
+    question.description,
+    ...(question.options?.map((option) => option.label) ?? []),
+    ...(question.options?.map((option) => option.value) ?? []),
+  ]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join("\n");
+
+  if (!text) return false;
+  if (label === "adaptation") {
+    return text.includes("上传参考文档") || text.includes("上传参考剧本");
+  }
+  return text.includes("上传剧本文档") || text.includes("上传脚本文档");
+}
+
+export function resolvePendingWorkflowUploadKind(
+  session: StudioSessionState | null | undefined,
+): PendingWorkflowUploadKind | null {
+  const explicit = normalizePendingWorkflowUploadKind(session?.pendingWorkflowUploadKind);
+  if (explicit) return explicit;
+
+  const assistantMessages = (session?.messages ?? [])
+    .filter((message) => message.role === "assistant")
+    .map((message) => message.content ?? "");
+  const lastAssistantMessage = assistantMessages[assistantMessages.length - 1] ?? "";
+  if (isAdaptationUploadInstructionMessage(lastAssistantMessage)) return "adaptation";
+  if (isVideoWorkflowUploadInstructionMessage(lastAssistantMessage)) return "video";
+  if (
+    hasLegacyPendingWorkflowUploadQuestion(session, "adaptation") &&
+    assistantMessages.some((message) => isAdaptationUploadInstructionMessage(message))
+  ) {
+    return "adaptation";
+  }
+  if (
+    hasLegacyPendingWorkflowUploadQuestion(session, "video") &&
+    assistantMessages.some((message) => isVideoWorkflowUploadInstructionMessage(message))
+  ) {
+    return "video";
+  }
+  return null;
 }
 
 export function areProjectSnapshotsEquivalent(
@@ -91,6 +313,7 @@ export function areProjectSnapshotsEquivalent(
     const prev = prevProjects[index];
     return (
       project.projectId === prev.projectId &&
+      project.sourceProjectId === prev.sourceProjectId &&
       project.updatedAt === prev.updatedAt &&
       project.automationMode === prev.automationMode &&
       project.derivedStage === prev.derivedStage &&
@@ -111,10 +334,21 @@ export function areRecentSessionsEquivalent(
 
   return nextSessions.every((session, index) => {
     const prev = prevSessions[index];
+    const currentSnapshot = session.currentProjectSnapshot;
+    const previousSnapshot = prev.currentProjectSnapshot;
     return (
       session.sessionId === prev.sessionId &&
       session.projectId === prev.projectId &&
       session.automationMode === prev.automationMode &&
+      currentSnapshot?.projectId === previousSnapshot?.projectId &&
+      currentSnapshot?.projectKind === previousSnapshot?.projectKind &&
+      currentSnapshot?.sourceProjectId === previousSnapshot?.sourceProjectId &&
+      currentSnapshot?.automationMode === previousSnapshot?.automationMode &&
+      currentSnapshot?.title === previousSnapshot?.title &&
+      currentSnapshot?.currentObjective === previousSnapshot?.currentObjective &&
+      currentSnapshot?.derivedStage === previousSnapshot?.derivedStage &&
+      currentSnapshot?.agentSummary === previousSnapshot?.agentSummary &&
+      currentSnapshot?.updatedAt === previousSnapshot?.updatedAt &&
       session.selectedTextModelKey === prev.selectedTextModelKey &&
       session.selectedImageModelFamily === prev.selectedImageModelFamily &&
       session.selectedVideoModelKey === prev.selectedVideoModelKey &&
@@ -137,13 +371,314 @@ export function areRecentSessionsEquivalent(
   });
 }
 
+export function upsertRecentProjectSession(
+  currentSessions: StudioSessionState[] | undefined,
+  nextSession: StudioSessionState,
+  limit = 50,
+): StudioSessionState[] {
+  const baseSessions = currentSessions ?? [];
+  const merged = [
+    nextSession,
+    ...baseSessions.filter(
+      (session) =>
+        session.projectId !== nextSession.projectId &&
+        session.sessionId !== nextSession.sessionId,
+    ),
+  ].slice(0, limit);
+
+  return areRecentSessionsEquivalent(merged, currentSessions) ? baseSessions : merged;
+}
+
 export function mergeRecentProjects(
   currentProjects: ConversationProjectSnapshot[],
   nextProject: ConversationProjectSnapshot,
   limit = 50,
 ): ConversationProjectSnapshot[] {
-  const merged = [nextProject, ...currentProjects.filter((item) => item.projectId !== nextProject.projectId)].slice(0, limit);
+  const existingIndex = currentProjects.findIndex((item) => item.projectId === nextProject.projectId);
+  const merged =
+    existingIndex >= 0
+      ? currentProjects.map((item, index) => (index === existingIndex ? nextProject : item))
+      : [nextProject, ...currentProjects].slice(0, limit);
   return areProjectSnapshotsEquivalent(merged, currentProjects) ? currentProjects : merged;
+}
+
+export function reconcileRecentProjectsWithStableOrder(
+  previousProjects: ConversationProjectSnapshot[],
+  nextProjects: ConversationProjectSnapshot[],
+): ConversationProjectSnapshot[] {
+  if (!previousProjects.length) return nextProjects;
+
+  const previousProjectIdSet = new Set(previousProjects.map((project) => project.projectId));
+  const nextProjectIdSet = new Set(nextProjects.map((project) => project.projectId));
+  const nextProjectMap = new Map(nextProjects.map((project) => [project.projectId, project]));
+
+  const preservedProjects = previousProjects
+    .filter((project) => nextProjectIdSet.has(project.projectId))
+    .map((project) => nextProjectMap.get(project.projectId) ?? project);
+  const addedProjects = nextProjects.filter((project) => !previousProjectIdSet.has(project.projectId));
+  const reconciledProjects = addedProjects.length
+    ? [...addedProjects, ...preservedProjects]
+    : preservedProjects;
+
+  return areProjectSnapshotsEquivalent(reconciledProjects, previousProjects)
+    ? previousProjects
+    : reconciledProjects;
+}
+
+export type AutomationModeProjectMemory = Record<AutomationMode, string | null>;
+
+export function createAutomationModeProjectMemory(
+  snapshot?: Pick<ConversationProjectSnapshot, "projectId" | "automationMode"> | null,
+): AutomationModeProjectMemory {
+  return rememberProjectForAutomationMode(
+    {
+      manual: null,
+      "full-auto": null,
+    },
+    snapshot,
+  );
+}
+
+export function rememberProjectForAutomationMode(
+  current: AutomationModeProjectMemory,
+  snapshot?: Pick<ConversationProjectSnapshot, "projectId" | "automationMode"> | null,
+): AutomationModeProjectMemory {
+  if (!snapshot?.projectId) return current;
+  const mode = normalizeAutomationMode(snapshot.automationMode);
+  if (current[mode] === snapshot.projectId) return current;
+  return {
+    ...current,
+    [mode]: snapshot.projectId,
+  };
+}
+
+function findSessionForProjectId(
+  projectId: string,
+  recentProjectSessions: Array<
+    Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot">
+  >,
+): Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot"> | null {
+  return (
+    recentProjectSessions.find(
+      (session) =>
+        session.projectId === projectId ||
+        session.currentProjectSnapshot?.projectId === projectId,
+    ) ?? null
+  );
+}
+
+export function resolveEffectiveProjectAutomationMode(params: {
+  snapshot?: Pick<ConversationProjectSnapshot, "projectId" | "automationMode"> | null;
+  recentProjectSessions?: Array<
+    Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot">
+  >;
+  currentProjectSnapshot?: Pick<ConversationProjectSnapshot, "projectId" | "automationMode"> | null;
+}): AutomationMode {
+  const {
+    snapshot = null,
+    recentProjectSessions = [],
+    currentProjectSnapshot = null,
+  } = params;
+
+  if (!snapshot?.projectId) {
+    return normalizeAutomationMode(snapshot?.automationMode);
+  }
+
+  if (currentProjectSnapshot?.projectId === snapshot.projectId) {
+    return normalizeAutomationMode(currentProjectSnapshot.automationMode ?? snapshot.automationMode);
+  }
+
+  const session = findSessionForProjectId(snapshot.projectId, recentProjectSessions);
+  if (session?.automationMode) {
+    return normalizeAutomationMode(session.automationMode);
+  }
+  if (session?.currentProjectSnapshot?.automationMode) {
+    return normalizeAutomationMode(session.currentProjectSnapshot.automationMode);
+  }
+
+  return normalizeAutomationMode(snapshot.automationMode);
+}
+
+export function filterRecentProjectsForAutomationMode(params: {
+  recentProjects: ConversationProjectSnapshot[];
+  mode: AutomationMode;
+  recentProjectSessions?: Array<
+    Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot">
+  >;
+  currentProjectSnapshot?: Pick<
+    ConversationProjectSnapshot,
+    "projectId" | "automationMode" | "projectKind" | "sourceProjectId"
+  > | null;
+  currentSessionProjectId?: string | null;
+}): ConversationProjectSnapshot[] {
+  const {
+    recentProjects,
+    mode,
+    recentProjectSessions = [],
+    currentProjectSnapshot = null,
+    currentSessionProjectId = null,
+  } = params;
+  const hiddenBridgedVideoProjectIds = collectHiddenBridgedVideoProjectIds({
+    recentProjects,
+    recentProjectSessions,
+    currentProjectSnapshot,
+    currentSessionProjectId,
+  });
+
+  return recentProjects.filter(
+    (project) =>
+      !hiddenBridgedVideoProjectIds.has(project.projectId) &&
+      resolveEffectiveProjectAutomationMode({
+        snapshot: project,
+        recentProjectSessions,
+        currentProjectSnapshot,
+      }) === mode,
+  );
+}
+
+export function selectRecentProjectForAutomationMode(params: {
+  recentProjects: ConversationProjectSnapshot[];
+  mode: AutomationMode;
+  preferredProjectId?: string | null;
+  recentProjectSessions?: Array<
+    Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot">
+  >;
+  currentProjectSnapshot?: Pick<
+    ConversationProjectSnapshot,
+    "projectId" | "automationMode" | "projectKind" | "sourceProjectId"
+  > | null;
+  currentSessionProjectId?: string | null;
+}): ConversationProjectSnapshot | null {
+  const {
+    recentProjects,
+    mode,
+    preferredProjectId = null,
+    recentProjectSessions = [],
+    currentProjectSnapshot = null,
+    currentSessionProjectId = null,
+  } = params;
+  const eligibleProjects = filterRecentProjectsForAutomationMode({
+    recentProjects,
+    mode,
+    recentProjectSessions,
+    currentProjectSnapshot,
+    currentSessionProjectId,
+  });
+  if (preferredProjectId) {
+    const preferredProject = eligibleProjects.find((project) => project.projectId === preferredProjectId);
+    if (preferredProject) return preferredProject;
+  }
+  return eligibleProjects[0] ?? null;
+}
+
+export function mergeRecentProjectsWithSessionSnapshots(params: {
+  recentProjects: ConversationProjectSnapshot[];
+  recentProjectSessions?: StudioSessionState[];
+  currentProjectSnapshot?: ConversationProjectSnapshot | null;
+  currentSessionProjectId?: string | null;
+  limit?: number;
+}): ConversationProjectSnapshot[] {
+  const {
+    recentProjects,
+    recentProjectSessions = [],
+    currentProjectSnapshot = null,
+    currentSessionProjectId = null,
+    limit = 50,
+  } = params;
+
+  const hiddenBridgedVideoProjectIds = collectHiddenBridgedVideoProjectIds({
+    recentProjects,
+    recentProjectSessions,
+    currentProjectSnapshot,
+    currentSessionProjectId,
+  });
+
+  let nextProjects = hiddenBridgedVideoProjectIds.size
+    ? recentProjects.filter((project) => !hiddenBridgedVideoProjectIds.has(project.projectId))
+    : recentProjects;
+  const currentSnapshotProjectId = trimProjectId(currentProjectSnapshot?.projectId);
+  const currentSessionProjectIdNormalized = trimProjectId(currentSessionProjectId);
+  const sessionSnapshots = recentProjectSessions
+    .map((session) => {
+      const snapshot = session.currentProjectSnapshot;
+      if (!snapshot?.projectId) return null;
+      const sessionProjectId = trimProjectId(session.projectId);
+      const shouldProjectOntoSessionShell = shouldKeepSessionProjectIdForBridgedVideo({
+        currentSessionProjectId: sessionProjectId,
+        snapshot,
+      });
+      return {
+        ...snapshot,
+        projectId: shouldProjectOntoSessionShell ? sessionProjectId : snapshot.projectId,
+        automationMode: session.automationMode ?? snapshot.automationMode,
+      } satisfies ConversationProjectSnapshot;
+    })
+    .filter((snapshot): snapshot is ConversationProjectSnapshot => Boolean(snapshot));
+
+  for (const snapshot of [...sessionSnapshots].reverse()) {
+    const previousSnapshot = nextProjects.find((project) => project.projectId === snapshot.projectId) ?? null;
+    const sessionProjectId = trimProjectId(snapshot.projectId);
+    const snapshotSourceProjectId = trimProjectId(snapshot.sourceProjectId);
+    const isCurrentSessionSnapshot =
+      sessionProjectId === currentSessionProjectIdNormalized ||
+      sessionProjectId === currentSnapshotProjectId ||
+      snapshotSourceProjectId === currentSessionProjectIdNormalized;
+    const shouldSurfaceMissingSnapshot =
+      isCurrentSessionSnapshot ||
+      (!previousSnapshot && sessionProjectId === currentSnapshotProjectId);
+
+    if (!shouldSurfaceMissingSnapshot) {
+      continue;
+    }
+
+    nextProjects = mergeRecentProjects(
+      nextProjects,
+      previousSnapshot?.pinned && !snapshot.pinned
+        ? { ...snapshot, pinned: previousSnapshot.pinned }
+        : snapshot,
+      limit,
+    );
+  }
+
+  if (currentProjectSnapshot?.projectId) {
+    const normalizedCurrentSnapshotProjectId = trimProjectId(currentProjectSnapshot.projectId);
+    const normalizedCurrentSourceProjectId = trimProjectId(currentProjectSnapshot.sourceProjectId);
+    const bridgedVisibleShellProjectId =
+      currentProjectSnapshot.projectKind === "video" &&
+      normalizedCurrentSnapshotProjectId &&
+      normalizedCurrentSourceProjectId &&
+      hiddenBridgedVideoProjectIds.has(normalizedCurrentSnapshotProjectId) &&
+      nextProjects.some((project) => project.projectId === normalizedCurrentSourceProjectId)
+        ? normalizedCurrentSourceProjectId
+        : null;
+    const projectedCurrentSnapshot = {
+      ...currentProjectSnapshot,
+      projectId:
+        bridgedVisibleShellProjectId ??
+        resolveSessionProjectIdForSnapshot({
+          currentSessionProjectId,
+          snapshot: currentProjectSnapshot,
+          fallbackProjectId: currentProjectSnapshot.projectId,
+        }) ?? currentProjectSnapshot.projectId,
+    };
+    const previousSnapshot =
+      nextProjects.find((project) => project.projectId === projectedCurrentSnapshot.projectId) ?? null;
+    const shouldSurfaceCurrentSnapshot =
+      Boolean(previousSnapshot) ||
+      !currentSessionProjectIdNormalized ||
+      projectedCurrentSnapshot.projectId === currentSessionProjectIdNormalized;
+    if (!shouldSurfaceCurrentSnapshot) {
+      return nextProjects;
+    }
+    nextProjects = mergeRecentProjects(
+      nextProjects,
+      previousSnapshot?.pinned && !projectedCurrentSnapshot.pinned
+        ? { ...projectedCurrentSnapshot, pinned: previousSnapshot.pinned }
+        : projectedCurrentSnapshot,
+      limit,
+    );
+  }
+  return nextProjects;
 }
 
 export function buildProjectSuggestionKey(

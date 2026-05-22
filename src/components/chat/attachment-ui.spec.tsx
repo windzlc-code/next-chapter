@@ -1,9 +1,74 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { ChatAttachment } from "@/lib/agent/chat-attachments";
-import { MessageAttachmentList } from "./attachment-ui";
+import { DraftAttachmentList, MessageAttachmentList } from "./attachment-ui";
 
 describe("MessageAttachmentList", () => {
+  it("renders an inline audio player for attached draft audio files", () => {
+    const originalCreateObjectUrl = URL.createObjectURL;
+    const originalRevokeObjectUrl = URL.revokeObjectURL;
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      writable: true,
+      value: vi.fn(() => "blob:voice-reference.wav"),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      writable: true,
+      value: vi.fn(),
+    });
+
+    try {
+      const { container } = render(
+        <DraftAttachmentList
+          files={[new File(["audio"], "voice-reference.wav", { type: "audio/wav" })]}
+          activeTheme
+          collapsed={false}
+          onToggleCollapsed={vi.fn()}
+          onRemove={vi.fn()}
+        />,
+      );
+
+      expect(container.querySelector('audio[src="blob:voice-reference.wav"]')).toBeTruthy();
+      const draftAudioCard = screen.getByText("voice-reference.wav").closest("div[class*='rounded-[18px]']");
+      expect(draftAudioCard?.className).toContain("w-full");
+      expect(draftAudioCard?.className).not.toContain("self-start");
+    } finally {
+      Object.defineProperty(URL, "createObjectURL", {
+        configurable: true,
+        writable: true,
+        value: originalCreateObjectUrl,
+      });
+      Object.defineProperty(URL, "revokeObjectURL", {
+        configurable: true,
+        writable: true,
+        value: originalRevokeObjectUrl,
+      });
+    }
+  });
+
+  it("renders an inline audio player for audio message attachments", () => {
+    const attachments: ChatAttachment[] = [
+      {
+        id: "audio-1",
+        fileName: "voice-reference.wav",
+        mimeType: "audio/wav",
+        size: 4096,
+        kind: "binary",
+        localPath: "D:\\voices\\voice-reference.wav",
+      },
+    ];
+
+    const { container } = render(<MessageAttachmentList attachments={attachments} />);
+
+    expect(container.querySelector("audio")).toBeTruthy();
+    expect(container.querySelector('source[src="file:///D:/voices/voice-reference.wav"]')).toBeTruthy();
+    const messageAudioCard = screen.getByText("voice-reference.wav").closest("div[class*='self-start']");
+    expect(messageAudioCard?.className).toContain("self-start");
+    expect(messageAudioCard?.className).toContain("w-[min(34rem,100%)]");
+    expect(messageAudioCard?.className.split(/\s+/)).not.toContain("w-full");
+  });
+
   it("switches image attachments between historical versions", () => {
     const attachments: ChatAttachment[] = [
       {
@@ -95,6 +160,33 @@ describe("MessageAttachmentList", () => {
     fireEvent.click(screen.getByRole("button", { name: /latest-video\.mp4/ }));
 
     expect(document.querySelector('source[src="https://example.com/older-video.mp4"]')).toBeTruthy();
+  });
+
+  it("keeps failed videos previewable with a grey-filtered card", () => {
+    const attachments: ChatAttachment[] = [
+      {
+        id: "video-failed-1",
+        fileName: "qa-failed-video.mp4",
+        mimeType: "video/mp4",
+        size: 0,
+        kind: "video",
+        previewUrl: "https://example.com/qa-failed-video.mp4",
+        failed: true,
+        failureReason: "QA rejected this cut for continuity drift.",
+      },
+    ];
+
+    const { container } = render(<MessageAttachmentList attachments={attachments} />);
+
+    expect(screen.getByText("QA 未通过")).toBeTruthy();
+    expect(screen.getByText("QA rejected this cut for continuity drift.")).toBeTruthy();
+    expect(container.querySelector(".grayscale")).toBeTruthy();
+    expect(container.querySelector("[draggable]")).toHaveAttribute("draggable", "false");
+
+    fireEvent.click(screen.getByRole("button", { name: /qa-failed-video\.mp4/ }));
+
+    expect(document.querySelector("video[controls]")).toBeTruthy();
+    expect(document.querySelector('source[src="https://example.com/qa-failed-video.mp4"]')).toBeTruthy();
   });
 
   it("reveals local video attachments in the system file manager", () => {

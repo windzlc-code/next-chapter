@@ -1,15 +1,16 @@
-/**
+﻿/**
  * electron/main.ts
  *
- * Electron 主进程：
- *  - 通过 preload 向渲染进程暴露安全的 IPC API
- *  - 窗口管理 + 系统托盘
+ * Electron 涓昏繘绋嬶細
+ *  - 閫氳繃 preload 鍚戞覆鏌撹繘绋嬫毚闇插畨鍏ㄧ殑 IPC API
+ *  - 绐楀彛绠＄悊 + 绯荤粺鎵樼洏
  */
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 
 const path = require("node:path");
 const crypto = require("node:crypto");
+const http = require("node:http");
 const {
   app,
   BrowserWindow,
@@ -20,40 +21,80 @@ const {
   shell,
 } = require("electron");
 const fs = require("node:fs");
-const os = require("node:os");
 
-// CJS 模式下 __dirname 由 Node.js 自动提供
-// 注意：main.ts 被 esbuild 编译为 CJS，__dirname 在运行时可用
-// __dirname 指向 electron/ 目录
+// CJS 妯″紡涓?__dirname 鐢?Node.js 鑷姩鎻愪緵
+// 娉ㄦ剰锛歮ain.ts 琚?esbuild 缂栬瘧涓?CJS锛宊_dirname 鍦ㄨ繍琛屾椂鍙敤
+// __dirname 鎸囧悜 electron/ 鐩綍
 
-// =========================== 配置 ===========================
+// =========================== 閰嶇疆 ===========================
 
 const BUILTIN_API_ADMIN_PASSWORD_HASH =
   "d4f31b6def1e6e11148cbab15b400e91528ab18880b25225d9a9f840d4d0d192";
-const STARTUP_LOG_PATH = path.join(
-  process.env.TEMP || process.cwd(),
-  "infinio-startup.log",
-);
 
-// =========================== 状态 ===========================
+function ensureDir(dirPath: string): string {
+  fs.mkdirSync(dirPath, { recursive: true });
+  return dirPath;
+}
+
+function getPortableExecutableDir(): string | null {
+  const portableDir = String(process.env.PORTABLE_EXECUTABLE_DIR || "").trim();
+  return portableDir ? path.resolve(portableDir) : null;
+}
+
+function getAppRootDir(): string {
+  const overrideDir = String(process.env.INFINIO_APP_ROOT_DIR || "").trim();
+  if (overrideDir) {
+    return path.resolve(overrideDir);
+  }
+  if (app.isPackaged) {
+    return getPortableExecutableDir() || path.dirname(process.execPath);
+  }
+  return path.resolve(__dirname, "..");
+}
+
+const APP_ROOT_DIR = getAppRootDir();
+const APP_LOGS_DIR = ensureDir(path.join(APP_ROOT_DIR, "logs"));
+const STARTUP_LOG_PATH = path.join(APP_LOGS_DIR, "infinio-startup.log");
+const APP_TEMP_DIR = ensureDir(path.join(APP_ROOT_DIR, "temp"));
+const APP_USER_DATA_DIR = ensureDir(path.join(APP_ROOT_DIR, "userData"));
+const APP_DB_DIR = ensureDir(path.join(APP_ROOT_DIR, "db"));
+const DEV_SERVER_WARMUP_POLL_INTERVAL_MS = 1000;
+const DEV_SERVER_WARMUP_REQUEST_TIMEOUT_MS = 120_000;
+const DEV_SERVER_WARMUP_TIMEOUT_MS = 5 * 60_000;
+
+// =========================== 鐘舵€?===========================
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
+let devLauncherWatchdog: NodeJS.Timeout | null = null;
+let watchedDevServerPid: number | null = null;
 
-// ── 低配兼容初始化（必须在 app.whenReady() 之前完成）──────────────────
+const allowTestMultiInstance = String(process.env.HOME_AGENT_ALLOW_TEST_MULTI_INSTANCE || "").trim() === "1";
+const singleInstanceLock = allowTestMultiInstance ? true : app.requestSingleInstanceLock();
+if (!singleInstanceLock) {
+  app.quit();
+}
 
-// 1. 固定 userData 到可写目录（%APPDATA%\InFinio），跨机器保证写权限
+// 鈹€鈹€ 浣庨厤鍏煎鍒濆鍖栵紙蹇呴』鍦?app.whenReady() 涔嬪墠瀹屾垚锛夆攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+// 1. 灏嗚繍琛屾椂鍐欏叆鐩綍鍥哄畾鍦ㄥ簲鐢ㄦ牴鐩綍鍐?
 const INFINIO_USER_DATA = (() => {
-  const p = path.join(os.homedir(), "AppData", "Roaming", "InFinio");
-  try { fs.mkdirSync(p, { recursive: true }); app.setPath("userData", p); } catch { /* 回退默认 */ }
-  return p;
+  try {
+    app.setPath("userData", APP_USER_DATA_DIR);
+    app.setPath("sessionData", ensureDir(path.join(APP_ROOT_DIR, "sessionData")));
+    app.setPath("crashDumps", ensureDir(path.join(APP_ROOT_DIR, "crashDumps")));
+    app.setPath("temp", APP_TEMP_DIR);
+  } catch {
+    /* 鍥為€€榛樿 */
+  }
+  return APP_USER_DATA_DIR;
 })();
 
-// 2. GPU 崩溃自动降级标志文件
+// 2. GPU 宕╂簝鑷姩闄嶇骇鏍囧織鏂囦欢
 const GPU_DISABLE_FLAG = path.join(INFINIO_USER_DATA, ".disable-gpu");
 const GPU_DISABLED = fs.existsSync(GPU_DISABLE_FLAG);
 
-// 3. 基础兼容性开关
+// 3. 鍩虹鍏煎鎬у紑鍏?
 app.commandLine.appendSwitch("disable-http-cache");
 app.commandLine.appendSwitch("disable-gpu-shader-disk-cache");
 app.commandLine.appendSwitch("no-first-run");
@@ -61,32 +102,97 @@ app.commandLine.appendSwitch("disable-background-networking");
 app.commandLine.appendSwitch("disable-sync");
 app.commandLine.appendSwitch("safebrowsing-disable-auto-update");
 
-// 4. 若上次 GPU 进程崩溃，本次启动切换为软件渲染（SwiftShader）
+const REMOTE_DEBUGGING_PORT = String(process.env.HOME_AGENT_ELECTRON_REMOTE_DEBUGGING_PORT || "").trim();
+if (/^\d+$/.test(REMOTE_DEBUGGING_PORT)) {
+  app.commandLine.appendSwitch("remote-debugging-port", REMOTE_DEBUGGING_PORT);
+}
+
+// 4. 鑻ヤ笂娆?GPU 杩涚▼宕╂簝锛屾湰娆″惎鍔ㄥ垏鎹负杞欢娓叉煋锛圫wiftShader锛?
 if (GPU_DISABLED) {
   app.commandLine.appendSwitch("disable-gpu");
   app.commandLine.appendSwitch("use-gl", "swiftshader");
   app.commandLine.appendSwitch("disable-gpu-compositing");
-  console.warn("[main] GPU 已禁用，使用软件渲染模式");
+  console.warn("[main] GPU 宸茬鐢紝浣跨敤杞欢娓叉煋妯″紡");
 }
 
 function getUserDataPath(): string {
   return app.getPath("userData");
 }
 
+function parseEnvPid(value: string | undefined): number | null {
+  if (!value) return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function readSmokeSelectFolderOverride(): string | null {
+  const raw = String(process.env.HOME_AGENT_SMOKE_SELECT_FOLDER || "").trim();
+  if (!raw) return null;
+  return path.resolve(raw);
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killProcessTree(pid: number): void {
+  if (!Number.isFinite(pid) || pid <= 0) return;
+
+  try {
+    if (process.platform === "win32") {
+      const { spawn } = require("node:child_process");
+      const killer = spawn("taskkill", ["/pid", String(pid), "/t", "/f"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      killer.on("error", () => {});
+      return;
+    }
+
+    process.kill(pid, "SIGTERM");
+  } catch {
+    // Ignore cleanup failures during shutdown.
+  }
+}
+
+function stopDevLauncherWatchdog(): void {
+  if (devLauncherWatchdog) {
+    clearInterval(devLauncherWatchdog);
+    devLauncherWatchdog = null;
+  }
+}
+
+function startDevLauncherWatchdog(): void {
+  if (app.isPackaged) return;
+
+  const launcherPid = parseEnvPid(process.env.INFINIO_DEV_LAUNCH_PID);
+  watchedDevServerPid = parseEnvPid(process.env.INFINIO_DEV_SERVER_PID);
+  if (!launcherPid) return;
+
+  stopDevLauncherWatchdog();
+  devLauncherWatchdog = setInterval(() => {
+    if (processExists(launcherPid)) return;
+    stopDevLauncherWatchdog();
+    if (watchedDevServerPid) {
+      killProcessTree(watchedDevServerPid);
+      watchedDevServerPid = null;
+    }
+    app.quit();
+  }, 2000);
+}
+
 /**
- * 默认缓存目录：与程序同级的 files/
- * - 开发：项目根目录/files（main 在 electron/，上一级为仓库根）
- * - 打包：可执行文件所在目录/files
+ * 榛樿缂撳瓨鐩綍锛氫笌绋嬪簭鍚岀骇鐨?files/
+ * - 寮€鍙戯細椤圭洰鏍圭洰褰?files锛坢ain 鍦?electron/锛屼笂涓€绾т负浠撳簱鏍癸級
+ * - 鎵撳寘锛氬彲鎵ц鏂囦欢鎵€鍦ㄧ洰褰?files
  */
 function getDefaultFilesDir(): string {
-  const portableDir = process.env.PORTABLE_EXECUTABLE_DIR;
-  if (app.isPackaged && portableDir) {
-    return path.join(portableDir, "files");
-  }
-  if (app.isPackaged) {
-    return path.join(app.getPath("userData"), "files");
-  }
-  return path.join(__dirname, "..", "files");
+  return path.join(APP_ROOT_DIR, "files");
 }
 
 function getBundledFilesDir(): string | null {
@@ -133,7 +239,7 @@ function seedRuntimeFilesDirFromBundle(filesDir: string): void {
   }
 }
 
-// =========================== 日志 ===========================
+// =========================== 鏃ュ織 ===========================
 
 function log(level: string, msg: string) {
   const ts = new Date().toISOString().slice(11, 23);
@@ -143,6 +249,135 @@ function log(level: string, msg: string) {
     fs.appendFileSync(STARTUP_LOG_PATH, `${new Date().toISOString()} ${line}\n`);
   } catch {
     /* ignore */
+  }
+}
+
+function isExpectedDevServer(body: string): boolean {
+  return body.includes('<div id="root"></div>') && body.includes("/src/main.tsx");
+}
+
+function isExpectedMainModule(body: string): boolean {
+  return body.includes("createRoot") && body.includes("App from") && body.includes("/src/App.tsx");
+}
+
+function probeDevServerOnce(devUrl: string): Promise<{ reachable: boolean; reusable: boolean }> {
+  return new Promise((resolve) => {
+    const mainModuleUrl = new URL("/src/main.tsx", devUrl).toString();
+    const requestTextOnce = (targetUrl: string) =>
+      new Promise<{ reachable: boolean; statusCode: number; body: string }>((innerResolve) => {
+        const request = http.get(targetUrl, (response: { statusCode?: number; on: (event: string, listener: (chunk?: Buffer | string) => void) => void }) => {
+          const chunks: Buffer[] = [];
+
+          response.on("data", (chunk?: Buffer | string) => {
+            if (typeof chunk === "undefined") return;
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          });
+
+          response.on("end", () => {
+            innerResolve({
+              reachable: true,
+              statusCode: response.statusCode ?? 0,
+              body: Buffer.concat(chunks).toString("utf8"),
+            });
+          });
+        });
+
+        request.setTimeout(DEV_SERVER_WARMUP_REQUEST_TIMEOUT_MS, () => {
+          request.destroy(new Error("probe timeout"));
+        });
+
+        request.on("error", () => {
+          innerResolve({
+            reachable: false,
+            statusCode: 0,
+            body: "",
+          });
+        });
+      });
+
+    void (async () => {
+      const pageProbe = await requestTextOnce(devUrl);
+      const pageReusable =
+        pageProbe.reachable &&
+        pageProbe.statusCode >= 200 &&
+        pageProbe.statusCode < 300 &&
+        isExpectedDevServer(pageProbe.body);
+
+      if (!pageReusable) {
+        resolve({
+          reachable: pageProbe.reachable,
+          reusable: false,
+        });
+        return;
+      }
+
+      const mainModuleProbe = await requestTextOnce(mainModuleUrl);
+      const mainModuleReusable =
+        mainModuleProbe.reachable &&
+        mainModuleProbe.statusCode >= 200 &&
+        mainModuleProbe.statusCode < 300 &&
+        isExpectedMainModule(mainModuleProbe.body);
+
+      resolve({
+        reachable: true,
+        reusable: mainModuleReusable,
+      });
+    })();
+  });
+}
+
+async function waitForReusableDevServer(devUrl: string, win: BrowserWindow): Promise<boolean> {
+  const deadline = Date.now() + DEV_SERVER_WARMUP_TIMEOUT_MS;
+
+  while (Date.now() <= deadline) {
+    if (win.isDestroyed()) {
+      return false;
+    }
+
+    const probe = await probeDevServerOnce(devUrl);
+    if (probe.reusable) {
+      return true;
+    }
+
+    if (win.isDestroyed()) {
+      return false;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, DEV_SERVER_WARMUP_POLL_INTERVAL_MS));
+  }
+
+  return false;
+}
+
+async function loadDevWarmupPage(win: BrowserWindow): Promise<void> {
+  const warmupPath = path.join(__dirname, "dev-warmup.html");
+  log("info", `loading dev warmup page: ${warmupPath}`);
+  await win.loadFile(warmupPath);
+}
+
+async function transitionWarmupWindowToDevServer(win: BrowserWindow, devUrl: string): Promise<void> {
+  const ready = await waitForReusableDevServer(devUrl, win);
+  if (!ready) {
+    if (!win.isDestroyed()) {
+      log("error", `timed out waiting for reusable dev server at ${devUrl}`);
+    }
+    return;
+  }
+
+  if (win.isDestroyed()) {
+    return;
+  }
+
+  try {
+    log("info", `dev warmup complete, loading live url: ${devUrl}`);
+    await win.loadURL(devUrl);
+    if (process.env.ELECTRON_OPEN_DEVTOOLS === "1" && !win.isDestroyed()) {
+      win.webContents.openDevTools();
+    }
+  } catch (error) {
+    if (!win.isDestroyed()) {
+      log("error", `failed to load live dev url: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 }
 
@@ -177,34 +412,23 @@ function verifyBuiltinApiAdminPassword(password: string): boolean {
   return crypto.timingSafeEqual(expectedBuffer, actualBuffer);
 }
 
-function getDreaminaCandidatePaths(): string[] {
-  const homeDir = os.homedir();
-  const executableName = process.platform === "win32" ? "dreamina.exe" : "dreamina";
-  return Array.from(
-    new Set([
-      path.join(homeDir, "bin", executableName),
-      path.join(homeDir, ".local", "bin", executableName),
-      path.join(path.dirname(process.execPath), executableName),
-    ]),
-  );
-}
 
-// =========================== IPC 处理 ===========================
+// =========================== IPC 澶勭悊 ===========================
 
 function setupIPC() {
-  // 🛡️ 读取崩溃日志
+  // 馃洝锔?璇诲彇宕╂簝鏃ュ織
   ipcMain.handle(
     "runtime:verifyBuiltinApiAdminPassword",
     (_event, password: string) => verifyBuiltinApiAdminPassword(password),
   );
 
-  // 查询当前渲染模式（供设置页展示）
+  // 鏌ヨ褰撳墠娓叉煋妯″紡锛堜緵璁剧疆椤靛睍绀猴級
   ipcMain.handle("runtime:getGpuMode", () => ({
     softwareRendering: GPU_DISABLED,
     flagPath: GPU_DISABLE_FLAG,
   }));
 
-  // 重置 GPU 降级标志，下次启动恢复硬件加速
+  // 閲嶇疆 GPU 闄嶇骇鏍囧織锛屼笅娆″惎鍔ㄦ仮澶嶇‖浠跺姞閫?
   ipcMain.handle("runtime:resetGpuFlag", () => {
     try {
       if (fs.existsSync(GPU_DISABLE_FLAG)) fs.unlinkSync(GPU_DISABLE_FLAG);
@@ -248,72 +472,8 @@ function setupIPC() {
     },
   );
 
-  ipcMain.handle(
-    "dreamina:exec",
-    async (
-      _event,
-      { args, stdin }: { args: string[]; stdin?: string },
-    ) => {
-      const executablePath = await resolveDreaminaExecutable();
-      if (!executablePath) {
-        return {
-          ok: false,
-          installed: false,
-          error: "未检测到 dreamina CLI，请先执行官方安装脚本安装。",
-        };
-      }
 
-      const safeArgs = Array.isArray(args)
-        ? args.filter((value) => typeof value === "string" && value.length > 0)
-        : [];
-
-      return await new Promise((resolve) => {
-        const proc = spawn(executablePath, safeArgs, {
-          stdio: ["pipe", "pipe", "pipe"],
-          windowsHide: true,
-        });
-
-        let stdout = "";
-        let stderr = "";
-
-        proc.stdout.on("data", (chunk: Buffer) => {
-          stdout += chunk.toString("utf8");
-        });
-        proc.stderr.on("data", (chunk: Buffer) => {
-          stderr += chunk.toString("utf8");
-        });
-
-        proc.on("error", (error: Error) => {
-          resolve({
-            ok: false,
-            installed: true,
-            path: executablePath,
-            error: error.message,
-            stdout,
-            stderr,
-          });
-        });
-
-        proc.on("close", (code: number | null) => {
-          resolve({
-            ok: code === 0,
-            installed: true,
-            path: executablePath,
-            code: code ?? -1,
-            stdout,
-            stderr,
-          });
-        });
-
-        if (typeof stdin === "string" && stdin.length > 0) {
-          proc.stdin.write(stdin);
-        }
-        proc.stdin.end();
-      });
-    },
-  );
-
-  // ===== 存储路径 ============================
+  // ===== 瀛樺偍璺緞 ============================
 
   ipcMain.handle("storage:getDefaultPath", () => {
     const filesDir = getDefaultFilesDir();
@@ -323,14 +483,18 @@ function setupIPC() {
     } catch {
       /* ignore */
     }
-    const userData = app.getPath("userData");
     return {
       files: filesDir,
-      db: path.join(userData, "db"),
+      db: APP_DB_DIR,
     };
   });
 
   ipcMain.handle("storage:selectFolder", async () => {
+    const smokeFolderOverride = readSmokeSelectFolderOverride();
+    if (smokeFolderOverride) {
+      fs.mkdirSync(smokeFolderOverride, { recursive: true });
+      return smokeFolderOverride;
+    }
     const { dialog } = require("electron");
     const result = await dialog.showOpenDialog(mainWindow!, {
       properties: ["openDirectory"],
@@ -347,7 +511,7 @@ function setupIPC() {
 
   ipcMain.handle("storage:openPath", (_event, targetPath: string) => {
     const normalizedPath = path.normalize(targetPath);
-    // 如果是文件，用 showItemInFolder 在资源管理器中高亮显示；否则直接打开目录
+    // 濡傛灉鏄枃浠讹紝鐢?showItemInFolder 鍦ㄨ祫婧愮鐞嗗櫒涓珮浜樉绀猴紱鍚﹀垯鐩存帴鎵撳紑鐩綍
     try {
       const stat = fs.statSync(normalizedPath);
       if (stat.isFile()) {
@@ -355,7 +519,7 @@ function setupIPC() {
         return Promise.resolve("");
       }
     } catch {
-      // 路径不存在时回退到 openPath
+      // 璺緞涓嶅瓨鍦ㄦ椂鍥為€€鍒?openPath
     }
     return shell.openPath(normalizedPath);
   });
@@ -393,7 +557,7 @@ function setupIPC() {
       try {
         const { dialog } = require("electron");
         const result = await dialog.showSaveDialog(mainWindow!, {
-          title: "保存文件",
+          title: "淇濆瓨鏂囦欢",
           defaultPath: params.defaultFileName,
           filters: Array.isArray(params.filters) ? params.filters : undefined,
         });
@@ -409,6 +573,27 @@ function setupIPC() {
         return {
           ok: false,
           cancelled: false,
+          filePath: null,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "storage:writeBase64File",
+    async (
+      _event,
+      { filePath, base64 }: { filePath: string; base64: string },
+    ) => {
+      try {
+        const normalizedPath = path.normalize(filePath);
+        fs.mkdirSync(path.dirname(normalizedPath), { recursive: true });
+        fs.writeFileSync(normalizedPath, Buffer.from(base64, "base64"));
+        return { ok: true, filePath: normalizedPath };
+      } catch (error) {
+        return {
+          ok: false,
           filePath: null,
           error: error instanceof Error ? error.message : String(error),
         };
@@ -533,7 +718,7 @@ function setupIPC() {
     }
   });
 
-  // 选择单个文件对话框
+  // 閫夋嫨鍗曚釜鏂囦欢瀵硅瘽妗?
   ipcMain.handle(
     "storage:selectFile",
     async (_event, { filters }: { filters?: { name: string; extensions: string[] }[] }) => {
@@ -547,7 +732,7 @@ function setupIPC() {
     },
   );
 
-  // 导出聊天记录：写入聊天记录 JSON，并按当前协议复制媒体目录
+  // 瀵煎嚭鑱婂ぉ璁板綍锛氬啓鍏ヨ亰澶╄褰?JSON锛屽苟鎸夊綋鍓嶅崗璁鍒跺獟浣撶洰褰?
   ipcMain.handle(
     "storage:exportChatHistory",
     async (
@@ -581,7 +766,7 @@ function setupIPC() {
     },
   );
 
-  // 导入聊天记录：直接读取用户选择的 chat-history.json，并把同级 media/ 复制回当前项目目录
+  // 瀵煎叆鑱婂ぉ璁板綍锛氱洿鎺ヨ鍙栫敤鎴烽€夋嫨鐨?chat-history.json锛屽苟鎶婂悓绾?media/ 澶嶅埗鍥炲綋鍓嶉」鐩洰褰?
   ipcMain.handle(
     "storage:importChatHistory",
     async (_event, { filePath, targetProjectDir }: { filePath: string; targetProjectDir?: string }) => {
@@ -622,7 +807,7 @@ function setupIPC() {
 
   // =========================== Agent IPC ===========================
   // Manages QueryEngine instances keyed by sessionId.
-  // Renders invoke agent:submitMessage → receives streamed agent:event messages.
+  // Renders invoke agent:submitMessage 鈫?receives streamed agent:event messages.
 
   const { QueryEngine } = require("../src/lib/agent/query-engine");
 
@@ -878,14 +1063,14 @@ function setupIPC() {
         ? `${binaryName}.exe`
         : binaryName;
 
-    // 优先使用打包进 extraResources 的 vendor/ffmpeg
+    // 浼樺厛浣跨敤鎵撳寘杩?extraResources 鐨?vendor/ffmpeg
     const resourcesDir = app.isPackaged
       ? process.resourcesPath
       : path.resolve(__dirname, "..");
     const vendorCandidate = path.join(resourcesDir, "vendor", "ffmpeg", executableName);
     if (fs.existsSync(vendorCandidate)) return vendorCandidate;
 
-    // 开发环境回退：系统安装路径
+    // 寮€鍙戠幆澧冨洖閫€锛氱郴缁熷畨瑁呰矾寰?
     const bundledDir = "C:\\Program Files\\ffmpeg\\bin";
     const directCandidate = path.join(bundledDir, executableName);
     if (fs.existsSync(directCandidate)) return directCandidate;
@@ -901,27 +1086,6 @@ function setupIPC() {
           .map((line: string) => line.trim())
           .find((line: string) => !!line && fs.existsSync(line)) || null
       );
-    } catch {
-      return null;
-    }
-  }
-
-  async function resolveDreaminaExecutable(): Promise<string | null> {
-    for (const candidate of getDreaminaCandidatePaths()) {
-      if (fs.existsSync(candidate)) return candidate;
-    }
-
-    try {
-      const lookupCommand = process.platform === "win32" ? "where.exe" : "which";
-      const { stdout } = await execFileAsync(
-        lookupCommand,
-        ["dreamina"],
-        { windowsHide: true },
-      );
-      return String(stdout)
-        .split(/\r?\n/)
-        .map((line: string) => line.trim())
-        .find((line: string) => !!line && fs.existsSync(line)) || null;
     } catch {
       return null;
     }
@@ -1035,7 +1199,7 @@ function setupIPC() {
     },
   );
 
-  // ── ffmpeg: 片段视频拼接 ──────────────────────────────────────────────
+  // 鈹€鈹€ ffmpeg: 鐗囨瑙嗛鎷兼帴 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   ipcMain.handle(
     "ffmpeg:concatSegments",
     async (
@@ -1059,7 +1223,7 @@ function setupIPC() {
 
         fs.mkdirSync(path.dirname(path.normalize(outputPath)), { recursive: true });
 
-        // 写 concat 列表文件
+        // 鍐?concat 鍒楄〃鏂囦欢
         const listFile = path.join(app.getPath("temp"), `infinio-concat-${Date.now()}.txt`);
         const listContent = validPaths.map((p: string) => `file '${p.replace(/\\/g, "/")}'`).join("\n");
         fs.writeFileSync(listFile, listContent, "utf8");
@@ -1070,7 +1234,7 @@ function setupIPC() {
           { windowsHide: true },
         );
 
-        try { fs.unlinkSync(listFile); } catch { /* 清理失败不影响结果 */ }
+        try { fs.unlinkSync(listFile); } catch { /* 娓呯悊澶辫触涓嶅奖鍝嶇粨鏋?*/ }
 
         return { ok: true, outputPath: path.normalize(outputPath) };
       } catch (error) {
@@ -1079,7 +1243,7 @@ function setupIPC() {
     },
   );
 
-  // ── ffmpeg: 烧录字幕 ──────────────────────────────────────────────────
+  // 鈹€鈹€ ffmpeg: 鐑у綍瀛楀箷 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   ipcMain.handle(
     "ffmpeg:burnSubtitles",
     async (
@@ -1099,11 +1263,11 @@ function setupIPC() {
         if (!ffmpegBin) return { ok: false, error: "ffmpeg 未找到。" };
 
         const normalizedInput = path.normalize(inputPath);
-        if (!fs.existsSync(normalizedInput)) return { ok: false, error: `输入文件不存在: ${normalizedInput}` };
+        if (!fs.existsSync(normalizedInput)) return { ok: false, error: `杈撳叆鏂囦欢涓嶅瓨鍦? ${normalizedInput}` };
 
         fs.mkdirSync(path.dirname(path.normalize(outputPath)), { recursive: true });
 
-        // 生成 SRT 文件
+        // 鐢熸垚 SRT 鏂囦欢
         const srtFile = path.join(app.getPath("temp"), `infinio-subs-${Date.now()}.srt`);
         const toSrtTime = (ms: number) => {
           const h = Math.floor(ms / 3600000);
@@ -1119,7 +1283,7 @@ function setupIPC() {
           .join("\n");
         fs.writeFileSync(srtFile, srtContent, "utf8");
 
-        // 烧录字幕（使用 subtitles filter，路径需转义冒号）
+        // 鐑у綍瀛楀箷锛堜娇鐢?subtitles filter锛岃矾寰勯渶杞箟鍐掑彿锛?
         const escapedSrt = srtFile.replace(/\\/g, "/").replace(/:/g, "\\:");
         await execFileAsync(
           ffmpegBin,
@@ -1127,7 +1291,7 @@ function setupIPC() {
           { windowsHide: true },
         );
 
-        try { fs.unlinkSync(srtFile); } catch { /* 清理失败不影响结果 */ }
+        try { fs.unlinkSync(srtFile); } catch { /* 娓呯悊澶辫触涓嶅奖鍝嶇粨鏋?*/ }
 
         return { ok: true, outputPath: path.normalize(outputPath) };
       } catch (error) {
@@ -1136,7 +1300,7 @@ function setupIPC() {
     },
   );
 
-  // ── SRT 后处理：过滤非对话内容 + 去重 + 修复重叠时间戳 ──────────────────
+  // 鈹€鈹€ SRT 鍚庡鐞嗭細杩囨护闈炲璇濆唴瀹?+ 鍘婚噸 + 淇閲嶅彔鏃堕棿鎴?鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   function cleanSrtDialogue(srtContent: string): string {
     const parseMs = (ts: string): number => {
       const [h, m, rest] = ts.split(":");
@@ -1158,16 +1322,16 @@ function setupIPC() {
       const lines = block.trim().split("\n");
       if (lines.length < 3) continue;
       const textLines = lines.slice(2).join("\n").trim();
-      // 过滤括号内容（音效、幻觉、片头字幕等）
-      if (/^[\s(（\[【♪♫]*[\)）\]】♪♫\s]*$/.test(textLines)) continue;
-      if (/^[\s(（\[【].*[\)）\]】]\s*$/.test(textLines)) continue;
-      // 过滤纯标点或空内容
+      // 杩囨护鎷彿鍐呭锛堥煶鏁堛€佸够瑙夈€佺墖澶村瓧骞曠瓑锛?
+      if (/^[\s(锛圽[銆愨櫔鈾玗*[\)锛塡]銆戔櫔鈾玕s]*$/.test(textLines)) continue;
+      if (/^[\s(锛圽[銆怾.*[\)锛塡]銆慮\s*$/.test(textLines)) continue;
+      // 杩囨护绾爣鐐规垨绌哄唴瀹?
       if (textLines.replace(/[\s\p{P}]/gu, "").length < 1) continue;
       const [startStr, endStr] = lines[1].split(" --> ");
       entries.push({ startMs: parseMs(startStr.trim()), endMs: parseMs(endStr.trim()), text: textLines });
     }
 
-    // 去重：时间戳重叠且文本相同或被包含 → 跳过
+    // 鍘婚噸锛氭椂闂存埑閲嶅彔涓旀枃鏈浉鍚屾垨琚寘鍚?鈫?璺宠繃
     const deduped: typeof entries = [];
     for (const entry of entries) {
       const prev = deduped[deduped.length - 1];
@@ -1177,7 +1341,7 @@ function setupIPC() {
       deduped.push(entry);
     }
 
-    // 修复重叠时间戳：确保每条结束 <= 下一条开始
+    // 淇閲嶅彔鏃堕棿鎴筹細纭繚姣忔潯缁撴潫 <= 涓嬩竴鏉″紑濮?
     for (let i = 0; i < deduped.length - 1; i++) {
       if (deduped[i].endMs > deduped[i + 1].startMs) {
         deduped[i].endMs = deduped[i + 1].startMs;
@@ -1187,7 +1351,7 @@ function setupIPC() {
     return deduped.map((e, i) => `${i + 1}\n${fmtMs(e.startMs)} --> ${fmtMs(e.endMs)}\n${e.text}`).join("\n\n") + "\n";
   }
 
-  // ── ffmpeg: AI 智能拼接（xfade 转场 + whisper 字幕识别）────────────────
+  // 鈹€鈹€ ffmpeg: AI 鏅鸿兘鎷兼帴锛坸fade 杞満 + whisper 瀛楀箷璇嗗埆锛夆攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   ipcMain.handle(
     "ffmpeg:smartConcat",
     async (
@@ -1224,7 +1388,7 @@ function setupIPC() {
         const tempDir = app.getPath("temp");
         const ts = Date.now();
 
-        // ── 步骤1：用 ffprobe 获取每段时长 ──────────────────────────────
+        // 鈹€鈹€ 姝ラ1锛氱敤 ffprobe 鑾峰彇姣忔鏃堕暱 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         const ffprobeBin = await resolveBinaryExecutable("ffprobe");
         const durations: number[] = [];
         if (ffprobeBin) {
@@ -1244,19 +1408,19 @@ function setupIPC() {
           validPaths.forEach(() => durations.push(5));
         }
 
-        // ── 步骤2：构建 xfade 滤镜图 ────────────────────────────────────
-        // 每段转场时长默认 0.5s，offset = 累计时长 - 转场时长
+        // 鈹€鈹€ 姝ラ2锛氭瀯寤?xfade 婊ら暅鍥?鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        // 姣忔杞満鏃堕暱榛樿 0.5s锛宱ffset = 绱鏃堕暱 - 杞満鏃堕暱
         const concatOutput = path.join(tempDir, `infinio-smart-concat-${ts}.mp4`);
 
         if (validPaths.length === 1) {
-          // 单段直接复制
+          // 鍗曟鐩存帴澶嶅埗
           await execFileAsync(
             ffmpegBin,
             ["-y", "-i", validPaths[0], "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", concatOutput],
             { windowsHide: true, maxBuffer: 100 * 1024 * 1024 },
           );
         } else {
-          // 构建 xfade 滤镜链
+          // 鏋勫缓 xfade 婊ら暅閾?
           const effectiveTransitions = transitions.slice(0, validPaths.length - 1);
           while (effectiveTransitions.length < validPaths.length - 1) {
             effectiveTransitions.push({ type: "fade", duration: 0.5 });
@@ -1267,18 +1431,18 @@ function setupIPC() {
             inputArgs.push("-i", vp);
           }
 
-          // 计算每个 xfade 的 offset（前段结束时间 - 转场时长）
+          // 璁＄畻姣忎釜 xfade 鐨?offset锛堝墠娈电粨鏉熸椂闂?- 杞満鏃堕暱锛?
           const offsets: number[] = [];
           let cumulative = 0;
           for (let i = 0; i < validPaths.length - 1; i++) {
             cumulative += durations[i];
             const xfadeDur = effectiveTransitions[i].duration;
             offsets.push(Math.max(0, cumulative - xfadeDur));
-            // 下一段的起始时间要减去转场重叠部分
+            // 涓嬩竴娈电殑璧峰鏃堕棿瑕佸噺鍘昏浆鍦洪噸鍙犻儴鍒?
             cumulative -= xfadeDur;
           }
 
-          // 构建滤镜图：[0:v][1:v]xfade=...,offset=...[v01]; [v01][2:v]xfade=...
+          // 鏋勫缓婊ら暅鍥撅細[0:v][1:v]xfade=...,offset=...[v01]; [v01][2:v]xfade=...
           let filterGraph = "";
           let prevLabel = "[0:v]";
           for (let i = 0; i < validPaths.length - 1; i++) {
@@ -1289,7 +1453,7 @@ function setupIPC() {
             prevLabel = outLabel;
           }
 
-          // 音频：acrossfade 链
+          // 闊抽锛歛crossfade 閾?
           let audioFilter = "";
           let prevALabel = "[0:a]";
           for (let i = 0; i < validPaths.length - 1; i++) {
@@ -1325,7 +1489,7 @@ function setupIPC() {
           return { ok: false, error: "视频拼接失败，输出文件未生成。" };
         }
 
-        // ── 步骤3：字幕处理 ──────────────────────────────────────────────────
+        // 鈹€鈹€ 姝ラ3锛氬瓧骞曞鐞?鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         let finalOutput = path.normalize(outputPath);
 
         const burnSrt = async (srtEntries: Array<{ startMs: number; endMs: number; text: string }>) => {
@@ -1352,7 +1516,7 @@ function setupIPC() {
         };
 
         if (addSubtitles) {
-          // whisper 语音识别：JSON 格式输出，精确去重合并
+          // whisper 璇煶璇嗗埆锛欽SON 鏍煎紡杈撳嚭锛岀簿纭幓閲嶅悎骞?
           const resourcesDir = app.isPackaged ? process.resourcesPath : path.resolve(__dirname, "..");
           const resolvedModelPath = whisperModelPath
             ? path.normalize(whisperModelPath)
@@ -1378,7 +1542,7 @@ function setupIPC() {
                 "-f", "null", "-"],
               { windowsHide: true, maxBuffer: 100 * 1024 * 1024, timeout: 300_000, cwd: tempDir },
             );
-          } catch { /* 失败时 jsonOutput 不存在，后续降级 */ }
+          } catch { /* 澶辫触鏃?jsonOutput 涓嶅瓨鍦紝鍚庣画闄嶇骇 */ }
           try { fs.unlinkSync(modelInTemp); } catch { /* ignore */ }
 
           let srtEntries: Array<{ startMs: number; endMs: number; text: string }> = [];
@@ -1386,21 +1550,21 @@ function setupIPC() {
             const jsonLines = fs.readFileSync(jsonOutput, "utf8");
             try { fs.unlinkSync(jsonOutput); } catch { /* ignore */ }
 
-            // 解析 JSON 行，三步过滤：括号幻觉 → 被包含重复 → 紧邻合并
+            // 瑙ｆ瀽 JSON 琛岋紝涓夋杩囨护锛氭嫭鍙峰够瑙?鈫?琚寘鍚噸澶?鈫?绱ч偦鍚堝苟
             const raw = jsonLines.trim().split("\n")
               .map((l) => { try { return JSON.parse(l.trim()) as { start: number; end: number; text: string }; } catch { return null; } })
               .filter((e): e is { start: number; end: number; text: string } => !!e);
 
-            // Step 1: 过滤括号内容（音效/幻觉）
+            // Step 1: 杩囨护鎷彿鍐呭锛堥煶鏁?骞昏锛?
             let entries = raw.filter((e) => {
               const t = e.text.trim();
-              if (/^[\s(（\[【♪♫]*[\)）\]】♪♫\s]*$/.test(t)) return false;
-              if (/^[\s(（\[【].*[\)）\]】]\s*$/.test(t)) return false;
+              if (/^[\s(锛圽[銆愨櫔鈾玗*[\)锛塡]銆戔櫔鈾玕s]*$/.test(t)) return false;
+              if (/^[\s(锛圽[銆怾.*[\)锛塡]銆慮\s*$/.test(t)) return false;
               if (t.replace(/[\s\p{P}]/gu, "").length < 1) return false;
               return true;
             });
 
-            // Step 2: 删除被其他相同文本条目完全包含的条目（时间窗口重叠幻觉）
+            // Step 2: 鍒犻櫎琚叾浠栫浉鍚屾枃鏈潯鐩畬鍏ㄥ寘鍚殑鏉＄洰锛堟椂闂寸獥鍙ｉ噸鍙犲够瑙夛級
             entries = entries.filter((e, i) => {
               const selfDur = e.end - e.start;
               return !entries.some((other, j) => {
@@ -1410,7 +1574,7 @@ function setupIPC() {
               });
             });
 
-            // Step 3: 合并相邻文本相同且 gap < 200ms 的条目
+            // Step 3: 鍚堝苟鐩搁偦鏂囨湰鐩稿悓涓?gap < 200ms 鐨勬潯鐩?
             const merged: Array<{ start: number; end: number; text: string }> = [];
             for (const e of entries) {
               const prev = merged[merged.length - 1];
@@ -1421,12 +1585,12 @@ function setupIPC() {
               merged.push({ ...e });
             }
 
-            // Step 4: 修复时间戳重叠
+            // Step 4: 淇鏃堕棿鎴抽噸鍙?
             for (let i = 0; i < merged.length - 1; i++) {
               if (merged[i].end > merged[i + 1].start) merged[i].end = merged[i + 1].start;
             }
 
-            // Step 5: 频率幻觉过滤 — 同一文本（≥4字）在非重叠时间段出现 ≥3 次视为幻觉循环
+            // Step 5: 棰戠巼骞昏杩囨护 鈥?鍚屼竴鏂囨湰锛堚墺4瀛楋級鍦ㄩ潪閲嶅彔鏃堕棿娈靛嚭鐜?鈮? 娆¤涓哄够瑙夊惊鐜?
             const textFreq = new Map<string, number>();
             for (const e of merged) textFreq.set(e.text.trim(), (textFreq.get(e.text.trim()) ?? 0) + 1);
             const deHallucinated = merged.filter((e) => {
@@ -1435,12 +1599,12 @@ function setupIPC() {
               return charLen <= 3 || (textFreq.get(key) ?? 0) < 3;
             });
 
-            // Step 6: 文本内部重复短语过滤 — "ABAB" 或 "AB,AB" 模式为幻觉特征
+            // Step 6: 鏂囨湰鍐呴儴閲嶅鐭杩囨护 鈥?"ABAB" 鎴?"AB,AB" 妯″紡涓哄够瑙夌壒寰?
             const deRepeat = deHallucinated.filter((e) => {
               const t = e.text.trim();
-              const parts = t.split(/[,，。.、；;]/).map((p) => p.trim()).filter(Boolean);
+              const parts = t.split(/[,锛屻€?銆侊紱;]/).map((p) => p.trim()).filter(Boolean);
               if (parts.length >= 2 && parts[0] === parts[1]) return false;
-              const clean = t.replace(/[,，。.、；;\s]/g, "");
+              const clean = t.replace(/[,锛屻€?銆侊紱;\s]/g, "");
               const half = Math.floor(clean.length / 2);
               if (half >= 3 && clean.slice(0, half) === clean.slice(half)) return false;
               return true;
@@ -1465,7 +1629,7 @@ function setupIPC() {
             fs.copyFileSync(concatOutput, finalOutput);
           }
         } else if (subtitleEntries && subtitleEntries.length > 0) {
-          // 分镜台词字幕（备用路径）
+          // 鍒嗛暅鍙拌瘝瀛楀箷锛堝鐢ㄨ矾寰勶級
           try {
             const subtitledOutput = await burnSrt(subtitleEntries.map((e) => ({ startMs: e.startMs, endMs: e.endMs, text: e.text })));
             if (fs.existsSync(subtitledOutput)) {
@@ -1495,7 +1659,7 @@ function setupIPC() {
     async (_event, { toolName, args }: { toolName: string; args: Record<string, unknown> }) => {
       try {
         switch (toolName) {
-          // ── FileRead ──────────────────────────────────────────────────
+          // 鈹€鈹€ FileRead 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
           case "FileRead": {
             const filePath = String(args.filePath);
             const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico"]);
@@ -1517,7 +1681,7 @@ function setupIPC() {
             return { content: numbered };
           }
 
-          // ── FileWrite ─────────────────────────────────────────────────
+          // 鈹€鈹€ FileWrite 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
           case "FileWrite": {
             const filePath = String(args.filePath);
             const content = String(args.content ?? "");
@@ -1526,7 +1690,7 @@ function setupIPC() {
             return { ok: true };
           }
 
-          // ── FileEdit ──────────────────────────────────────────────────
+          // 鈹€鈹€ FileEdit 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
           case "FileEdit": {
             const filePath = String(args.filePath);
             if (!fs.existsSync(filePath)) return { error: `File not found: ${filePath}` };
@@ -1547,7 +1711,7 @@ function setupIPC() {
             return { ok: true, message: `Edited ${filePath}` };
           }
 
-          // ── Glob ──────────────────────────────────────────────────────
+          // 鈹€鈹€ Glob 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
           case "Glob": {
             const pattern = String(args.pattern);
             const cwd = args.path ? String(args.path) : process.cwd();
@@ -1566,7 +1730,7 @@ function setupIPC() {
             return { files: withStat.map((x: { f: string }) => x.f) };
           }
 
-          // ── Grep ──────────────────────────────────────────────────────
+          // 鈹€鈹€ Grep 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
           case "Grep": {
             const pattern = String(args.pattern);
             const searchPath = args.path ? String(args.path) : process.cwd();
@@ -1594,7 +1758,7 @@ function setupIPC() {
               // ripgrep exits 1 when no matches, that's fine
               const exitCode = (e as { code?: number }).code;
               if (exitCode === 1) return { output: "" };
-              // rg not found – fallback
+              // rg not found 鈥?fallback
               const { stdout } = await execAsync(
                 `grep -r ${caseInsensitive ? "-i" : ""} -l "${pattern.replace(/"/g, '\\"')}" "${searchPath}"`,
                 { maxBuffer: 5 * 1024 * 1024 },
@@ -1603,7 +1767,7 @@ function setupIPC() {
             }
           }
 
-          // ── Bash ──────────────────────────────────────────────────────
+          // 鈹€鈹€ Bash 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
           case "Bash": {
             const command = String(args.command);
             const timeout = Math.min(Number(args.timeout ?? 120_000), 600_000);
@@ -1772,7 +1936,7 @@ function setupIPC() {
   });
 }
 
-// =========================== 窗口 & 托盘 ===========================
+// =========================== 绐楀彛 & 鎵樼洏 ===========================
 
 async function prepareWindowSession(win: Electron.BrowserWindow): Promise<void> {
   try {
@@ -1791,7 +1955,7 @@ async function prepareWindowSession(win: Electron.BrowserWindow): Promise<void> 
     log("warn", `failed to clear cache storage: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  // 为外部媒体资源（如火山引擎 TOS）注入 CORS 响应头，解决视频播放跨域问题
+  // 涓哄閮ㄥ獟浣撹祫婧愶紙濡傜伀灞卞紩鎿?TOS锛夋敞鍏?CORS 鍝嶅簲澶达紝瑙ｅ喅瑙嗛鎾斁璺ㄥ煙闂
   win.webContents.session.webRequest.onHeadersReceived((details, callback) => {
     const headers = { ...details.responseHeaders };
     if (!headers["access-control-allow-origin"] && !headers["Access-Control-Allow-Origin"]) {
@@ -1812,22 +1976,45 @@ async function createWindow() {
     minWidth: 1024,
     minHeight: 700,
     icon: path.join(__dirname, "../build/icon.ico"),
+    backgroundColor: "#090b11",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
       webSecurity: false,
-      spellcheck: false,           // 低配优化：禁用拼写检查
-      backgroundThrottling: true,  // 后台节流，减少低配机器资源占用
+      spellcheck: false,           // 浣庨厤浼樺寲锛氱鐢ㄦ嫾鍐欐鏌?
+      backgroundThrottling: true,  // 鍚庡彴鑺傛祦锛屽噺灏戜綆閰嶆満鍣ㄨ祫婧愬崰鐢?
+      paintWhenInitiallyHidden: true,
     },
     show: false,
-    title: "InFinio-一站式智能体自动化平台",
+    title: "InFinio - 一站式智能体自动化平台",
   });
+
+  let hasRevealedMainWindow = false;
+  let startupRevealTimer: NodeJS.Timeout | null = setTimeout(() => {
+    revealMainWindow("startup-timeout");
+  }, 1200);
+
+  const revealMainWindow = (reason: string) => {
+    if (!mainWindow || mainWindow.isDestroyed() || hasRevealedMainWindow) return;
+    hasRevealedMainWindow = true;
+    if (startupRevealTimer) {
+      clearTimeout(startupRevealTimer);
+      startupRevealTimer = null;
+    }
+    log("info", `main window revealed via ${reason}`);
+    mainWindow.show();
+  };
 
   mainWindow.once("ready-to-show", () => {
     log("info", "main window ready-to-show");
-    mainWindow?.show();
+    revealMainWindow("ready-to-show");
+  });
+
+  mainWindow.webContents.once("dom-ready", () => {
+    log("info", "main window dom-ready");
+    revealMainWindow("dom-ready");
   });
 
   mainWindow.webContents.on("did-finish-load", () => {
@@ -1838,21 +2025,28 @@ async function createWindow() {
     log("error", `main window did-fail-load code=${code} description=${description} url=${url}`);
   });
 
-  // 🛡️ 监听渲染进程崩溃
-  mainWindow.webContents.on("render-process-gone", (event, details) => {
-    log("error", `========== 渲染进程崩溃 ==========`);
-    log("error", `原因: ${details.reason}`);
-    log("error", `退出码: ${details.exitCode}`);
-    console.error("渲染进程崩溃详情:", details);
+  mainWindow.on("closed", () => {
+    if (startupRevealTimer) {
+      clearTimeout(startupRevealTimer);
+      startupRevealTimer = null;
+    }
+  });
 
-    // 保存崩溃信息到文件，包含更多上下文
+  // 馃洝锔?鐩戝惉娓叉煋杩涚▼宕╂簝
+  mainWindow.webContents.on("render-process-gone", (event, details) => {
+    log("error", `========== 娓叉煋杩涚▼宕╂簝 ==========`);
+    log("error", `鍘熷洜: ${details.reason}`);
+    log("error", `閫€鍑虹爜: ${details.exitCode}`);
+    console.error("娓叉煋杩涚▼宕╂簝璇︽儏:", details);
+
+    // 淇濆瓨宕╂簝淇℃伅鍒版枃浠讹紝鍖呭惈鏇村涓婁笅鏂?
     const crashInfo = {
       timestamp: new Date().toISOString(),
       reason: details.reason,
       exitCode: details.exitCode,
-      // 添加内存使用信息
+      // 娣诲姞鍐呭瓨浣跨敤淇℃伅
       memoryUsage: process.memoryUsage(),
-      // 添加系统信息
+      // 娣诲姞绯荤粺淇℃伅
       platform: process.platform,
       arch: process.arch,
       nodeVersion: process.version,
@@ -1867,31 +2061,35 @@ async function createWindow() {
       logs.unshift(crashInfo);
       if (logs.length > 20) logs.length = 20;
       fs.writeFileSync(crashLogPath, JSON.stringify(logs, null, 2));
-      log("info", `崩溃日志已保存到: ${crashLogPath}`);
+      log("info", `宕╂簝鏃ュ織宸蹭繚瀛樺埌: ${crashLogPath}`);
     } catch (err) {
-      log("error", `无法保存崩溃日志: ${err}`);
+      log("error", `鏃犳硶淇濆瓨宕╂簝鏃ュ織: ${err}`);
     }
   });
 
-  // 🛡️ 监听未响应
+  // 馃洝锔?鐩戝惉鏈搷搴?
   mainWindow.webContents.on("unresponsive", () => {
     log("warn", "渲染进程未响应");
   });
 
-  // 🛡️ 监听恢复响应
+  // 馃洝锔?鐩戝惉鎭㈠鍝嶅簲
   mainWindow.webContents.on("responsive", () => {
     log("info", "渲染进程已恢复响应");
   });
 
   await prepareWindowSession(mainWindow);
 
-  // 加载 Vite dev server 或打包后的 index.html
+  // 鍔犺浇 Vite dev server 鎴栨墦鍖呭悗鐨?index.html
   if (process.env.VITE_DEV_SERVER_URL) {
-    log("info", `loading dev url: ${process.env.VITE_DEV_SERVER_URL}`);
-    await mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
-    if (process.env.ELECTRON_OPEN_DEVTOOLS === "1") {
-      mainWindow.webContents.openDevTools();
+    const devUrl = process.env.VITE_DEV_SERVER_URL;
+
+    try {
+      await loadDevWarmupPage(mainWindow);
+    } catch (error) {
+      log("warn", `failed to load dev warmup page: ${error instanceof Error ? error.message : String(error)}`);
     }
+
+    void transitionWarmupWindowToDevServer(mainWindow, devUrl);
   } else {
     const indexPath = path.join(__dirname, "../dist/index.html");
     log("info", `loading file: ${indexPath}`);
@@ -1900,7 +2098,7 @@ async function createWindow() {
 }
 
 function createTray() {
-  // 加载图标
+  // 鍔犺浇鍥炬爣
   const icon = nativeImage.createFromPath(path.join(__dirname, "../build/icon.ico"));
   log("info", `createTray icon empty=${icon.isEmpty()}`);
   tray = new Tray(icon);
@@ -1911,30 +2109,100 @@ function createTray() {
     { label: "退出", click: () => app.quit() },
   ]);
 
-  tray.setToolTip("InFinio-一站式智能体自动化平台");
+  tray.setToolTip("InFinio - 一站式智能体自动化平台");
   tray.setContextMenu(contextMenu);
   tray.on("click", () => mainWindow?.show());
 }
 
-// =========================== App 入口 ===========================
+function configureApplicationMenu() {
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate([
+      {
+        label: "文件",
+        submenu: [
+          { role: "close", label: "关闭窗口" },
+          { type: "separator" },
+          { role: "quit", label: "退出" },
+        ],
+      },
+      {
+        label: "编辑",
+        submenu: [
+          { role: "undo", label: "撤销" },
+          { role: "redo", label: "重做" },
+          { type: "separator" },
+          { role: "cut", label: "剪切" },
+          { role: "copy", label: "复制" },
+          { role: "paste", label: "粘贴" },
+          { role: "selectAll", label: "全选" },
+        ],
+      },
+      {
+        label: "视图",
+        submenu: [
+          { role: "reload", label: "重新加载" },
+          { role: "forceReload", label: "强制重新加载" },
+          { role: "toggleDevTools", label: "开发者工具" },
+          { type: "separator" },
+          { role: "resetZoom", label: "重置缩放" },
+          { role: "zoomIn", label: "放大" },
+          { role: "zoomOut", label: "缩小" },
+          { type: "separator" },
+          { role: "togglefullscreen", label: "切换全屏" },
+        ],
+      },
+      {
+        label: "窗口",
+        submenu: [
+          { role: "minimize", label: "最小化" },
+          { role: "close", label: "关闭窗口" },
+        ],
+      },
+      {
+        label: "帮助",
+        submenu: [
+          {
+            label: "打开数据目录",
+            click: () => {
+              void shell.openPath(app.getPath("userData"));
+            },
+          },
+        ],
+      },
+    ]),
+  );
+}
+
+// =========================== App 鍏ュ彛 ===========================
 
 app.whenReady().then(async () => {
-  log("info", "========== Electron 主进程启动 ==========");
+  log("info", "========== Electron 涓昏繘绋嬪惎鍔?==========");
   log("info", `渲染模式: ${GPU_DISABLED ? "软件渲染(SwiftShader)" : "硬件加速"}`);
 
-  // GPU 崩溃自动降级：写入标志文件，下次启动切换软件渲染
+  // GPU 宕╂簝鑷姩闄嶇骇锛氬啓鍏ユ爣蹇楁枃浠讹紝涓嬫鍚姩鍒囨崲杞欢娓叉煋
   app.on("gpu-process-crashed", (_event, killed) => {
-    log("warn", `GPU 进程崩溃 killed=${killed}，下次启动将自动切换软件渲染`);
+    log("warn", `GPU 杩涚▼宕╂簝 killed=${killed}锛屼笅娆″惎鍔ㄥ皢鑷姩鍒囨崲杞欢娓叉煋`);
     try { fs.writeFileSync(GPU_DISABLE_FLAG, "1"); } catch { /* ignore */ }
   });
 
   setupIPC();
+  configureApplicationMenu();
   await createWindow();
   createTray();
+  startDevLauncherWatchdog();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) void createWindow();
   });
+});
+
+app.on("second-instance", () => {
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore();
+    }
+    mainWindow.focus();
+  }
 });
 
 app.on("window-all-closed", () => {
@@ -1942,5 +2210,12 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
-  // Cleanup if needed
+  stopDevLauncherWatchdog();
+  if (watchedDevServerPid) {
+    killProcessTree(watchedDevServerPid);
+    watchedDevServerPid = null;
+  }
 });
+
+
+

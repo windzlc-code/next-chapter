@@ -6,6 +6,13 @@ vi.mock("@/lib/export-xlsx", () => ({
   exportScenesToXlsx,
 }));
 import { runWorkflowAction } from "./workflow-actions";
+import {
+  FULL_AUTO_ADAPTATION_SMOKE_SCENARIO,
+  FULL_AUTO_ORIGINAL_SCRIPT_SMOKE_SCENARIO,
+  FULL_AUTO_VIDEO_WORKFLOW_SMOKE_SCENARIO,
+  WORKFLOW_TEST_SCENARIO_KEY,
+  WORKFLOW_TEST_TRACE_KEY,
+} from "./workflow-test-overrides";
 import type { StudioRuntimeState } from "./types";
 import type { PersistedVideoProject } from "@/hooks/use-local-persistence";
 import { createEmptyDramaProject, type DramaProject } from "@/types/drama";
@@ -84,6 +91,111 @@ function createRuntime(): StudioRuntimeState {
 }
 
 describe("workflow-actions get_context", () => {
+  it("can drive the full-auto original-script smoke override from localStorage", async () => {
+    localStorage.setItem(WORKFLOW_TEST_SCENARIO_KEY, FULL_AUTO_ORIGINAL_SCRIPT_SMOKE_SCENARIO);
+    localStorage.removeItem(WORKFLOW_TEST_TRACE_KEY);
+
+    const saveSetupResult = await runWorkflowAction(
+      "save_setup",
+      {
+        projectKind: "script",
+        projectId: "session-full-auto-smoke-1",
+        automationMode: "full-auto",
+        setupMode: "creative",
+        creativeInput: "雨夜重逢后，女主和冷面投资人联手追查旧案。",
+        audience: "女频",
+        tone: "甜虐",
+        ending: "HE",
+        totalEpisodes: 40,
+        targetMarket: "cn",
+      },
+      createRuntime(),
+    );
+
+    expect(saveSetupResult.projectSnapshot?.projectKind).toBe("script");
+    expect(saveSetupResult.projectSnapshot?.projectId).toBe("session-full-auto-smoke-1");
+    expect(saveSetupResult.projectSnapshot?.derivedStage).toBe("创意方案");
+
+    const trace = JSON.parse(localStorage.getItem(WORKFLOW_TEST_TRACE_KEY) || "[]");
+    expect(trace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          scenario: FULL_AUTO_ORIGINAL_SCRIPT_SMOKE_SCENARIO,
+          actionKind: "save_setup",
+        }),
+      ]),
+    );
+
+    localStorage.removeItem(WORKFLOW_TEST_SCENARIO_KEY);
+    localStorage.removeItem(WORKFLOW_TEST_TRACE_KEY);
+  });
+
+  it("can drive the full-auto adaptation smoke override from localStorage", async () => {
+    localStorage.setItem(WORKFLOW_TEST_SCENARIO_KEY, FULL_AUTO_ADAPTATION_SMOKE_SCENARIO);
+    localStorage.removeItem(WORKFLOW_TEST_TRACE_KEY);
+
+    const saveSetupResult = await runWorkflowAction(
+      "save_setup",
+      {
+        projectKind: "adaptation",
+        projectId: "session-full-auto-adaptation-smoke-1",
+        automationMode: "full-auto",
+        referenceScript: "参考剧本正文",
+        title: "Adaptation Smoke",
+        totalEpisodes: 60,
+        targetMarket: "cn",
+      },
+      createRuntime(),
+    );
+
+    expect(saveSetupResult.projectSnapshot?.projectKind).toBe("adaptation");
+    expect(saveSetupResult.projectSnapshot?.projectId).toBe("session-full-auto-adaptation-smoke-1");
+
+    const trace = JSON.parse(localStorage.getItem(WORKFLOW_TEST_TRACE_KEY) || "[]");
+    expect(trace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          scenario: FULL_AUTO_ADAPTATION_SMOKE_SCENARIO,
+          actionKind: "save_setup",
+        }),
+      ]),
+    );
+
+    localStorage.removeItem(WORKFLOW_TEST_SCENARIO_KEY);
+    localStorage.removeItem(WORKFLOW_TEST_TRACE_KEY);
+  });
+
+  it("can drive the full-auto video-workflow smoke override from localStorage", async () => {
+    localStorage.setItem(WORKFLOW_TEST_SCENARIO_KEY, FULL_AUTO_VIDEO_WORKFLOW_SMOKE_SCENARIO);
+    localStorage.removeItem(WORKFLOW_TEST_TRACE_KEY);
+
+    const analyzeResult = await runWorkflowAction(
+      "analyze_script_for_video",
+      {
+        projectId: "drama-project-video-entry",
+        sourceProjectId: "drama-project-video-entry",
+        automationMode: "full-auto",
+      },
+      createRuntime(),
+    );
+
+    expect(analyzeResult.projectSnapshot?.projectKind).toBe("video");
+    expect(analyzeResult.projectSnapshot?.sourceProjectId).toBeTruthy();
+
+    const trace = JSON.parse(localStorage.getItem(WORKFLOW_TEST_TRACE_KEY) || "[]");
+    expect(trace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          scenario: FULL_AUTO_VIDEO_WORKFLOW_SMOKE_SCENARIO,
+          actionKind: "analyze_script_for_video",
+        }),
+      ]),
+    );
+
+    localStorage.removeItem(WORKFLOW_TEST_SCENARIO_KEY);
+    localStorage.removeItem(WORKFLOW_TEST_TRACE_KEY);
+  });
+
   it("creates an untitled adaptation project from minimal setup input", async () => {
     const result = await runWorkflowAction(
       "save_setup",
@@ -135,6 +247,66 @@ describe("workflow-actions get_context", () => {
     expect(result.projectSnapshot?.currentObjective).toContain("角色开发");
   });
 
+  it("does not complete original-script setup from a title-only first-turn save", async () => {
+    const result = await runWorkflowAction(
+      "save_setup",
+      {
+        projectKind: "script",
+        forceNewProject: true,
+        title: "会话项目：你好",
+      },
+      {
+        ...createRuntime(),
+        currentProjectSnapshot: null,
+        currentDramaProject: null,
+      },
+    );
+
+    expect(result.data?.dramaProject?.setup).toBeNull();
+    expect(result.data?.dramaProject?.currentStep).toBe("setup");
+    expect(result.projectSnapshot?.derivedStage).toBe("立项设定");
+    expect(result.summary).toContain("先确认原创立项方向");
+  });
+
+  it("reuses the current conversation project id when full-auto setup execution starts", async () => {
+    const result = await runWorkflowAction(
+      "save_setup",
+      {
+        projectKind: "script",
+        projectId: "session-full-auto-1",
+        automationMode: "full-auto",
+        setupMode: "creative",
+        genres: ["缇庨", "閮藉競"],
+        audience: "濂抽",
+        tone: "鐢滆檺",
+        ending: "HE",
+        totalEpisodes: 24,
+        targetMarket: "cn",
+        creativeInput: "缇庨鎽婁富涓庡喎闈㈡姇璧勪汉鍦ㄥ煄甯傚甯傜浉閬囷紝涓€璧锋墦閫犲搧鐗屻€?",
+      },
+      {
+        ...createRuntime(),
+        currentProjectSnapshot: {
+          projectId: "session-full-auto-1",
+          projectKind: "script",
+          title: "浣犲ソ",
+          currentObjective: "缁х画褰撳墠瀵硅瘽",
+          derivedStage: "鍘嗗彶瀵硅瘽",
+          agentSummary: "placeholder",
+          recommendedActions: [],
+          artifacts: [],
+          automationMode: "full-auto",
+        },
+        currentDramaProject: null,
+      },
+    );
+
+    expect(result.data?.dramaProject?.id).toBe("session-full-auto-1");
+    expect(result.projectSnapshot?.projectId).toBe("session-full-auto-1");
+    expect(result.projectSnapshot?.projectKind).toBe("script");
+    expect(result.data?.dramaProject?.currentStep).toBe("creative-plan");
+  });
+
   it("returns an agent-readable structured summary instead of raw JSON", async () => {
     const result = await runWorkflowAction("get_context", {}, createRuntime());
 
@@ -166,8 +338,8 @@ describe("workflow-actions get_context", () => {
           dialogue: "",
           cameraDirection: "中景，跟拍",
           duration: 5,
-          storyboardUrl: "https://example.com/storyboard-1.jpg",
-          videoUrl: "https://example.com/video-1.mp4",
+          storyboardUrl: "https://cdn.storyforge.test/storyboard-1.jpg",
+          videoUrl: "https://cdn.storyforge.test/video-1.mp4",
           videoStatus: "completed",
         },
       ],
@@ -176,7 +348,7 @@ describe("workflow-actions get_context", () => {
           id: "char-1",
           name: "沈昭",
           description: "红衣、清冷、警觉",
-          imageUrl: "https://example.com/char-1.jpg",
+          imageUrl: "https://cdn.storyforge.test/char-1.jpg",
           isAIGenerated: false,
           source: "auto",
         },
@@ -186,7 +358,7 @@ describe("workflow-actions get_context", () => {
           id: "setting-1",
           name: "雨夜长街",
           description: "冷色夜雨中的长街",
-          imageUrl: "https://example.com/scene-1.jpg",
+          imageUrl: "https://cdn.storyforge.test/scene-1.jpg",
           isAIGenerated: false,
           source: "auto",
         },
@@ -349,7 +521,7 @@ describe("workflow-actions get_context", () => {
       shotStyle: "电影感近景",
       outputGoal: "预告片",
     });
-    expect(result.projectSnapshot?.currentObjective).toContain("镜头拆解");
+    expect(result.projectSnapshot?.currentObjective).toContain("参考资产入口");
   });
 
   it("preserves existing bridge fields when only one field is written", async () => {
@@ -843,7 +1015,7 @@ describe("workflow-actions get_context", () => {
         currentObjective: "继续复核镜头指令包，并衔接提示词与生成。",
         derivedStage: "镜头指令包",
         agentSummary: "当前已经具备资产清单、镜头指令包和待审阅状态。",
-        recommendedActions: ["导出生产状态包", "准备视频提示词批次"],
+        recommendedActions: ["导出生产状态包", "视频提示词生成方式"],
         artifacts: [],
       },
       currentVideoProject: videoProject,

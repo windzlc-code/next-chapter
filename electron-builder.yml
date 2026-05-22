@@ -8,7 +8,8 @@ directories:
 
 files:
   - dist/**/*
-  - electron/**/*
+  - electron/main.cjs
+  - electron/preload.cjs
   - "!**/*.map"
   - "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}"
   - "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}"
@@ -22,6 +23,7 @@ extraResources:
     filter:
       - "**/*"
       - "!projects/**"
+      - "!conversations/**"
   - from: config/builtin-api.json
     to: config/builtin-api.json
   - from: vendor/ffmpeg

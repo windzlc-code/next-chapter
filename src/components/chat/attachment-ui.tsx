@@ -1,6 +1,7 @@
 import * as React from "react";
 import {
   AlertCircle,
+  AudioLines,
   Download,
   File as FileIcon,
   FileImage,
@@ -32,6 +33,18 @@ function AttachmentKindIcon({
   return <FileIcon className={className} />;
 }
 
+function isAudioFile(file: Pick<File, "type">): boolean {
+  return String(file.type || "").toLowerCase().startsWith("audio/");
+}
+
+function isAudioAttachment(attachment: Pick<ChatAttachment, "mimeType">): boolean {
+  return String(attachment.mimeType || "").toLowerCase().startsWith("audio/");
+}
+
+function formatAttachmentKilobytes(size: number): string {
+  return `${(size / 1024).toFixed(0)}KB`;
+}
+
 /** 为 File 对象创建并管理 object URL 预览（图片 + 视频） */
 function useFilePreviews(files: File[]): Map<number, string> {
   const [previews, setPreviews] = React.useState<Map<number, string>>(new Map());
@@ -40,7 +53,7 @@ function useFilePreviews(files: File[]): Map<number, string> {
     const newPreviews = new Map<number, string>();
     files.forEach((file, index) => {
       if (
-        (file.type.startsWith("image/") || file.type.startsWith("video/")) &&
+        (file.type.startsWith("image/") || file.type.startsWith("video/") || isAudioFile(file)) &&
         typeof URL.createObjectURL === "function"
       ) {
         newPreviews.set(index, URL.createObjectURL(file));
@@ -63,19 +76,26 @@ export function DraftAttachmentList({
   collapsed,
   onToggleCollapsed,
   onRemove,
+  progressByIndex,
+  disableRemove = false,
 }: {
   files: File[];
   activeTheme: boolean;
   collapsed: boolean;
   onToggleCollapsed: () => void;
   onRemove: (index: number) => void;
+  progressByIndex?: Record<number, { progress: number; label?: string }>;
+  disableRemove?: boolean;
 }) {
-  const imagePreviews = useFilePreviews(files);
+  const filePreviews = useFilePreviews(files);
 
   if (!files.length) return null;
 
   const mediaFiles = files.filter((f) => f.type.startsWith("image/") || f.type.startsWith("video/"));
-  const nonMediaFiles = files.filter((f) => !f.type.startsWith("image/") && !f.type.startsWith("video/"));
+  const audioFiles = files.filter((f) => isAudioFile(f));
+  const nonMediaFiles = files.filter(
+    (f) => !f.type.startsWith("image/") && !f.type.startsWith("video/") && !isAudioFile(f),
+  );
 
   return (
     <div
@@ -108,7 +128,9 @@ export function DraftAttachmentList({
                 const isImg = file.type.startsWith("image/");
                 const isVid = file.type.startsWith("video/");
                 if (!isImg && !isVid) return null;
-                const previewUrl = imagePreviews.get(index);
+                const previewUrl = filePreviews.get(index);
+                const progressMeta = progressByIndex?.[index];
+                const progressValue = Math.max(0, Math.min(100, Math.round(progressMeta?.progress ?? 0)));
                 return (
                   <div
                     key={`${file.name}-${index}`}
@@ -134,30 +156,133 @@ export function DraftAttachmentList({
                           activeTheme ? "bg-white/[0.08]" : "bg-muted/50",
                         )}
                       >
-                        {isVid
-                          ? <Film className={cn("h-5 w-5", activeTheme ? "text-white/55" : "text-muted-foreground")} />
-                          : <FileImage className={cn("h-5 w-5", activeTheme ? "text-white/55" : "text-muted-foreground")} />
-                        }
+                        {isVid ? (
+                          <Film className={cn("h-5 w-5", activeTheme ? "text-white/55" : "text-muted-foreground")} />
+                        ) : (
+                          <FileImage className={cn("h-5 w-5", activeTheme ? "text-white/55" : "text-muted-foreground")} />
+                        )}
                       </div>
                     )}
-                    <button
-                      type="button"
-                      className="absolute top-0.5 right-0.5 opacity-0 group-hover:opacity-100 transition-opacity bg-black/60 hover:bg-black/80 text-white rounded-full p-0.5"
-                      onClick={() => onRemove(index)}
-                      aria-label={`移除 ${file.name}`}
-                    >
-                      <X className="h-2.5 w-2.5" />
-                    </button>
+                    {progressMeta ? (
+                      <>
+                        <div className="absolute inset-x-0 bottom-0 h-1.5 bg-black/35">
+                          <div
+                            role="progressbar"
+                            aria-label={`${file.name} 识别进度`}
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                            aria-valuenow={progressValue}
+                            className="h-full bg-primary transition-[width] duration-200 ease-out"
+                            style={{ width: `${progressValue}%` }}
+                          />
+                        </div>
+                        <div className="absolute inset-x-1.5 bottom-2 rounded-md bg-black/65 px-1.5 py-1 text-[9px] font-medium text-white/92 backdrop-blur-sm">
+                          {(progressMeta.label?.trim() || "正在识别") + ` ${progressValue}%`}
+                        </div>
+                      </>
+                    ) : null}
+                    {!disableRemove && !progressMeta ? (
+                      <button
+                        type="button"
+                        className="absolute top-0.5 right-0.5 opacity-0 group-hover:opacity-100 transition-opacity bg-black/60 hover:bg-black/80 text-white rounded-full p-0.5"
+                        onClick={() => onRemove(index)}
+                        aria-label={`移除 ${file.name}`}
+                      >
+                        <X className="h-2.5 w-2.5" />
+                      </button>
+                    ) : null}
                   </div>
                 );
               })}
             </div>
           )}
           {/* 非媒体文件列表 */}
+          {audioFiles.length > 0 && (
+            <div className="flex w-full flex-col gap-1.5">
+              {files.map((file, index) => {
+                if (!isAudioFile(file)) return null;
+                const previewUrl = filePreviews.get(index);
+                return (
+                  <div
+                    key={`${file.name}-${index}`}
+                    className={cn(
+                      "w-full rounded-[18px] border px-3 py-2 shadow-[0_10px_24px_rgba(0,0,0,0.14)]",
+                      activeTheme
+                        ? "border-white/[0.08] bg-white/[0.04]"
+                        : "border-border/90 bg-muted/20",
+                    )}
+                  >
+                    <div className="flex items-start gap-3">
+                      <span
+                        className={cn(
+                          "mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full",
+                          activeTheme ? "bg-white/[0.08] text-white/76" : "bg-muted text-foreground/72",
+                        )}
+                      >
+                        <AudioLines className="h-4 w-4" />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div
+                          className={cn(
+                            "whitespace-normal break-all text-[11.5px] font-medium leading-4.5",
+                            activeTheme ? "text-white/84" : "text-foreground/88",
+                          )}
+                          title={file.name}
+                        >
+                          {file.name}
+                        </div>
+                        <div
+                          className={cn(
+                            "mt-0.5 text-[10px] leading-4",
+                            activeTheme ? "text-white/42" : "text-muted-foreground/80",
+                          )}
+                        >
+                          {`Audio / ${formatAttachmentKilobytes(file.size)}`}
+                        </div>
+                      </div>
+                      {!disableRemove ? (
+                        <button
+                          type="button"
+                          className={cn(
+                            "inline-flex h-6.5 w-6.5 shrink-0 items-center justify-center rounded-full transition",
+                            activeTheme
+                              ? "bg-white/[0.05] text-white/40 hover:bg-white/[0.09] hover:text-red-300"
+                              : "bg-muted text-muted-foreground hover:text-red-500",
+                          )}
+                          onClick={() => onRemove(index)}
+                          aria-label={`Remove ${file.name}`}
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      ) : null}
+                    </div>
+                    {previewUrl ? (
+                      <div
+                        className={cn(
+                          "mt-2 rounded-[14px] border px-2 py-1.5",
+                          activeTheme
+                            ? "border-white/[0.08] bg-black/12"
+                            : "border-border/70 bg-background/70",
+                        )}
+                      >
+                        <audio
+                          className="h-10 w-full"
+                          controls
+                          preload="metadata"
+                          src={previewUrl}
+                          aria-label={`Play ${file.name}`}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          )}
           {nonMediaFiles.length > 0 && (
             <div className="flex flex-col gap-1">
               {files.map((file, index) => {
-                if (file.type.startsWith("image/") || file.type.startsWith("video/")) return null;
+                if (file.type.startsWith("image/") || file.type.startsWith("video/") || isAudioFile(file)) return null;
                 return (
                   <div key={`${file.name}-${index}`} className="flex items-center gap-2">
                     <Paperclip
@@ -177,7 +302,7 @@ export function DraftAttachmentList({
                         activeTheme ? "text-white/30" : "text-muted-foreground/60",
                       )}
                     >
-                      {(file.size / 1024).toFixed(0)}KB
+                      {formatAttachmentKilobytes(file.size)}
                     </span>
                     <button
                       type="button"
@@ -338,6 +463,30 @@ function resolveAttachmentLocalPath(
   return null;
 }
 
+function toRenderableLocalAttachmentUrl(value: string): string {
+  if (value.startsWith("file://")) return value;
+  const normalized = normalizeLocalAttachmentPath(value).replace(/\\/g, "/");
+  const leadingSlash = /^[A-Za-z]:\//.test(normalized) ? "/" : "";
+  return `file://${leadingSlash}${encodeURI(normalized)}`;
+}
+
+function resolvePlayableAudioAttachmentUrl(
+  attachment: Pick<ChatAttachment, "localPath" | "previewUrl" | "mimeType">,
+): string | null {
+  if (!String(attachment.mimeType || "").toLowerCase().startsWith("audio/")) return null;
+
+  const localPath = resolveAttachmentLocalPath(attachment);
+  if (localPath) {
+    return toRenderableLocalAttachmentUrl(localPath);
+  }
+
+  const previewUrl = typeof attachment.previewUrl === "string" ? attachment.previewUrl.trim() : "";
+  if (!previewUrl) return null;
+  return isLocalAttachmentPath(previewUrl)
+    ? toRenderableLocalAttachmentUrl(previewUrl)
+    : previewUrl;
+}
+
 function doesAttachmentLocalFileExist(
   attachment: Pick<ChatAttachment, "localPath" | "previewUrl">,
 ): boolean {
@@ -459,6 +608,12 @@ function getMediaCardWidthClass(compact: boolean) {
 
 function getMediaCardFooterClass(compact: boolean) {
   return compact ? "h-9 px-2 py-1.5" : "h-10 px-2.5 py-2";
+}
+
+function getAudioAttachmentCardWidthClass(compact: boolean) {
+  return compact
+    ? "self-start w-[min(26rem,100%)] max-w-full"
+    : "self-start w-[min(34rem,100%)] max-w-full";
 }
 
 function useNearViewport<T extends HTMLElement>(enabled: boolean, rootMargin = "360px") {
@@ -872,8 +1027,9 @@ function VideoAttachmentCard({
   const localFileMissing = isAttachmentLocallyMissing(view);
   const hasLocalSource = Boolean(resolveAttachmentLocalPath(view));
   const canPreviewVideo = !!view.previewUrl && !signedUrlExpired && !localFileMissing;
+  const showFailedPreview = attachment.failed && canPreviewVideo;
   const canAddVideoToAssets =
-    !attachment.pending && !!view.previewUrl && !signedUrlExpired && !localFileMissing;
+    !attachment.pending && !attachment.failed && !!view.previewUrl && !signedUrlExpired && !localFileMissing;
   const [previewRef, nearViewport] = useNearViewport<HTMLDivElement>(canPreviewVideo && !attachment.pending);
   const {
     poster: cachedPoster,
@@ -954,6 +1110,13 @@ function VideoAttachmentCard({
               <span className="text-[12px] font-medium text-foreground/50">正在生成视频</span>
             </div>
           </div>
+        ) : attachment.failed && !view.previewUrl ? (
+          <div className="flex h-full w-full flex-col items-center justify-center gap-3 px-4 text-center">
+            <AlertCircle className="h-8 w-8 text-destructive/60" />
+            <span className="text-[12px] leading-5 text-destructive/70">
+              {attachment.failureReason || "生成失败"}
+            </span>
+          </div>
         ) : view.previewUrl ? (
           <div
             ref={previewRef}
@@ -971,7 +1134,7 @@ function VideoAttachmentCard({
               <img
                 src={cachedPoster}
                 alt={view.fileName}
-                className="h-full w-full object-contain"
+                className={cn("h-full w-full object-contain", showFailedPreview && "grayscale brightness-75")}
                 loading="lazy"
                 decoding="async"
               />
@@ -984,19 +1147,40 @@ function VideoAttachmentCard({
                 onLoadedMetadata={primePosterFrame}
                 onLoadedData={capturePoster}
                 onSeeked={capturePoster}
-                className="h-full w-full object-contain"
+                className={cn("h-full w-full object-contain", showFailedPreview && "grayscale brightness-75")}
               />
             ) : null}
             {canPreviewVideo ? (
               <>
-                <div className="absolute inset-0 flex items-center justify-center bg-black/25 transition-colors hover:bg-black/40">
-              <div className="flex h-14 w-14 items-center justify-center rounded-full bg-white/90 shadow-lg transition-transform group-hover:scale-105">
-                <Play className="ml-1 h-6 w-6 text-black" />
-              </div>
-            </div>
-                <div className="pointer-events-none absolute right-2 top-2 rounded-full bg-black/40 px-1.5 py-0.5 text-[9px] text-white/70 opacity-0 transition-opacity group-hover:opacity-100">
-                  可拖拽
+                <div
+                  className={cn(
+                    "absolute inset-0 flex items-center justify-center transition-colors",
+                    showFailedPreview ? "bg-zinc-900/45" : "bg-black/25 hover:bg-black/40",
+                  )}
+                >
+                  <div className="flex h-14 w-14 items-center justify-center rounded-full bg-white/90 shadow-lg transition-transform group-hover:scale-105">
+                    {showFailedPreview ? (
+                      <AlertCircle className="h-6 w-6 text-zinc-900" />
+                    ) : (
+                      <Play className="ml-1 h-6 w-6 text-black" />
+                    )}
+                  </div>
                 </div>
+                {attachment.failed ? (
+                  <div className="pointer-events-none absolute inset-x-3 bottom-3 rounded-xl border border-white/10 bg-black/70 px-3 py-2 text-left shadow-[0_10px_28px_rgba(0,0,0,0.28)] backdrop-blur-sm">
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-white/68">
+                      QA 未通过
+                    </div>
+                    <div className="mt-1 text-[11px] leading-4.5 text-white/88">
+                      {attachment.failureReason || "鐢熸垚澶辫触"}
+                    </div>
+                  </div>
+                ) : null}
+                {!attachment.failed ? (
+                  <div className="pointer-events-none absolute right-2 top-2 rounded-full bg-black/40 px-1.5 py-0.5 text-[9px] text-white/70 opacity-0 transition-opacity group-hover:opacity-100">
+                    可拖拽
+                  </div>
+                ) : null}
               </>
             ) : (
               <div className="absolute inset-0 bg-black/65">
@@ -1174,7 +1358,8 @@ export function MessageAttachmentList({
 
   const imageAttachments = attachments.filter((a) => a.kind === "image");
   const videoAttachments = attachments.filter((a) => a.kind === "video");
-  const nonMediaAttachments = attachments.filter((a) => a.kind !== "image" && a.kind !== "video");
+  const audioAttachments = attachments.filter((a) => isAudioAttachment(a));
+  const nonMediaAttachments = attachments.filter((a) => a.kind !== "image" && a.kind !== "video" && !isAudioAttachment(a));
   const globalImages = (allConversationImages ?? imageAttachments)
     .map((attachment) => getAttachmentViewModel(attachment, selectedVersionIndices[attachment.id]))
     .filter((attachment) =>
@@ -1467,6 +1652,118 @@ export function MessageAttachmentList({
         </div>
       )}
 
+      {audioAttachments.length > 0 && (
+        <div className={cn("mt-2 flex w-full flex-col items-start gap-1.5")}>
+          {audioAttachments.map((attachment) => {
+            const selectedVersionIndex = selectedVersionIndices[attachment.id];
+            const view = getAttachmentViewModel(attachment, selectedVersionIndex);
+            const playableAudioUrl = resolvePlayableAudioAttachmentUrl(view);
+            const hasLocalSource = Boolean(resolveAttachmentLocalPath(view));
+            const audioTitle = view.label?.trim() ? view.label.trim() : view.fileName;
+            const audioFileName =
+              view.label?.trim() && view.label.trim() !== view.fileName.trim()
+                ? view.fileName
+                : null;
+            const audioMeta = [formatAttachmentKilobytes(view.size), view.activeVersionLabel].filter(Boolean);
+
+            return (
+              <div
+                key={attachment.id}
+                className={cn(
+                  getAudioAttachmentCardWidthClass(compact),
+                  "rounded-[18px] border px-3 py-2 shadow-[0_12px_28px_rgba(0,0,0,0.16)]",
+                  activeTheme
+                    ? "border-white/[0.1] bg-white/[0.05] text-white/78"
+                    : "border-border/90 bg-muted/20 text-foreground/82",
+                  compact && "rounded-2xl px-2.5 py-2 shadow-none",
+                )}
+              >
+                <div className="flex items-start gap-3">
+                  <span
+                    className={cn(
+                      "mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full",
+                      activeTheme ? "bg-white/[0.08] text-white/78" : "bg-muted text-foreground/75",
+                    )}
+                  >
+                    <AudioLines className="h-4 w-4" />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="whitespace-normal break-all text-[11.5px] font-medium leading-4.5">
+                      {audioTitle}
+                    </div>
+                    {audioFileName ? (
+                      <div
+                        className={cn(
+                          "mt-0.5 whitespace-normal break-all text-[10.5px] leading-4",
+                          activeTheme ? "text-white/58" : "text-foreground/70",
+                        )}
+                      >
+                        {audioFileName}
+                      </div>
+                    ) : null}
+                    <div
+                      className={cn(
+                        "mt-0.5 text-[10px] leading-4",
+                        activeTheme ? "text-white/38" : "text-muted-foreground/80",
+                      )}
+                    >
+                      {audioMeta.join(" / ")}
+                    </div>
+                  </div>
+                  {hasLocalSource ? (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void revealAttachmentInFolder(view);
+                      }}
+                      className={cn(
+                        "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition",
+                        activeTheme
+                          ? "bg-white/[0.08] text-white/70 hover:bg-white/[0.14] hover:text-white"
+                          : "bg-muted/80 text-foreground/60 hover:bg-muted hover:text-foreground",
+                      )}
+                      title="Reveal local file"
+                    >
+                      <FolderOpen className="h-3.5 w-3.5" />
+                    </button>
+                  ) : null}
+                </div>
+                {playableAudioUrl ? (
+                  <div
+                    className={cn(
+                      "mt-2 rounded-[14px] border px-2 py-1.5",
+                      activeTheme
+                        ? "border-white/[0.08] bg-black/12"
+                        : "border-border/70 bg-background/70",
+                    )}
+                  >
+                    <audio
+                      className="h-10 w-full"
+                      controls
+                      preload="metadata"
+                      aria-label={`Play ${view.fileName}`}
+                    >
+                      <source src={playableAudioUrl} type={view.mimeType || undefined} />
+                    </audio>
+                  </div>
+                ) : (
+                  <div
+                    className={cn(
+                      "mt-3 rounded-[18px] border px-3 py-2.5 text-[11px]",
+                      activeTheme
+                        ? "border-white/[0.08] bg-black/10 text-white/55"
+                        : "border-border bg-muted/30 text-muted-foreground",
+                    )}
+                  >
+                    当前音频暂时无法播放，请重新上传后再试。
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
       {nonMediaAttachments.length > 0 && (
         <div className={cn("mt-2 flex flex-wrap gap-2")}>
           {nonMediaAttachments.map((attachment) => {

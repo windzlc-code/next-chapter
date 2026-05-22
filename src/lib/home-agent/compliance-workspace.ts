@@ -17,6 +17,7 @@ import {
 const DEFAULT_MODEL: ComplianceWorkspaceModel = "gemini-3.1-pro-preview";
 const CJK_SEGMENT_LIMIT = 10_000;
 const LATIN_SEGMENT_LIMIT = 25_000;
+const DIALOGUE_REVIEW_MARKER = "【对话审查】";
 
 export const COMPLIANCE_MODEL_OPTIONS: Array<{ value: ComplianceWorkspaceModel; label: string }> = [
   { value: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro" },
@@ -78,6 +79,10 @@ export function normalizeComplianceWorkspace(
     ...base,
     sourceText: typeof workspace.sourceText === "string" ? workspace.sourceText : "",
     paletteText: typeof workspace.paletteText === "string" ? workspace.paletteText : "",
+    reviewBaselineSourceText:
+      typeof workspace.reviewBaselineSourceText === "string" ? workspace.reviewBaselineSourceText : "",
+    reviewBaselineReviewedAt:
+      typeof workspace.reviewBaselineReviewedAt === "string" ? workspace.reviewBaselineReviewedAt : null,
     reviewMode: workspace.reviewMode === "script" ? "script" : "text",
     strictness:
       workspace.strictness === "strict" || workspace.strictness === "extreme"
@@ -99,6 +104,16 @@ export function normalizeComplianceWorkspace(
                 : 0,
             replacement: typeof phrase.replacement === "string" ? phrase.replacement : undefined,
             status: phrase.status === "resolved" ? "resolved" : "pending",
+            normalizedText:
+              typeof phrase.normalizedText === "string" ? phrase.normalizedText : undefined,
+            sourceStart:
+              typeof phrase.sourceStart === "number" && Number.isFinite(phrase.sourceStart)
+                ? phrase.sourceStart
+                : undefined,
+            sourceEnd:
+              typeof phrase.sourceEnd === "number" && Number.isFinite(phrase.sourceEnd)
+                ? phrase.sourceEnd
+                : undefined,
           }))
       : [],
     riskSpans: Array.isArray(workspace.riskSpans)
@@ -263,12 +278,16 @@ export function buildComplianceSourceText(
 ): string {
   if (typeof input.sourceText === "string" && input.sourceText.trim()) return input.sourceText;
   const workspace = normalizeComplianceWorkspace(project.complianceWorkspace);
-  if (workspace.sourceText.trim()) return workspace.sourceText;
-  if (!project.episodes.length) return "";
-  return project.episodes
+  const requestedReviewMode =
+    input.reviewMode === "text" || input.reviewMode === "script" ? input.reviewMode : workspace.reviewMode;
+  const scriptSource = project.episodes
     .sort((a, b) => a.number - b.number)
     .map((episode) => `第${episode.number}集 ${episode.title}\n${episode.content}`)
     .join("\n\n---\n\n");
+  if (input.sourceStrategy === "project-script" && scriptSource.trim()) return scriptSource;
+  if (requestedReviewMode === "script" && scriptSource.trim()) return scriptSource;
+  if (workspace.sourceText.trim()) return workspace.sourceText;
+  return scriptSource;
 }
 
 export function splitComplianceSourceText(text: string): string[] {
@@ -445,14 +464,45 @@ function countDialogueWords(line: string): number {
   return content.split(/\s+/).filter(Boolean).length;
 }
 
+function stripDialogueReviewMarker(line: string): string {
+  return line.replace(new RegExp(`^${DIALOGUE_REVIEW_MARKER}\\s*`), "");
+}
+
+function stripDialogueReviewMarkers(text: string): string {
+  return text
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => stripDialogueReviewMarker(line))
+    .join("\n");
+}
+
 export function deriveDialogueOverLimitLineIndexes(text: string, enabled: boolean): number[] {
+  const normalizedText = stripDialogueReviewMarkers(text);
   if (!enabled) return [];
-  return text.replace(/\r/g, "").split("\n").reduce<number[]>((acc, line, index) => {
+  return normalizedText.split("\n").reduce<number[]>((acc, line, index) => {
     if (!splitDialogue(line)) return acc;
     const wordCount = countDialogueWords(line);
     if (wordCount >= (isCjk(line) ? 36 : 24)) acc.push(index);
     return acc;
   }, []);
+}
+
+export function applyDialogueReviewMarkers(
+  text: string,
+  enabled: boolean,
+): { paletteText: string; lineIndexes: number[] } {
+  const normalizedText = stripDialogueReviewMarkers(text);
+  const lineIndexes = deriveDialogueOverLimitLineIndexes(normalizedText, enabled);
+  if (!normalizedText.trim()) {
+    return { paletteText: normalizedText, lineIndexes };
+  }
+  return {
+    paletteText: normalizedText
+      .split("\n")
+      .map((line, index) => (lineIndexes.includes(index) ? `${DIALOGUE_REVIEW_MARKER} ${line}` : line))
+      .join("\n"),
+    lineIndexes,
+  };
 }
 
 function pushHistory(workspace: ComplianceWorkspace, value: string): Pick<ComplianceWorkspace, "history" | "historyIndex"> {
@@ -586,11 +636,11 @@ export async function executeComplianceReview(params: {
       ? reports[0]
       : reports.map((segmentReport, index) => `## 分段 ${index + 1}/${reports.length}\n${segmentReport}`).join("\n\n");
   const riskPhrases = extractComplianceRiskPhrases(report);
-  const paletteText = base.paletteText.trim() || sourceText;
-  const history = pushHistory(base, paletteText);
+  const dialogueReview = applyDialogueReviewMarkers(sourceText, base.dialogueReviewEnabled);
+  const history = pushHistory(base, dialogueReview.paletteText);
   const nextWorkspace = normalizeComplianceWorkspace({
     ...workspace,
-    paletteText,
+    paletteText: dialogueReview.paletteText,
     riskPhrases,
     riskSpans: locateComplianceRiskSpans(sourceText, riskPhrases),
     phraseReplacements: {},
@@ -603,7 +653,7 @@ export async function executeComplianceReview(params: {
     },
     history: history.history,
     historyIndex: history.historyIndex,
-    dialogueOverLimitLineIndexes: deriveDialogueOverLimitLineIndexes(sourceText, base.dialogueReviewEnabled),
+    dialogueOverLimitLineIndexes: dialogueReview.lineIndexes,
   });
   return {
     report,
@@ -631,36 +681,48 @@ export function applyComplianceReplacement(params: {
     phrase.text,
     params.replacement.trim(),
   );
-  const history = pushHistory(workspace, nextPalette);
+  const dialogueReview = applyDialogueReviewMarkers(nextPalette, workspace.dialogueReviewEnabled);
+  const history = pushHistory(workspace, dialogueReview.paletteText);
   return normalizeComplianceWorkspace({
     ...workspace,
-    paletteText: nextPalette,
+    paletteText: dialogueReview.paletteText,
     phraseReplacements: { ...workspace.phraseReplacements, [params.riskId]: params.replacement.trim() },
     riskPhrases: workspace.riskPhrases.map((entry) =>
       entry.id === params.riskId ? { ...entry, replacement: params.replacement.trim(), status: "resolved" } : entry,
     ),
     history: history.history,
     historyIndex: history.historyIndex,
+    dialogueOverLimitLineIndexes: dialogueReview.lineIndexes,
   });
 }
 
 export function applyComplianceUndo(workspace: ComplianceWorkspace): ComplianceWorkspace {
   const normalized = normalizeComplianceWorkspace(workspace);
   if (normalized.historyIndex <= 0) return normalized;
+  const dialogueReview = applyDialogueReviewMarkers(
+    normalized.history[normalized.historyIndex - 1] ?? normalized.paletteText,
+    normalized.dialogueReviewEnabled,
+  );
   return normalizeComplianceWorkspace({
     ...normalized,
-    paletteText: normalized.history[normalized.historyIndex - 1] ?? normalized.paletteText,
+    paletteText: dialogueReview.paletteText,
     historyIndex: normalized.historyIndex - 1,
+    dialogueOverLimitLineIndexes: dialogueReview.lineIndexes,
   });
 }
 
 export function applyComplianceRedo(workspace: ComplianceWorkspace): ComplianceWorkspace {
   const normalized = normalizeComplianceWorkspace(workspace);
   if (normalized.historyIndex >= normalized.history.length - 1) return normalized;
+  const dialogueReview = applyDialogueReviewMarkers(
+    normalized.history[normalized.historyIndex + 1] ?? normalized.paletteText,
+    normalized.dialogueReviewEnabled,
+  );
   return normalizeComplianceWorkspace({
     ...normalized,
-    paletteText: normalized.history[normalized.historyIndex + 1] ?? normalized.paletteText,
+    paletteText: dialogueReview.paletteText,
     historyIndex: normalized.historyIndex + 1,
+    dialogueOverLimitLineIndexes: dialogueReview.lineIndexes,
   });
 }
 

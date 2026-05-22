@@ -8,8 +8,15 @@ export function stripHiddenThoughtBlocks(text: string): string {
     .replace(/^\s*<\/?think>\s*$/gim, "")
     // 移除完整的 <function_calls>...</function_calls> 工具调用块（含多行）
     .replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, "")
+    // 移除未闭合的 <function_calls> 残段，避免把参数正文漏到前台
+    .replace(/<function_calls>[\s\S]*$/gi, "")
     // 移除残留的 <invoke ...>...</invoke> 块
     .replace(/<invoke[\s\S]*?<\/invoke>/gi, "")
+    // 移除未闭合的 <invoke ...> 残段
+    .replace(/<invoke[\s\S]*$/gi, "")
+    // 移除完整或未闭合的 parameter 块，避免露出英文 prompt 正文
+    .replace(/<parameter[^>]*>[\s\S]*?<\/parameter>/gi, "")
+    .replace(/<parameter[^>]*>[\s\S]*$/gi, "")
     // 移除残留的单个工具调用标签行
     .replace(/<\/?(function_calls|invoke|parameter)[^>]*>/gi, "")
     // 移除 LLM 暴露的工具调用描述行，如 "执行动作:" / "执行操作:"

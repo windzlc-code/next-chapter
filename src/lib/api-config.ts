@@ -1,6 +1,8 @@
 import {
   getServerProxyEndpoint,
   shouldPreferServerProxyDefaults,
+  shouldUseServerProxyRouting,
+  isServerProxyEndpoint,
 } from "@/lib/server-proxy";
 
 export type ApiMode = "builtin";
@@ -11,6 +13,10 @@ const DEFAULT_NETWORK_RETRY_DELAY_MS = 800;
 export interface BuiltinApiBundle {
   geminiEndpoint?: string;
   geminiKey?: string;
+  aliyunEndpoint?: string;
+  aliyunKey?: string;
+  runninghubEndpoint?: string;
+  runninghubKey?: string;
   gptEndpoint?: string;
   gptKey?: string;
   claudeEndpoint?: string;
@@ -29,7 +35,7 @@ export interface BuiltinApiBundle {
 export interface SupportedModelMapping {
   key: string;
   label: string;
-  provider: "gemini" | "gpt" | "claude" | "grok" | "seedream" | "jimeng" | "tuzi";
+  provider: "gemini" | "gpt" | "claude" | "grok" | "seedream" | "jimeng" | "aliyun" | "tuzi";
   category: "text" | "image" | "video";
   defaultModelName: string;
 }
@@ -38,6 +44,10 @@ export interface ApiConfig {
   apiMode: ApiMode;
   geminiEndpoint: string;
   geminiKey: string;
+  aliyunEndpoint: string;
+  aliyunKey: string;
+  runninghubEndpoint: string;
+  runninghubKey: string;
   gptEndpoint: string;
   gptKey: string;
   claudeEndpoint: string;
@@ -280,18 +290,25 @@ export const SUPPORTED_MODEL_MAPPINGS: SupportedModelMapping[] = [
     defaultModelName: "doubao-seedance-1-5-pro_1080p",
   },
   {
-    key: "seedance2.0",
-    label: "Seedance 2.0 (Dreamina CLI)",
+    key: "doubao-seedance-2-0-260128",
+    label: "Seedance 2.0",
     provider: "jimeng",
     category: "video",
-    defaultModelName: "seedance2.0",
+    defaultModelName: "doubao-seedance-2-0-260128",
   },
   {
-    key: "seedance2.0fast",
-    label: "Seedance 2.0 Fast (Dreamina CLI)",
+    key: "doubao-seedance-2-0-fast-260128",
+    label: "Seedance 2.0 Fast",
     provider: "jimeng",
     category: "video",
-    defaultModelName: "seedance2.0fast",
+    defaultModelName: "doubao-seedance-2-0-fast-260128",
+  },
+  {
+    key: "happyhorse-1.0",
+    label: "HappyHorse 1.0",
+    provider: "aliyun",
+    category: "video",
+    defaultModelName: "happyhorse-1.0",
   },
   {
     key: "sora-2",
@@ -361,7 +378,12 @@ function resolveModelMappingWithConfig(config: Pick<ApiConfig, "jimengEndpoint" 
 
 const STORAGE_KEY = "storyforge_api_config";
 const OBF_PREFIX = "obf:";
+const WORKFLOW_SESSION_ENDPOINT = "/api/workflow/session";
+const WORKFLOW_CONFIG_ENDPOINT = "/api/workflow/config";
 let builtinApiBundleCache: BuiltinApiBundle | null | undefined;
+let localProxySessionPromise: Promise<void> | null = null;
+let localProxySyncChain: Promise<void> = Promise.resolve();
+let lastLocalProxyConfigSnapshot = "";
 
 function emitApiConfigUpdated(): void {
   if (typeof window === "undefined") return;
@@ -390,6 +412,8 @@ function deobfuscate(value: string): string {
 
 const SENSITIVE_KEYS: (keyof ApiConfig)[] = [
   "geminiKey",
+  "aliyunKey",
+  "runninghubKey",
   "gptKey",
   "claudeKey",
   "grokKey",
@@ -402,6 +426,10 @@ export const DEFAULT_API_CONFIG: ApiConfig = {
   apiMode: "builtin",
   geminiEndpoint: "",
   geminiKey: "",
+  aliyunEndpoint: "",
+  aliyunKey: "",
+  runninghubEndpoint: "",
+  runninghubKey: "",
   gptEndpoint: "",
   gptKey: "",
   claudeEndpoint: "",
@@ -423,6 +451,51 @@ export const DEFAULT_API_CONFIG: ApiConfig = {
   storagePath: "",
 };
 
+const SERVER_PROXY_ROUTE_ENDPOINTS: Record<
+  | "geminiEndpoint"
+  | "gptEndpoint"
+  | "claudeEndpoint"
+  | "grokEndpoint"
+  | "aliyunEndpoint"
+  | "runninghubEndpoint"
+  | "seedreamEndpoint"
+  | "jimengEndpoint"
+  | "tuziEndpoint",
+  string
+> = {
+  geminiEndpoint: getServerProxyEndpoint("gemini"),
+  gptEndpoint: getServerProxyEndpoint("gpt"),
+  claudeEndpoint: getServerProxyEndpoint("claude"),
+  grokEndpoint: getServerProxyEndpoint("grok"),
+  aliyunEndpoint: getServerProxyEndpoint("aliyun"),
+  runninghubEndpoint: getServerProxyEndpoint("runninghub"),
+  seedreamEndpoint: getServerProxyEndpoint("seedream"),
+  jimengEndpoint: getServerProxyEndpoint("jimeng"),
+  tuziEndpoint: getServerProxyEndpoint("tuzi"),
+};
+
+const SERVER_PROXY_SYNC_FIELDS: (keyof ApiConfig)[] = [
+  "geminiEndpoint",
+  "geminiKey",
+  "gptEndpoint",
+  "gptKey",
+  "claudeEndpoint",
+  "claudeKey",
+  "grokEndpoint",
+  "grokKey",
+  "aliyunEndpoint",
+  "aliyunKey",
+  "runninghubEndpoint",
+  "runninghubKey",
+  "seedreamEndpoint",
+  "seedreamKey",
+  "jimengEndpoint",
+  "jimengKey",
+  "tuziEndpoint",
+  "tuziKey",
+  "jimengExecutionMode",
+];
+
 function readEnvString(name: string): string {
   const env = import.meta.env as Record<string, string | undefined>;
   const value = env[name];
@@ -436,6 +509,8 @@ function getPreferredProxyDefaults(): Partial<ApiConfig> {
     gptEndpoint: getServerProxyEndpoint("gpt"),
     claudeEndpoint: getServerProxyEndpoint("claude"),
     grokEndpoint: getServerProxyEndpoint("grok"),
+    aliyunEndpoint: getServerProxyEndpoint("aliyun"),
+    runninghubEndpoint: getServerProxyEndpoint("runninghub"),
     seedreamEndpoint: getServerProxyEndpoint("seedream"),
     jimengEndpoint: getServerProxyEndpoint("jimeng"),
     tuziEndpoint: getServerProxyEndpoint("tuzi"),
@@ -455,6 +530,10 @@ function getEnvDefaultApiConfig(): Partial<ApiConfig> {
       proxyDefaults.geminiEndpoint ||
       imageEndpoint,
     geminiKey: readEnvString("VITE_DEFAULT_GEMINI_KEY") || unifiedKey,
+    aliyunEndpoint: readEnvString("VITE_DEFAULT_ALIYUN_ENDPOINT"),
+    aliyunKey: readEnvString("VITE_DEFAULT_ALIYUN_KEY"),
+    runninghubEndpoint: readEnvString("VITE_DEFAULT_RUNNINGHUB_ENDPOINT"),
+    runninghubKey: readEnvString("VITE_DEFAULT_RUNNINGHUB_KEY"),
     gptEndpoint:
       readEnvString("VITE_DEFAULT_GPT_ENDPOINT") ||
       proxyDefaults.gptEndpoint ||
@@ -480,11 +559,6 @@ function getEnvDefaultApiConfig(): Partial<ApiConfig> {
       proxyDefaults.jimengEndpoint ||
       videoEndpoint,
     jimengKey: readEnvString("VITE_DEFAULT_JIMENG_KEY") || unifiedKey,
-    jimengExecutionMode:
-      readEnvString("VITE_DEFAULT_JIMENG_EXECUTION_MODE") === "api" ||
-      readEnvString("VITE_DEFAULT_JIMENG_EXECUTION_MODE") === "cli"
-        ? (readEnvString("VITE_DEFAULT_JIMENG_EXECUTION_MODE") as JimengExecutionMode)
-        : undefined,
     tuziEndpoint:
       readEnvString("VITE_DEFAULT_TUZI_ENDPOINT") ||
       proxyDefaults.tuziEndpoint ||
@@ -500,12 +574,21 @@ function applyProxyEndpointFallbacks(config: ApiConfig): ApiConfig {
   return {
     ...config,
     geminiEndpoint: config.geminiEndpoint || proxyDefaults.geminiEndpoint || "",
+    aliyunEndpoint: config.aliyunEndpoint || proxyDefaults.aliyunEndpoint || "",
     gptEndpoint: config.gptEndpoint || proxyDefaults.gptEndpoint || "",
     claudeEndpoint: config.claudeEndpoint || proxyDefaults.claudeEndpoint || "",
     grokEndpoint: config.grokEndpoint || proxyDefaults.grokEndpoint || "",
     seedreamEndpoint: config.seedreamEndpoint || proxyDefaults.seedreamEndpoint || "",
     jimengEndpoint: config.jimengEndpoint || proxyDefaults.jimengEndpoint || "",
     tuziEndpoint: config.tuziEndpoint || proxyDefaults.tuziEndpoint || "",
+  };
+}
+
+function applyServerProxyEndpointRouting(config: ApiConfig): ApiConfig {
+  if (!shouldUseServerProxyRouting()) return config;
+  return {
+    ...config,
+    ...SERVER_PROXY_ROUTE_ENDPOINTS,
   };
 }
 
@@ -517,6 +600,13 @@ function normalizeStoredConfig(config: Partial<ApiConfig>): ApiConfig {
     geminiEndpoint:
       typeof config.geminiEndpoint === "string" ? config.geminiEndpoint.trim() : "",
     geminiKey: typeof config.geminiKey === "string" ? config.geminiKey.trim() : "",
+    aliyunEndpoint:
+      typeof config.aliyunEndpoint === "string" ? config.aliyunEndpoint.trim() : "",
+    aliyunKey: typeof config.aliyunKey === "string" ? config.aliyunKey.trim() : "",
+    runninghubEndpoint:
+      typeof config.runninghubEndpoint === "string" ? config.runninghubEndpoint.trim() : "",
+    runninghubKey:
+      typeof config.runninghubKey === "string" ? config.runninghubKey.trim() : "",
     gptEndpoint: typeof config.gptEndpoint === "string" ? config.gptEndpoint.trim() : "",
     gptKey: typeof config.gptKey === "string" ? config.gptKey.trim() : "",
     claudeEndpoint:
@@ -531,12 +621,10 @@ function normalizeStoredConfig(config: Partial<ApiConfig>): ApiConfig {
     jimengEndpoint:
       typeof config.jimengEndpoint === "string" ? config.jimengEndpoint.trim() : "",
     jimengKey: typeof config.jimengKey === "string" ? config.jimengKey.trim() : "",
-    jimengExecutionMode:
-      config.jimengExecutionMode === "api" || config.jimengExecutionMode === "cli"
-        ? config.jimengExecutionMode
-        : "api",
+    jimengExecutionMode: config.jimengExecutionMode === "cli" ? "cli" : "api",
     tuziEndpoint: typeof config.tuziEndpoint === "string" ? config.tuziEndpoint.trim() : "",
     tuziKey: typeof config.tuziKey === "string" ? config.tuziKey.trim() : "",
+    storagePath: "",
     modelMappings: normalizeModelMappings(config.modelMappings),
   };
 }
@@ -553,10 +641,29 @@ function getBuiltinApiBundle(): BuiltinApiBundle | null {
   return builtinApiBundleCache;
 }
 
+function getLatestBuiltinApiBundleForHydration(): BuiltinApiBundle | null {
+  try {
+    const runtimeBundle = window.electronAPI?.runtime?.builtinApiBundle;
+    if (runtimeBundle && typeof runtimeBundle === "object") {
+      const sanitized = sanitizeBuiltinApiBundle(runtimeBundle);
+      builtinApiBundleCache = sanitized;
+      return sanitized;
+    }
+  } catch {
+    // Fall through to the cached bundle below.
+  }
+  return getBuiltinApiBundle();
+}
+
 function sanitizeBuiltinApiBundle(input: Partial<BuiltinApiBundle>): BuiltinApiBundle {
   return {
     geminiEndpoint: typeof input.geminiEndpoint === "string" ? input.geminiEndpoint.trim() : "",
     geminiKey: typeof input.geminiKey === "string" ? input.geminiKey.trim() : "",
+    aliyunEndpoint: typeof input.aliyunEndpoint === "string" ? input.aliyunEndpoint.trim() : "",
+    aliyunKey: typeof input.aliyunKey === "string" ? input.aliyunKey.trim() : "",
+    runninghubEndpoint:
+      typeof input.runninghubEndpoint === "string" ? input.runninghubEndpoint.trim() : "",
+    runninghubKey: typeof input.runninghubKey === "string" ? input.runninghubKey.trim() : "",
     gptEndpoint: typeof input.gptEndpoint === "string" ? input.gptEndpoint.trim() : "",
     gptKey: typeof input.gptKey === "string" ? input.gptKey.trim() : "",
     claudeEndpoint: typeof input.claudeEndpoint === "string" ? input.claudeEndpoint.trim() : "",
@@ -632,6 +739,7 @@ export function getStoredApiConfig(): ApiConfig {
     } as ApiConfig;
     merged = applyLegacyCompatibility(parsed, merged);
     merged = decodeSensitiveFields(merged);
+    merged = applyEmptyFieldFallbacks(merged, envDefaults);
     return applyProxyEndpointFallbacks(normalizeStoredConfig(merged));
   } catch {
     return applyProxyEndpointFallbacks(normalizeStoredConfig({
@@ -683,6 +791,45 @@ function decodeSensitiveFields(config: ApiConfig): ApiConfig {
   return next;
 }
 
+function applyEmptyFieldFallbacks(
+  config: ApiConfig,
+  defaults: Partial<ApiConfig>,
+): ApiConfig {
+  const next = { ...config };
+  for (const field of [
+    "geminiEndpoint",
+    "geminiKey",
+    "aliyunEndpoint",
+    "aliyunKey",
+    "runninghubEndpoint",
+    "runninghubKey",
+    "gptEndpoint",
+    "gptKey",
+    "claudeEndpoint",
+    "claudeKey",
+    "grokEndpoint",
+    "grokKey",
+    "seedreamEndpoint",
+    "seedreamKey",
+    "jimengEndpoint",
+    "jimengKey",
+    "tuziEndpoint",
+    "tuziKey",
+  ] satisfies Array<keyof ApiConfig>) {
+    const currentValue = next[field];
+    const fallbackValue = defaults[field];
+    if (
+      typeof currentValue === "string" &&
+      !currentValue.trim() &&
+      typeof fallbackValue === "string" &&
+      fallbackValue.trim()
+    ) {
+      next[field] = fallbackValue.trim() as ApiConfig[typeof field];
+    }
+  }
+  return next;
+}
+
 function applyBuiltinOverlay(config: ApiConfig): ApiConfig {
   const normalizedConfig = normalizeStoredConfig(config);
   const builtin = getBuiltinApiBundle();
@@ -717,6 +864,10 @@ function applyBuiltinOverlay(config: ApiConfig): ApiConfig {
     ...normalizedConfig,
     geminiEndpoint,
     geminiKey,
+    aliyunEndpoint: pick("aliyunEndpoint", "aliyunEndpoint"),
+    aliyunKey: pick("aliyunKey", "aliyunKey"),
+    runninghubEndpoint: pick("runninghubEndpoint", "runninghubEndpoint"),
+    runninghubKey: pick("runninghubKey", "runninghubKey"),
     gptEndpoint: pick("gptEndpoint", "gptEndpoint") || geminiEndpoint,
     gptKey: pick("gptKey", "gptKey") || geminiKey,
     claudeEndpoint: pick("claudeEndpoint", "claudeEndpoint") || geminiEndpoint,
@@ -727,7 +878,7 @@ function applyBuiltinOverlay(config: ApiConfig): ApiConfig {
     seedreamKey: pick("seedreamKey", "seedreamKey") || geminiKey,
     jimengEndpoint: pick("jimengEndpoint", "jimengEndpoint") || geminiEndpoint,
     jimengKey: pick("jimengKey", "jimengKey") || geminiKey,
-    jimengExecutionMode: normalizedConfig.jimengExecutionMode,
+    jimengExecutionMode: "api",
     tuziEndpoint: pick("tuziEndpoint", "tuziEndpoint"),
     tuziKey: pick("tuziKey", "tuziKey"),
     modelMappings: {
@@ -744,22 +895,73 @@ export function resolveApiConfigForRuntime(config: ApiConfig): ApiConfig {
 
 export function resolveJimengExecutionMode(
   config: Pick<ApiConfig, "jimengExecutionMode">,
-  options?: {
-    dreaminaCliAccessible?: boolean;
-  },
+  options?: object,
 ): JimengExecutionMode {
-  if (config.jimengExecutionMode === "api" || config.jimengExecutionMode === "cli") {
-    return config.jimengExecutionMode;
-  }
-  return options?.dreaminaCliAccessible ? "cli" : "api";
+  void config;
+  void options;
+  return "api";
 }
 
 export function getApiConfig(): ApiConfig {
   try {
-    return applyProxyEndpointFallbacks(resolveApiConfigForRuntime(getStoredApiConfig()));
+    return applyServerProxyEndpointRouting(
+      applyProxyEndpointFallbacks(resolveApiConfigForRuntime(getStoredApiConfig())),
+    );
   } catch {
-    return applyProxyEndpointFallbacks(applyBuiltinOverlay(DEFAULT_API_CONFIG));
+    return applyServerProxyEndpointRouting(
+      applyProxyEndpointFallbacks(applyBuiltinOverlay(DEFAULT_API_CONFIG)),
+    );
   }
+}
+
+function toComparableApiConfigSnapshot(config: ApiConfig): string {
+  const normalized = normalizeStoredConfig(config);
+  const sortedModelMappings = Object.fromEntries(
+    Object.entries(normalizeModelMappings(normalized.modelMappings)).sort(([left], [right]) =>
+      left.localeCompare(right),
+    ),
+  );
+  return JSON.stringify({
+    ...normalized,
+    modelMappings: sortedModelMappings,
+  });
+}
+
+export function hydrateStoredApiConfigFromBuiltinBundle(): boolean {
+  const builtin = getLatestBuiltinApiBundleForHydration();
+  if (!builtin) return false;
+
+  const current = getStoredApiConfig();
+  const resolved = resolveApiConfigForRuntime(current);
+  const next = normalizeStoredConfig({
+    ...current,
+    geminiEndpoint: resolved.geminiEndpoint,
+    geminiKey: resolved.geminiKey,
+    aliyunEndpoint: resolved.aliyunEndpoint,
+    aliyunKey: resolved.aliyunKey,
+    runninghubEndpoint: resolved.runninghubEndpoint,
+    runninghubKey: resolved.runninghubKey,
+    gptEndpoint: resolved.gptEndpoint,
+    gptKey: resolved.gptKey,
+    claudeEndpoint: resolved.claudeEndpoint,
+    claudeKey: resolved.claudeKey,
+    grokEndpoint: resolved.grokEndpoint,
+    grokKey: resolved.grokKey,
+    seedreamEndpoint: resolved.seedreamEndpoint,
+    seedreamKey: resolved.seedreamKey,
+    jimengEndpoint: resolved.jimengEndpoint,
+    jimengKey: resolved.jimengKey,
+    tuziEndpoint: resolved.tuziEndpoint,
+    tuziKey: resolved.tuziKey,
+    modelMappings: resolved.modelMappings,
+  });
+
+  if (toComparableApiConfigSnapshot(current) === toComparableApiConfigSnapshot(next)) {
+    return false;
+  }
+
+  saveApiConfig(next);
+  return true;
 }
 
 export function saveApiConfig(config: Partial<ApiConfig>): void {
@@ -779,8 +981,92 @@ export function saveApiConfig(config: Partial<ApiConfig>): void {
   emitApiConfigUpdated();
 }
 
+function canSyncApiConfigToServerProxy(): boolean {
+  return shouldUseServerProxyRouting() && typeof fetch === "function";
+}
+
+function sanitizeServerProxySyncEndpoint(value: string): string {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return "";
+  return isServerProxyEndpoint(trimmed) ? "" : trimmed;
+}
+
+function buildServerProxySyncPayload(config: ApiConfig): Partial<ApiConfig> {
+  return SERVER_PROXY_SYNC_FIELDS.reduce<Partial<ApiConfig>>((acc, field) => {
+    const value = config[field];
+    if (typeof value === "string") {
+      acc[field] = field.endsWith("Endpoint")
+        ? sanitizeServerProxySyncEndpoint(value)
+        : value.trim();
+    }
+    return acc;
+  }, {});
+}
+
+async function ensureServerProxyWorkflowSession(): Promise<void> {
+  if (!canSyncApiConfigToServerProxy()) return;
+  if (!localProxySessionPromise) {
+    localProxySessionPromise = (async () => {
+      const response = await fetch(WORKFLOW_SESSION_ENDPOINT, {
+        method: "POST",
+        credentials: "same-origin",
+      });
+      if (!response.ok) {
+        throw new Error(`Failed to initialize local proxy session (${response.status})`);
+      }
+    })().catch((error) => {
+      localProxySessionPromise = null;
+      throw error;
+    });
+  }
+  await localProxySessionPromise;
+}
+
+export async function syncApiConfigToServerProxy(
+  config?: Partial<ApiConfig>,
+): Promise<boolean> {
+  if (!canSyncApiConfigToServerProxy()) return false;
+
+  const merged = normalizeStoredConfig({
+    ...getStoredApiConfig(),
+    ...(config || {}),
+  });
+  const runtimeConfig = resolveApiConfigForRuntime(merged);
+  const payload = buildServerProxySyncPayload(runtimeConfig);
+  const snapshot = JSON.stringify(payload);
+  if (snapshot === lastLocalProxyConfigSnapshot) {
+    return true;
+  }
+
+  await ensureServerProxyWorkflowSession();
+  const response = await fetch(WORKFLOW_CONFIG_ENDPOINT, {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: snapshot,
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to sync API config to local proxy (${response.status})`);
+  }
+  lastLocalProxyConfigSnapshot = snapshot;
+  return true;
+}
+
+export function queueApiConfigSyncToServerProxy(config?: Partial<ApiConfig>): void {
+  if (!canSyncApiConfigToServerProxy()) return;
+  localProxySyncChain = localProxySyncChain
+    .catch(() => undefined)
+    .then(() => syncApiConfigToServerProxy(config))
+    .catch((error) => {
+      console.warn("Failed to sync API config to local proxy:", error);
+    });
+}
+
 export function clearApiConfig(): void {
   localStorage.removeItem(STORAGE_KEY);
+  lastLocalProxyConfigSnapshot = "";
   emitApiConfigUpdated();
 }
 
@@ -797,5 +1083,6 @@ export function resolveConfiguredModelNameFromConfig(
 }
 
 export function prefersJimengCli(config: Pick<ApiConfig, "jimengExecutionMode">): boolean {
-  return resolveJimengExecutionMode(config) === "cli";
+  void config;
+  return false;
 }

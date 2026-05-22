@@ -3,13 +3,82 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { useIsMobile } from "@/hooks/use-mobile";
 import { cn } from "@/lib/utils";
 
-const { Suspense, lazy, memo, useEffect, useRef } = React;
+const { Suspense, lazy, memo, useEffect, useRef, useState } = React;
 
 const SETTINGS_PANEL_CLASS =
   "rounded-[28px] border border-border bg-background text-foreground shadow-[0_28px_70px_rgba(0,0,0,0.55)]";
 const MOBILE_SETTINGS_SHEET =
   "w-full border-r border-border bg-background p-0 text-foreground shadow-[18px_0_48px_rgba(0,0,0,0.4)] overscroll-contain sm:max-w-[440px]";
-const SettingsPage = lazy(() => import("@/pages/Settings"));
+const loadSettingsPage = () => import("@/pages/Settings");
+const SettingsPage = lazy(loadSettingsPage);
+let settingsPagePreloadPromise: Promise<unknown> | null = null;
+let settingsPageWarmupScheduled = false;
+
+function preloadSettingsPage() {
+  if (!settingsPagePreloadPromise) {
+    settingsPagePreloadPromise = loadSettingsPage();
+  }
+  return settingsPagePreloadPromise;
+}
+
+function scheduleSettingsPageWarmup() {
+  if (settingsPageWarmupScheduled || typeof window === "undefined") return;
+  settingsPageWarmupScheduled = true;
+  const warm = () => {
+    void preloadSettingsPage();
+  };
+  if (typeof window.requestAnimationFrame === "function") {
+    window.requestAnimationFrame(warm);
+    return;
+  }
+  window.setTimeout(warm, 0);
+}
+
+scheduleSettingsPageWarmup();
+
+function useWarmSettingsPage() {
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      void preloadSettingsPage();
+      return;
+    }
+
+    const warm = () => {
+      void preloadSettingsPage();
+    };
+    let quickWarmFrame: number | null =
+      typeof window.requestAnimationFrame === "function"
+        ? window.requestAnimationFrame(() => warm())
+        : null;
+    let quickWarmTimer: number | null = window.setTimeout(warm, 180);
+
+    if (typeof window.requestIdleCallback === "function") {
+      const handle = window.requestIdleCallback(warm, { timeout: 500 });
+      return () => {
+        if (quickWarmFrame !== null && typeof window.cancelAnimationFrame === "function") {
+          window.cancelAnimationFrame(quickWarmFrame);
+          quickWarmFrame = null;
+        }
+        if (quickWarmTimer !== null) {
+          window.clearTimeout(quickWarmTimer);
+          quickWarmTimer = null;
+        }
+        if (typeof window.cancelIdleCallback === "function") {
+          window.cancelIdleCallback(handle);
+        }
+      };
+    }
+
+    return () => {
+      if (quickWarmFrame !== null && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(quickWarmFrame);
+      }
+      if (quickWarmTimer !== null) {
+        window.clearTimeout(quickWarmTimer);
+      }
+    };
+  }, []);
+}
 
 export const DesktopSettingsPanel = memo(function DesktopSettingsPanel({
   open,
@@ -25,6 +94,14 @@ export const DesktopSettingsPanel = memo(function DesktopSettingsPanel({
   width: number;
 }) {
   const panelRef = useRef<HTMLElement | null>(null);
+  const [hasOpenedOnce, setHasOpenedOnce] = useState(open);
+  useWarmSettingsPage();
+
+  useEffect(() => {
+    if (open) {
+      setHasOpenedOnce(true);
+    }
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -50,12 +127,17 @@ export const DesktopSettingsPanel = memo(function DesktopSettingsPanel({
     };
   }, [onClose, open]);
 
-  if (!open) return null;
+  if (!open && !hasOpenedOnce) return null;
 
   return (
     <aside
       ref={panelRef}
-      className="fixed bottom-4 top-4 z-50 hidden lg:block"
+      data-home-settings-panel="desktop"
+      aria-hidden={!open}
+      className={cn(
+        "fixed bottom-4 top-4 z-50 hidden transition-opacity duration-150 ease-out lg:block",
+        open ? "visible pointer-events-auto opacity-100" : "invisible pointer-events-none opacity-0",
+      )}
       style={{
         left: leftOffset - 16,
         width: `min(${width}px, calc(100vw - ${leftOffset + 32}px))`,
@@ -86,12 +168,23 @@ export const MobileSettingsSheet = memo(function MobileSettingsSheet({
   onSaved?: () => void;
 }) {
   const isMobile = useIsMobile();
+  const [hasOpenedOnce, setHasOpenedOnce] = useState(open);
+  useWarmSettingsPage();
+
+  useEffect(() => {
+    if (open) {
+      setHasOpenedOnce(true);
+    }
+  }, [open]);
 
   if (!isMobile) return null;
+  if (!open && !hasOpenedOnce) return null;
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
+        data-home-settings-panel="mobile"
+        forceMount
         side="left"
         overlayClassName="bg-black/58 backdrop-blur-0"
         className={cn(MOBILE_SETTINGS_SHEET, "lg:hidden")}

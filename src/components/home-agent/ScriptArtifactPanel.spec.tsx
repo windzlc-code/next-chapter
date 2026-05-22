@@ -31,13 +31,16 @@ vi.mock("mermaid", () => ({
   },
 }));
 
-function createSnapshot(artifacts: ConversationArtifact[]): ConversationProjectSnapshot {
+function createSnapshot(
+  artifacts: ConversationArtifact[],
+  derivedStage = "Episodes",
+): ConversationProjectSnapshot {
   return {
     projectId: "script-project-1",
     projectKind: "script",
     title: "Artifact Test",
     currentObjective: "Continue",
-    derivedStage: "Episodes",
+    derivedStage,
     agentSummary: "Rich cards ready",
     recommendedActions: [],
     artifacts,
@@ -240,6 +243,122 @@ describe("ScriptArtifactPanel", () => {
     expect(onArtifactAction).toHaveBeenNthCalledWith(1, "generate_creative_plan", "Continue setup");
     expect(onArtifactAction).toHaveBeenNthCalledWith(2, "script:export-video", "Video bridge");
     expect(onArtifactAction).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows dialogue review markers in the compliance palette tab", () => {
+    render(
+      <ScriptArtifactPanel
+        snapshot={createSnapshot([
+          {
+            id: "compliance",
+            kind: "compliance",
+            label: "Compliance",
+            summary: "Compliance summary",
+            updatedAt: "2026-04-02T00:00:00.000Z",
+            presentation: "script-rich",
+            payload: {
+              type: "complianceSummary",
+              mode: "script",
+              strictness: "standard",
+              report: "warning",
+              packets: [],
+              workspace: {
+                ...createEmptyComplianceWorkspace(),
+                sourceText: "角色A：这是一段很长的对话",
+                paletteText: "【对话审查】 角色A：这是一段很长的对话",
+                dialogueReviewEnabled: true,
+                dialogueOverLimitLineIndexes: [0],
+              },
+              counts: { redLine: 0, highRisk: 0, suggestion: 0, pendingPackets: 0 },
+            },
+          },
+        ])}
+      />,
+    );
+
+    expandAllArtifacts();
+    fireEvent.click(screen.getByRole("button", { name: "调色盘文本对比" }));
+
+    const dialogueReviewLegend = screen.getByText((_, element) => element?.textContent === "▬ 对话审查");
+    expect(dialogueReviewLegend.querySelector("span")?.className).toContain("text-sky-600");
+    expect(screen.getByTitle("对话审查").className).toContain("text-sky-300");
+  });
+
+  it("shows compliance repair records after risks are fixed", () => {
+    render(
+      <ScriptArtifactPanel
+        snapshot={createSnapshot([
+          {
+            id: "compliance",
+            kind: "compliance",
+            label: "Compliance",
+            summary: "Compliance summary",
+            updatedAt: "2026-04-02T00:00:00.000Z",
+            presentation: "script-rich",
+            payload: {
+              type: "complianceSummary",
+              mode: "script",
+              strictness: "strict",
+              report: "warning",
+              packets: [
+                {
+                  id: "packet-red",
+                  issueTitle: "高风险条目",
+                  riskLevel: "high",
+                  recommendation: "需要弱化",
+                  sourceQuote: "原始高风险表述",
+                  originalSnippet: "原始高风险表述",
+                  replacement: "改写后的安全表述",
+                  status: "resolved",
+                },
+                {
+                  id: "packet-info",
+                  issueTitle: "提示条目",
+                  riskLevel: "low",
+                  recommendation: "已处理",
+                  sourceQuote: "已确认处理的提示项",
+                  status: "resolved",
+                },
+              ],
+              workspace: {
+                ...createEmptyComplianceWorkspace(),
+                sourceText: "原始文本",
+                paletteText: "改写后的文本",
+                riskPhrases: [
+                  {
+                    id: "risk-red",
+                    level: "red",
+                    text: "原始高风险表述",
+                    reason: "需要弱化",
+                    segmentIndex: 0,
+                    replacement: "改写后的安全表述",
+                    status: "resolved",
+                  },
+                  {
+                    id: "risk-info",
+                    level: "info",
+                    text: "已确认处理的提示项",
+                    reason: "已处理",
+                    segmentIndex: 0,
+                    status: "resolved",
+                  },
+                ],
+              },
+              counts: { redLine: 1, highRisk: 0, suggestion: 1, pendingPackets: 0 },
+            },
+          },
+        ])}
+      />,
+    );
+
+    expandAllArtifacts();
+
+    expect(screen.getByText("修复记录")).toBeInTheDocument();
+    expect(screen.getByText("2 条")).toBeInTheDocument();
+    expect(screen.getByText("原始高风险表述")).toBeInTheDocument();
+    expect(screen.getByText("改写后的安全表述")).toBeInTheDocument();
+    expect(screen.getByText("已确认处理的提示项")).toBeInTheDocument();
+    expect(screen.getByText("已标记为处理完成，当前风险不再进入待修列表。")).toBeInTheDocument();
   });
 
   it("shows inline edit controls and toggles the relationship diagram state", async () => {
@@ -595,6 +714,58 @@ describe("ScriptArtifactPanel", () => {
 
     expect(screen.getByText("Directory")).toBeInTheDocument();
     expect(screen.queryByText("Outlines")).not.toBeInTheDocument();
+  });
+
+  it("shows only the export card once a script project reaches the export stage", () => {
+    render(
+      <ScriptArtifactPanel
+        snapshot={createSnapshot(
+          [
+            {
+              id: "setup",
+              kind: "setup",
+              label: "Setup Card",
+              summary: "Project setup summary",
+              updatedAt: "2026-04-02T00:00:00.000Z",
+            },
+            {
+              id: "characters",
+              kind: "characters",
+              label: "Characters",
+              summary: "Character summary",
+              updatedAt: "2026-04-02T00:00:00.000Z",
+            },
+            {
+              id: "export",
+              kind: "export",
+              label: "Export",
+              summary: "Export summary",
+              updatedAt: "2026-04-02T00:00:00.000Z",
+              presentation: "script-rich",
+              payload: {
+                type: "exportSummary",
+                dramaTitle: "Export Test",
+                completedEpisodes: 1,
+                totalEpisodes: 24,
+                totalWordCount: 1200,
+                complianceStatus: "passed",
+                skippedAt: null,
+                quickExportMarkdown: "# Export Test",
+                creativePlan: "Creative plan",
+                characters: "Character sheet",
+                episodes: [{ number: 1, title: "Episode 1", content: "Episode body", wordCount: 1200 }],
+                setup: null,
+              },
+            },
+          ],
+          "导出与出片",
+        )}
+      />,
+    );
+
+    expect(screen.getByText("Export")).toBeInTheDocument();
+    expect(screen.queryByText("Setup Card")).not.toBeInTheDocument();
+    expect(screen.queryByText("Characters")).not.toBeInTheDocument();
   });
 
   it("supports translation stop and resume for long non-Chinese text", async () => {

@@ -3,13 +3,23 @@ import {
   createDramaSnapshot,
   createVideoSnapshot,
   deleteConversationProject,
+  duplicateConversationProject,
   listRecentConversationSnapshots,
+  loadConversationSourceById,
   loadStoredDramaProjectById,
   listStoredDramaProjects,
   renameConversationProject,
+  upsertStoredDramaProject,
 } from "./project-store";
 import type { PersistedVideoProject } from "@/hooks/use-local-persistence";
-import { readStudioProjectSession } from "./session-store";
+import { invalidateProjectsCache } from "@/hooks/use-local-persistence";
+import {
+  __resetSessionStoreCachesForTests,
+  readProjectStudioSession,
+  readStudioProjectSession,
+  writeProjectStudioSession,
+} from "./session-store";
+import { buildFreeConversationProjectSnapshot } from "@/components/home-agent/use-home-agent-runtime-actions";
 import {
   createEmptyComplianceWorkspace,
   createEmptyDramaProject,
@@ -17,6 +27,7 @@ import {
 } from "@/types/drama";
 
 const DRAMA_PROJECTS_KEY = "storyforge_drama_projects";
+const VIDEO_PROJECTS_KEY = "storyforge_projects";
 const STUDIO_PROJECT_SESSIONS_KEY = "storyforge-home-agent-project-sessions-v1";
 
 function writeDramaProjects(projects: unknown[]): void {
@@ -111,6 +122,8 @@ function createVideoFixture(overrides: Partial<PersistedVideoProject> = {}): Per
 describe("project-store", () => {
   beforeEach(() => {
     localStorage.clear();
+    invalidateProjectsCache();
+    __resetSessionStoreCachesForTests();
   });
 
   it("normalizes legacy drama projects with missing workflow arrays and compliance workspace", () => {
@@ -171,6 +184,114 @@ describe("project-store", () => {
     expect(snapshot?.artifacts.length).toBeGreaterThan(0);
     expect(snapshot?.memory?.styleLock?.genre[0]).toBe("urban romance");
     expect(snapshot?.currentObjective).toBe("确认创作方案后进入角色开发，并保持首页单链路推进。");
+  });
+
+  it("falls back to later string fields when derived world-model sources contain non-string values", () => {
+    const saved = upsertStoredDramaProject(
+      createDramaFixture({
+        id: "drama-weird-world-model",
+        creativePlan: { broken: true } as unknown as string,
+        structureTransform: "Fallback synopsis from structure transform.",
+        characters: { broken: true } as unknown as string,
+        characterTransform: "Fallback character description.",
+        directory: [createDirectoryEntry(1)],
+      }),
+    );
+
+    expect(saved.worldModel?.synopsis).toContain("Fallback synopsis");
+    expect(saved.worldModel?.characters[0]?.description).toContain("Fallback character description");
+  });
+
+  it("normalizes malformed drama projects before persistence and snapshot creation", () => {
+    const malformedProject = createDramaFixture({
+      id: "drama-malformed-sync",
+      currentStep: "characters",
+      creativePlan: { broken: true } as unknown as string,
+      structureTransform: "Fallback synopsis from structure transform.",
+      characters: { broken: true } as unknown as string,
+      characterTransform: "Fallback character description.\n\n关系：女主，男主",
+      directoryRaw: { broken: true } as unknown as string,
+      complianceReport: { broken: true } as unknown as string,
+      directory: [createDirectoryEntry(1, { outline: "" })],
+    });
+
+    const saved = upsertStoredDramaProject(malformedProject);
+    const snapshot = createDramaSnapshot(malformedProject);
+
+    expect(saved.directoryRaw).toBe("");
+    expect(saved.characters).toBe("");
+    expect(saved.characterTransform).toContain("Fallback character description");
+    expect(saved.complianceReport).toBe("");
+    expect(saved.worldModel?.synopsis).toContain("Fallback synopsis");
+    expect(saved.characterStateCards[0]?.coreConflict).toContain("Fallback character description");
+    expect(snapshot.memory?.worldModel?.synopsis).toContain("Fallback synopsis");
+    expect(snapshot.memory?.worldModel?.characters[0]?.description).toContain(
+      "Fallback character description",
+    );
+  });
+
+  it("builds a detailed relationship diagram payload from the second mermaid block when needed", () => {
+    writeDramaProjects([
+      createDramaFixture({
+        id: "characters-mermaid-fallback",
+        currentStep: "characters",
+        characters: [
+          "角色设定正文",
+          "",
+          "**简单关系图**",
+          "```mermaid",
+          "graph TD",
+          "    A[陆沉] --> B[苏清月]",
+          "```",
+          "",
+          "**详细关系图**（含 NPC）",
+          "```mermaid",
+          "graph TD",
+          "    A[陆沉] --> B[苏清月]",
+          "    C[大皇子] --> A",
+          "    D[管家] --> B",
+          "```",
+        ].join("\n"),
+      }),
+    ]);
+
+    const [project] = listStoredDramaProjects();
+    const snapshot = createDramaSnapshot(project);
+    const charactersArtifact = snapshot.artifacts.find((artifact) => artifact.kind === "characters");
+
+    expect(charactersArtifact?.payload?.type).toBe("characters+mermaid");
+    if (charactersArtifact?.payload?.type === "characters+mermaid") {
+      expect(charactersArtifact.payload.mermaidCode).toContain("A[陆沉] --> B[苏清月]");
+      expect(charactersArtifact.payload.detailedMermaidCode).toContain("D[管家] --> B");
+      expect(charactersArtifact.payload.body).toContain("角色设定正文");
+      expect(charactersArtifact.payload.body).not.toContain("graph TD");
+    }
+  });
+
+  it("keeps characters internal on the homepage until simple and detailed diagrams are both ready", () => {
+    writeDramaProjects([
+      createDramaFixture({
+        id: "characters-mermaid-not-ready",
+        currentStep: "characters",
+        characters: [
+          "角色设定正文",
+          "",
+          "**简单关系图**",
+          "```mermaid",
+          "graph TD",
+          "    A[陆沉] --> B[苏清月]",
+          "```",
+        ].join("\n"),
+      }),
+    ]);
+
+    const [project] = listStoredDramaProjects();
+    const snapshot = createDramaSnapshot(project);
+
+    expect(snapshot.artifacts.some((artifact) => artifact.kind === "characters")).toBe(false);
+    expect(snapshot.recommendedActions).toContain("进入角色开发");
+    expect(snapshot.recommendedActions).not.toContain("生成分集目录");
+    expect(snapshot.currentObjective).toContain("简单版和详细版都已生成且可切换");
   });
 
   it("repairs legacy directory markers from raw text before building snapshot stats", () => {
@@ -297,6 +418,55 @@ describe("project-store", () => {
     expect(snapshot.derivedStage).toBe("角色开发");
     expect(snapshot.recommendedActions).toEqual(["进入角色开发"]);
     expect(snapshot.currentObjective).toBe("完善角色关系与人设弧光，再进入分集目录。");
+  });
+
+  it("keeps storyboard breakdown results internal on the homepage until internal checks pass", () => {
+    const snapshot = createVideoSnapshot(
+      createVideoFixture({
+        scriptBreakdownPassed: false,
+        scenes: [
+          {
+            id: "scene-1",
+            sceneNumber: 1,
+            sceneName: "走廊相遇",
+            description: "女主在走廊回头。",
+            characters: ["沈昭"],
+            dialogue: "你来了",
+            cameraDirection: "中近景",
+            duration: 5,
+            segmentLabel: "1-1",
+          },
+        ] as PersistedVideoProject["scenes"],
+      }),
+    );
+
+    expect(snapshot.derivedStage).toBe("脚本拆解");
+    expect(snapshot.artifacts.some((artifact) => artifact.id.endsWith("-scenes"))).toBe(false);
+    expect(snapshot.recommendedActions[0]).toBe("完成第一轮剧本拆解");
+  });
+
+  it("keeps legacy validated storyboard breakdown artifacts visible without the new status field", () => {
+    const legacyProject = createVideoFixture({
+      scenes: [
+        {
+          id: "scene-1",
+          sceneNumber: 1,
+          sceneName: "走廊相遇",
+          description: "女主在走廊回头。",
+          characters: ["沈昭"],
+          dialogue: "你来了",
+          cameraDirection: "中近景",
+          duration: 5,
+          segmentLabel: "1-1",
+        },
+      ] as PersistedVideoProject["scenes"],
+    });
+
+    delete (legacyProject as { scriptBreakdownPassed?: boolean }).scriptBreakdownPassed;
+
+    const snapshot = createVideoSnapshot(legacyProject);
+
+    expect(snapshot.artifacts.some((artifact) => artifact.id.endsWith("-scenes"))).toBe(true);
   });
 
   it("builds rich script payloads and quick-export fallback artifacts", () => {
@@ -444,9 +614,11 @@ describe("project-store", () => {
         complianceWorkspace: {
           ...createEmptyComplianceWorkspace(),
           sourceText: "待审文本",
-          paletteText: "调色盘",
+          paletteText: "【对话审查】 角色A：这是一段超长对话",
           reviewMode: "script",
           strictness: "strict",
+          dialogueReviewEnabled: true,
+          dialogueOverLimitLineIndexes: [0],
         },
       }),
     );
@@ -456,10 +628,17 @@ describe("project-store", () => {
     expect(complianceArtifact?.payload?.type).toBe("complianceSummary");
     if (complianceArtifact?.payload?.type === "complianceSummary") {
       expect(complianceArtifact.payload.workspace.sourceText).toBe("待审文本");
-      expect(complianceArtifact.payload.workspace.paletteText).toBe("调色盘");
+      expect(complianceArtifact.payload.workspace.paletteText).toBe("【对话审查】 角色A：这是一段超长对话");
       expect(complianceArtifact.payload.strictness).toBe("strict");
+      expect(complianceArtifact.payload.workspace.dialogueReviewEnabled).toBe(true);
+      expect(complianceArtifact.payload.workspace.dialogueOverLimitLineIndexes).toEqual([0]);
     }
     expect(complianceArtifact?.actions?.map((action) => action.value)).toContain("script:step-enter-compliance");
+    expect(
+      snapshot.artifacts.some(
+        (artifact) => artifact.kind === "episode" && artifact.payload?.type === "episodes+batchProgress",
+      ),
+    ).toBe(false);
   });
 
   it("surfaces structured episode-stage actions and the skip-compliance recommendation", () => {
@@ -486,7 +665,7 @@ describe("project-store", () => {
     const episodeArtifact = snapshot.artifacts.find((artifact) => artifact.kind === "episode");
 
     expect(snapshot.recommendedActions).toEqual([
-      "批量生成剩余正文",
+      "自动批量补齐",
       "生成第 3 集正文",
       "进入合规审查",
       "跳过合规，直接进入导出",
@@ -739,12 +918,147 @@ describe("project-store", () => {
             updatedAt: "2026-04-03T01:00:00.000Z",
           },
         ],
+        videoAuditPackets: [
+          {
+            id: "audit:segment:1-1",
+            targetType: "segment",
+            targetId: "segment:1-1",
+            segmentLabel: "1-1",
+            sceneIds: ["scene-1"],
+            submittedPrompt: "prompt",
+            referenceImageUrls: ["https://example.com/storyboard-1.jpg"],
+            usedContinuityFrame: false,
+            usedRelayVideo: false,
+            symbolicPassed: true,
+            totalScore: 90,
+            status: "pass",
+            scores: {
+              continuity: { score: 90, passed: true, reason: "ok" },
+              identity: { score: 90, passed: true, reason: "ok" },
+              semantic: { score: 90, passed: true, reason: "ok" },
+              visual: { score: 90, passed: true, reason: "ok" },
+            },
+            issues: [],
+            createdAt: "2026-04-03T01:00:00.000Z",
+            updatedAt: "2026-04-03T01:00:00.000Z",
+          },
+        ],
+        videoRepairTasks: [
+          {
+            id: "repair:segment:1-1",
+            targetType: "segment",
+            targetId: "segment:1-1",
+            segmentLabel: "1-1",
+            route: "local_repair",
+            status: "completed",
+            reason: "history",
+            attempts: 1,
+            createdAt: "2026-04-03T01:00:00.000Z",
+            updatedAt: "2026-04-03T01:00:00.000Z",
+          },
+        ],
+        automationState: {
+          strategy: "quality-first",
+          segmentPassBudget: 5,
+          localRepairBudget: 2,
+          regenerateBudget: 2,
+          assetPrimaryRetryBudget: 3,
+          assetVariantRetryBudget: 2,
+          segments: {
+            "1-1": {
+              totalPasses: 1,
+              localRepairCount: 0,
+              regenerateCount: 0,
+            },
+          },
+          referenceTargets: {
+            "reference-character:char-1": {
+              targetId: "reference-character:char-1",
+              targetType: "character-primary",
+              entityId: "char-1",
+              status: "ready",
+              attemptCount: 1,
+              retryBudget: 3,
+            },
+          },
+          updatedAt: "2026-04-03T01:00:00.000Z",
+        },
       }),
     );
 
     expect(snapshot.memory?.assetManifest?.items.length).toBeGreaterThan(0);
     expect(snapshot.memory?.shotPackets?.length).toBe(1);
+    expect(snapshot.memory?.automationState?.referenceTargets?.["reference-character:char-1"]).toEqual(
+      expect.objectContaining({
+        targetId: "reference-character:char-1",
+        entityId: "char-1",
+      }),
+    );
+    expect(snapshot.memory?.videoAuditPackets?.length).toBe(1);
+    expect(snapshot.memory?.videoRepairTasks?.length).toBe(1);
     expect(snapshot.artifacts.some((artifact) => artifact.kind === "shot-packet")).toBe(true);
+  });
+
+  it("surfaces segment final prompt logs as report artifacts in video snapshots", () => {
+    const snapshot = createVideoSnapshot(
+      createVideoFixture({
+        id: "video-project-segment-prompt-log",
+        scenes: [
+          {
+            id: "scene-1",
+            sceneNumber: 1,
+            sceneName: "Opening",
+            description: "The heroine enters the corridor.",
+            characters: ["Hero"],
+            dialogue: "",
+            cameraDirection: "medium shot",
+            duration: 5,
+            segmentLabel: "1-1",
+          },
+        ],
+        segmentVideoPrompts: {
+          "1-1": {
+            segmentLabel: "1-1",
+            prompt: "Final merged segment prompt body.",
+            duration: 12,
+            targetDuration: 15,
+            modelKey: "doubao-seedance-1-5-pro",
+            maxDurationForModel: 15,
+            sceneIds: ["scene-1"],
+            generatedAt: "2026-04-03T01:00:00.000Z",
+            debug: {
+              source: "model",
+              promptLength: 33,
+              shotCount: 1,
+              shotCoverageComplete: true,
+              videoMode: "text-to-video",
+            },
+          },
+        },
+      }),
+    );
+
+    const promptLogArtifact = snapshot.artifacts.find((artifact) => artifact.id === "video-project-segment-prompt-log-segment-video-prompts");
+    expect(promptLogArtifact).toMatchObject({
+      kind: "report",
+      label: "片段最终提示词日志",
+      summary: "已记录 1 个片段的最终提示词。",
+    });
+    expect(promptLogArtifact?.content).toContain("最终提示词");
+    expect(promptLogArtifact?.content).toContain("Final merged segment prompt body.");
+  });
+
+  it("mirrors a persisted reference-image style summary into video snapshot memory", () => {
+    const snapshot = createVideoSnapshot(
+      createVideoFixture({
+        id: "video-project-style-memory",
+        referenceStyleSummary: "具有电影质感的写实风格，街头场景，光影对比强烈。",
+      }),
+    );
+
+    expect(snapshot.memory?.referenceImageStyleSummary).toBe(
+      "具有电影质感的写实风格，街头场景，光影对比强烈。",
+    );
   });
 
   it("keeps the full decomposed scene list in the video snapshot artifact", () => {
@@ -904,6 +1218,7 @@ describe("project-store", () => {
             id: "char-2",
             name: "Support",
             description: "Support character",
+            imageUrl: "https://example.com/support.jpg",
             isAIGenerated: false,
             source: "auto",
           },
@@ -921,6 +1236,7 @@ describe("project-store", () => {
             id: "setting-2",
             name: "Lobby",
             description: "Hotel lobby",
+            imageUrl: "https://example.com/lobby.jpg",
             isAIGenerated: false,
             source: "auto",
           },
@@ -966,6 +1282,7 @@ describe("project-store", () => {
         ],
         storyboardPlan: "Shot 1: the heroine steps into the corridor.",
         shotPackets: [],
+        videoPromptBatch: "Prompt batch ready",
         reviewQueue: [],
       }),
     );
@@ -1100,9 +1417,30 @@ describe("project-store", () => {
             dialogue: "",
             cameraDirection: "medium shot",
             duration: 5,
-            storyboardUrl: "",
+            storyboardUrl: "https://example.com/storyboard-1.jpg",
           },
         ],
+        characters: [
+          {
+            id: "char-1",
+            name: "Hero",
+            description: "Lead character",
+            imageUrl: "https://example.com/hero.jpg",
+            isAIGenerated: false,
+            source: "auto",
+          },
+        ],
+        sceneSettings: [
+          {
+            id: "setting-1",
+            name: "Corridor",
+            description: "Night corridor",
+            imageUrl: "https://example.com/corridor.jpg",
+            isAIGenerated: false,
+            source: "auto",
+          },
+        ],
+        storyboardPlan: "Shot 1: the heroine enters the corridor.",
         videoPromptBatch: "Prompt batch ready",
         shotPackets: [{ id: "packet-1" }] as PersistedVideoProject["shotPackets"],
       }),
@@ -1220,6 +1558,380 @@ describe("project-store", () => {
     expect(snapshot?.title).toBe("The Confession Inside the Kitchen Light");
   });
 
+  it("keeps duplicate titles stable and increments the copy suffix", async () => {
+    const sourceProject = createDramaFixture({
+      id: "drama-duplicate-1",
+      dramaTitle: "Smoke and Amber",
+      createdAt: "2026-04-01T00:00:00.000Z",
+      updatedAt: "2026-04-02T00:00:00.000Z",
+    });
+    writeDramaProjects([sourceProject]);
+
+    await writeProjectStudioSession({
+      projectId: sourceProject.id,
+      sessionId: "session-duplicate-1",
+      mode: "active",
+      creationMode: "fast",
+      automationMode: "manual",
+      devMode: false,
+      messages: [],
+      currentProjectSnapshot: createDramaSnapshot(sourceProject),
+      recentMessageSummary: "",
+      draft: "",
+      compactedMessageCount: 0,
+      qState: null,
+      pendingChoiceQuestion: null,
+      selectedValues: [],
+      deferredQuestionState: null,
+      deferredSelectedValues: [],
+      fullAutoRun: null,
+    });
+
+    const firstCopy = await duplicateConversationProject(createDramaSnapshot(sourceProject));
+    const secondCopy = await duplicateConversationProject(createDramaSnapshot(sourceProject));
+
+    expect(firstCopy?.title).toBe("Smoke and Amber - 副本");
+    expect(secondCopy?.title).toBe("Smoke and Amber - 副本2");
+
+    const firstCopySession = firstCopy ? readProjectStudioSession(firstCopy.projectId) : null;
+    const secondCopySession = secondCopy ? readProjectStudioSession(secondCopy.projectId) : null;
+    expect(firstCopySession?.currentProjectSnapshot?.title).toBe("Smoke and Amber - 副本");
+    expect(secondCopySession?.currentProjectSnapshot?.title).toBe("Smoke and Amber - 副本2");
+
+    const recentSnapshots = await listRecentConversationSnapshots(10);
+    expect(recentSnapshots.map((snapshot) => snapshot.title)).toEqual(
+      expect.arrayContaining(["Smoke and Amber - 副本", "Smoke and Amber - 副本2"]),
+    );
+  });
+
+  it("duplicates placeholder conversation cards from session storage before a real project exists", async () => {
+    const placeholder = buildFreeConversationProjectSnapshot({
+      projectId: "session-full-auto-placeholder",
+      userPrompt: "项目设定：美食治愈 / 职场现实 / 24 集",
+      latestAssistantText: "项目设定已确认。全自动模式会先一次性收集后续策略。",
+      automationMode: "full-auto",
+      updatedAt: "2026-05-10T00:00:00.000Z",
+    });
+
+    await writeProjectStudioSession({
+      projectId: placeholder.projectId,
+      sessionId: "session-full-auto-placeholder",
+      mode: "active",
+      creationMode: "fast",
+      automationMode: "full-auto",
+      devMode: false,
+      messages: [],
+      currentProjectSnapshot: placeholder,
+      recentMessageSummary: "",
+      draft: "",
+      compactedMessageCount: 0,
+      qState: null,
+      pendingChoiceQuestion: null,
+      selectedValues: [],
+      deferredQuestionState: null,
+      deferredSelectedValues: [],
+      fullAutoRun: null,
+    });
+
+    const duplicated = await duplicateConversationProject(placeholder);
+    const duplicatedSession = duplicated ? readProjectStudioSession(duplicated.projectId) : null;
+
+    expect(duplicated?.projectId).not.toBe(placeholder.projectId);
+    expect(duplicated?.title).toBe(`${placeholder.title} - 副本`);
+    expect(duplicated?.automationMode).toBe("full-auto");
+    expect(duplicatedSession?.currentProjectSnapshot?.title).toBe(`${placeholder.title} - 副本`);
+  });
+
+  it("repairs recent snapshot automation mode from a full-auto session lineage", async () => {
+    const sourceProject = createDramaFixture({
+      id: "drama-full-auto-repair",
+      dramaTitle: "Full Auto Repair",
+    });
+    writeDramaProjects([sourceProject]);
+
+    await writeProjectStudioSession({
+      projectId: sourceProject.id,
+      sessionId: "session-full-auto-repair",
+      mode: "active",
+      creationMode: "fast",
+      automationMode: "manual",
+      devMode: false,
+      messages: [
+        {
+          id: "assistant-1",
+          role: "assistant",
+          content: "已切换为全自动原创剧本。请先一次性确认立项参数；确认完毕后我会代替用户连续发送指令并自动执行到视频导出。",
+          createdAt: "2026-05-10T18:00:00.000Z",
+        },
+        {
+          id: "user-1",
+          role: "user",
+          content: "生成创作方案",
+          createdAt: "2026-05-10T18:00:01.000Z",
+          automationOrigin: "full-auto",
+        },
+      ],
+      currentProjectSnapshot: {
+        ...createDramaSnapshot(sourceProject),
+        automationMode: "manual",
+      },
+      recentMessageSummary: "",
+      draft: "",
+      compactedMessageCount: 0,
+      qState: null,
+      pendingChoiceQuestion: null,
+      selectedValues: [],
+      deferredQuestionState: null,
+      deferredSelectedValues: [],
+      fullAutoRun: null,
+    });
+
+    const [snapshot] = await listRecentConversationSnapshots(10);
+
+    expect(snapshot?.projectId).toBe(sourceProject.id);
+    expect(snapshot?.automationMode).toBe("full-auto");
+    expect(readStudioProjectSession(sourceProject.id)?.automationMode).toBe("full-auto");
+  });
+
+  it("prefers the current project session snapshot when hydrating a stored video conversation source", async () => {
+    const projectId = "video-history-session-priority";
+    const storedVideoProject = createVideoFixture({
+      id: projectId,
+      title: "Session Priority Video",
+      currentStep: 2,
+      updatedAt: "2026-05-10T20:25:00.000Z",
+    });
+    const hydratedVideoProject = createVideoFixture({
+      id: projectId,
+      title: "Session Priority Video",
+      currentStep: 6,
+      updatedAt: "2026-05-10T17:31:00.000Z",
+    });
+    const hydratedSnapshot = createVideoSnapshot(hydratedVideoProject);
+
+    localStorage.setItem(VIDEO_PROJECTS_KEY, JSON.stringify([storedVideoProject]));
+    await writeProjectStudioSession({
+      projectId,
+      sessionId: "video-history-session-priority",
+      mode: "active",
+      creationMode: "fast",
+      automationMode: "manual",
+      devMode: false,
+      messages: [
+        {
+          id: "assistant-1",
+          role: "assistant",
+          content: "Hydrated session snapshot should win over stale recent metadata.",
+          createdAt: "2026-05-10T17:31:00.000Z",
+        },
+      ],
+      currentProjectSnapshot: hydratedSnapshot,
+      recentMessageSummary: "",
+      draft: "",
+      compactedMessageCount: 0,
+      qState: null,
+      pendingChoiceQuestion: null,
+      selectedValues: [],
+      deferredQuestionState: null,
+      deferredSelectedValues: [],
+      fullAutoRun: null,
+    });
+
+    const snapshot = (await loadConversationSourceById(projectId, { fastVideoLoad: true })).snapshot;
+
+    expect(snapshot?.projectId).toBe(projectId);
+    expect(snapshot?.derivedStage).toBe(hydratedSnapshot.derivedStage);
+    expect(snapshot?.updatedAt).toBe(hydratedSnapshot.updatedAt);
+    expect(snapshot?.currentObjective).toBe(hydratedSnapshot.currentObjective);
+  });
+
+  it("surfaces session-only conversation histories from db session backups", async () => {
+    const projectId = "session-only-history";
+    const sessionSnapshot = createDramaSnapshot(
+      createDramaFixture({
+        id: projectId,
+        dramaTitle: "Session Only History",
+        currentStep: "characters",
+        updatedAt: "2026-05-11T01:23:45.000Z",
+      }),
+    );
+    const sessionFilePath = `C:/Storyforge/db/sessions/${projectId}.json`;
+    const sessionFiles = new Map<string, string>([
+      [
+        sessionFilePath,
+        JSON.stringify({
+          projectId,
+          sessionId: "session-only-history",
+          mode: "active",
+          creationMode: "fast",
+          automationMode: "manual",
+          devMode: false,
+          messages: [
+            {
+              id: "assistant-1",
+              role: "assistant",
+              content: "Recovered from the db backup only.",
+              createdAt: "2026-05-11T01:23:45.000Z",
+            },
+          ],
+          currentProjectSnapshot: sessionSnapshot,
+          recentMessageSummary: "",
+          draft: "",
+          compactedMessageCount: 0,
+          qState: null,
+          pendingChoiceQuestion: null,
+          selectedValues: [],
+          deferredQuestionState: null,
+          deferredSelectedValues: [],
+          fullAutoRun: null,
+        }),
+      ],
+    ]);
+
+    Object.defineProperty(window, "electronAPI", {
+      value: {
+        storage: {
+          getDefaultPath: async () => ({ files: "C:/Storyforge/files", db: "C:/Storyforge/db" }),
+          listDir: async (dirPath: string) => {
+            if (dirPath === "C:/Storyforge/files/conversations") {
+              return { ok: true, entries: [] };
+            }
+            if (dirPath === "C:/Storyforge/db/sessions") {
+              return {
+                ok: true,
+                entries: [
+                  { name: `${projectId}.json`, isDirectory: false },
+                  { name: "_last.json", isDirectory: false },
+                ],
+              };
+            }
+            return { ok: true, entries: [] };
+          },
+          readText: async (filePath: string) =>
+            sessionFiles.has(filePath)
+              ? { ok: true, exists: true, content: sessionFiles.get(filePath) }
+              : { ok: true, exists: false, content: "" },
+          writeText: async (filePath: string, content: string) => {
+            sessionFiles.set(filePath, content);
+            return { ok: true };
+          },
+        },
+      },
+      writable: true,
+      configurable: true,
+    });
+
+    const snapshots = await listRecentConversationSnapshots(10, { fast: true });
+    const snapshot = snapshots.find((item) => item.projectId === projectId);
+    const source = await loadConversationSourceById(projectId);
+
+    expect(snapshot?.projectId).toBe(projectId);
+    expect(snapshot?.derivedStage).toBe(sessionSnapshot.derivedStage);
+    expect(source.snapshot?.projectId).toBe(projectId);
+    expect(source.snapshot?.currentObjective).toBe(sessionSnapshot.currentObjective);
+    expect(source.dramaProject).toBeNull();
+    expect(source.videoProject).toBeNull();
+  });
+
+  it("skips archive backfill during fast recent scans so startup stays light", async () => {
+    const dramaProject = createDramaFixture({
+      id: "stored-drama-only",
+      dramaTitle: "Stored Drama Only",
+      updatedAt: "2026-05-12T10:00:00.000Z",
+    });
+    const archiveFiles = new Map<string, string>();
+
+    writeDramaProjects([dramaProject]);
+
+    Object.defineProperty(window, "electronAPI", {
+      value: {
+        storage: {
+          getDefaultPath: async () => ({ files: "C:/Storyforge/files", db: "C:/Storyforge/db" }),
+          listDir: async (dirPath: string) => {
+            if (dirPath === "C:/Storyforge/files/conversations") {
+              return { ok: true, entries: [] };
+            }
+            if (dirPath === "C:/Storyforge/db/sessions") {
+              return { ok: true, entries: [] };
+            }
+            return { ok: true, entries: [] };
+          },
+          readText: async (filePath: string) =>
+            archiveFiles.has(filePath)
+              ? { ok: true, exists: true, content: archiveFiles.get(filePath) }
+              : { ok: true, exists: false, content: "" },
+          writeText: async (filePath: string, content: string) => {
+            archiveFiles.set(filePath, content);
+            return { ok: true };
+          },
+        },
+      },
+      writable: true,
+      configurable: true,
+    });
+
+    const snapshots = await listRecentConversationSnapshots(10, { fast: true });
+
+    expect(snapshots.some((snapshot) => snapshot.projectId === dramaProject.id)).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(archiveFiles.size).toBe(0);
+  });
+
+  it("backfills a conversation archive for a stored project during a full recent scan", async () => {
+    const dramaProject = createDramaFixture({
+      id: "stored-drama-only",
+      dramaTitle: "Stored Drama Only",
+      updatedAt: "2026-05-12T10:00:00.000Z",
+    });
+    const archiveFiles = new Map<string, string>();
+
+    writeDramaProjects([dramaProject]);
+
+    Object.defineProperty(window, "electronAPI", {
+      value: {
+        storage: {
+          getDefaultPath: async () => ({ files: "C:/Storyforge/files", db: "C:/Storyforge/db" }),
+          listDir: async (dirPath: string) => {
+            if (dirPath === "C:/Storyforge/files/conversations") {
+              return { ok: true, entries: [] };
+            }
+            if (dirPath === "C:/Storyforge/db/sessions") {
+              return { ok: true, entries: [] };
+            }
+            return { ok: true, entries: [] };
+          },
+          readText: async (filePath: string) =>
+            archiveFiles.has(filePath)
+              ? { ok: true, exists: true, content: archiveFiles.get(filePath) }
+              : { ok: true, exists: false, content: "" },
+          writeText: async (filePath: string, content: string) => {
+            archiveFiles.set(filePath, content);
+            return { ok: true };
+          },
+        },
+      },
+      writable: true,
+      configurable: true,
+    });
+
+    const snapshots = await listRecentConversationSnapshots(10);
+
+    expect(snapshots.some((snapshot) => snapshot.projectId === dramaProject.id)).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(
+      archiveFiles.has("C:/Storyforge/files/conversations/Stored-Drama-Only--stored-drama-only/chat-history.full.json"),
+    ).toBe(true);
+    expect(
+      archiveFiles.has("C:/Storyforge/files/conversations/Stored-Drama-Only--stored-drama-only/history-manifest.json"),
+    ).toBe(true);
+  });
+
   it("keeps the video snapshot in step 1 while bootstrap context is still missing", () => {
     const snapshot = createVideoSnapshot(
       createVideoFixture({
@@ -1315,10 +2027,10 @@ describe("project-store", () => {
       configurable: true,
     });
 
+    const source = await loadConversationSourceById("archive-drama-1");
     const snapshots = await listRecentConversationSnapshots();
 
-    expect(loadStoredDramaProjectById("archive-drama-1")?.dramaTitle).toBe("Archive Auto Import");
-    expect(readStudioProjectSession("archive-drama-1")?.projectId).toBe("archive-drama-1");
+    expect(source.snapshot?.projectId).toBe("archive-drama-1");
     expect(snapshots.some((snapshot) => snapshot.projectId === "archive-drama-1")).toBe(true);
   });
 
@@ -1413,5 +2125,330 @@ describe("project-store", () => {
     expect(loadStoredDramaProjectById("archive-drama-deleted")).toBeNull();
     expect(readStudioProjectSession("archive-drama-deleted")).toBeNull();
     expect(snapshots.some((snapshot) => snapshot.projectId === "archive-drama-deleted")).toBe(false);
+  });
+
+  it("keeps all batch-deleted projects hidden even if their archive folders still exist", async () => {
+    const archiveProjectA = createDramaFixture({
+      id: "archive-drama-deleted-a",
+      dramaTitle: "Deleted Archive A",
+      updatedAt: "2026-04-05T00:00:00.000Z",
+    });
+    const archiveProjectB = createDramaFixture({
+      id: "archive-drama-deleted-b",
+      dramaTitle: "Deleted Archive B",
+      updatedAt: "2026-04-05T01:00:00.000Z",
+    });
+    const createArchiveSession = (project: DramaProject) => ({
+      projectId: project.id,
+      mode: "active",
+      creationMode: "fast",
+      automationMode: "manual",
+      devMode: false,
+      messages: [{ id: `m-${project.id}`, role: "assistant", content: "delete me", createdAt: project.updatedAt }],
+      currentProjectSnapshot: createDramaSnapshot(project),
+      recentMessageSummary: "delete me",
+      draft: "",
+      compactedMessageCount: 0,
+      qState: null,
+      pendingChoiceQuestion: null,
+      fullAutoRun: null,
+      selectedValues: [],
+      deferredQuestionState: null,
+      deferredSelectedValues: [],
+      deferredDraft: "",
+      surfacedTaskIds: [],
+      surfacedTaskFollowupKeys: [],
+      surfacedProjectSuggestionKeys: [],
+    });
+
+    const archiveSessionA = createArchiveSession(archiveProjectA);
+    const archiveSessionB = createArchiveSession(archiveProjectB);
+
+    writeDramaProjects([archiveProjectA, archiveProjectB]);
+    localStorage.setItem(
+      STUDIO_PROJECT_SESSIONS_KEY,
+      JSON.stringify({
+        [archiveProjectA.id]: archiveSessionA,
+        [archiveProjectB.id]: archiveSessionB,
+      }),
+    );
+
+    const archiveFiles = new Map<string, string>([
+      [
+        "C:/Storyforge/files/conversations/Deleted-Archive-A--archive-drama-deleted-a/chat-history.full.json",
+        JSON.stringify(archiveSessionA),
+      ],
+      [
+        "C:/Storyforge/files/conversations/Deleted-Archive-A--archive-drama-deleted-a/project.json",
+        JSON.stringify(archiveProjectA),
+      ],
+      [
+        "C:/Storyforge/files/conversations/Deleted-Archive-B--archive-drama-deleted-b/chat-history.full.json",
+        JSON.stringify(archiveSessionB),
+      ],
+      [
+        "C:/Storyforge/files/conversations/Deleted-Archive-B--archive-drama-deleted-b/project.json",
+        JSON.stringify(archiveProjectB),
+      ],
+    ]);
+
+    const storage = {
+      getDefaultPath: async () => ({ files: "C:/Storyforge/files", db: "C:/Storyforge/db" }),
+      listDir: async (dirPath: string) => {
+        if (dirPath === "C:/Storyforge/files/conversations") {
+          return {
+            ok: true,
+            entries: [
+              { name: "Deleted-Archive-A--archive-drama-deleted-a", isDirectory: true },
+              { name: "Deleted-Archive-B--archive-drama-deleted-b", isDirectory: true },
+            ],
+          };
+        }
+        return { ok: true, entries: [] };
+      },
+      readText: async (filePath: string) =>
+        archiveFiles.has(filePath)
+          ? { ok: true, exists: true, content: archiveFiles.get(filePath) }
+          : { ok: true, exists: false, content: "" },
+      writeText: async (filePath: string, content: string) => {
+        archiveFiles.set(filePath, content);
+        return { ok: true };
+      },
+      deleteDir: async () => ({ ok: false }),
+      importChatHistory: async ({ filePath, targetProjectDir }: { filePath: string; targetProjectDir?: string }) => ({
+        ok: true,
+        content: archiveFiles.get(filePath),
+        importedMediaDir: targetProjectDir,
+      }),
+    };
+
+    Object.defineProperty(window, "electronAPI", {
+      value: { storage },
+      writable: true,
+      configurable: true,
+    });
+
+    await deleteConversationProject({ projectId: archiveProjectA.id, projectKind: "script" });
+    await deleteConversationProject({ projectId: archiveProjectB.id, projectKind: "script" });
+
+    await loadConversationSourceById("archive-drama-1");
+    const snapshots = await listRecentConversationSnapshots();
+
+    expect(loadStoredDramaProjectById(archiveProjectA.id)).toBeNull();
+    expect(loadStoredDramaProjectById(archiveProjectB.id)).toBeNull();
+    expect(readStudioProjectSession(archiveProjectA.id)).toBeNull();
+    expect(readStudioProjectSession(archiveProjectB.id)).toBeNull();
+    expect(snapshots.some((snapshot) => snapshot.projectId === archiveProjectA.id)).toBe(false);
+    expect(snapshots.some((snapshot) => snapshot.projectId === archiveProjectB.id)).toBe(false);
+  });
+
+  it("deletes the linked source script when removing the only bridged video project", async () => {
+    const dramaProject = createDramaFixture({
+      id: "bridge-drama-delete",
+      dramaTitle: "Bridge Drama Delete",
+    });
+    const videoProject = createVideoFixture({
+      id: "bridge-video-delete",
+      title: "Bridge Drama Delete",
+      sourceProjectId: dramaProject.id,
+    });
+
+    writeDramaProjects([dramaProject]);
+    localStorage.setItem(VIDEO_PROJECTS_KEY, JSON.stringify([videoProject]));
+
+    const result = await deleteConversationProject({
+      projectId: videoProject.id,
+      projectKind: "video",
+      sourceProjectId: dramaProject.id,
+    });
+    const snapshots = await listRecentConversationSnapshots(20, { fast: true });
+
+    expect(result.deletedProjectIds.sort()).toEqual([dramaProject.id, videoProject.id].sort());
+    expect(loadStoredDramaProjectById(dramaProject.id)).toBeNull();
+    expect(snapshots.some((snapshot) => snapshot.projectId === dramaProject.id)).toBe(false);
+    expect(snapshots.some((snapshot) => snapshot.projectId === videoProject.id)).toBe(false);
+  });
+
+  it("deletes the projected bridge shell together with its linked video", async () => {
+    const dramaProject = createDramaFixture({
+      id: "bridge-drama-shell-delete",
+      dramaTitle: "Bridge Drama Shell Delete",
+    });
+    const videoProject = createVideoFixture({
+      id: "bridge-video-shell-delete",
+      title: "Bridge Drama Shell Delete",
+      sourceProjectId: dramaProject.id,
+    });
+
+    writeDramaProjects([dramaProject]);
+    localStorage.setItem(VIDEO_PROJECTS_KEY, JSON.stringify([videoProject]));
+
+    const result = await deleteConversationProject({
+      projectId: dramaProject.id,
+      projectKind: "video",
+      sourceProjectId: dramaProject.id,
+    });
+    const snapshots = await listRecentConversationSnapshots(20, { fast: true });
+
+    expect(result.deletedProjectIds.sort()).toEqual([dramaProject.id, videoProject.id].sort());
+    expect(loadStoredDramaProjectById(dramaProject.id)).toBeNull();
+    expect(snapshots.some((snapshot) => snapshot.projectId === dramaProject.id)).toBe(false);
+    expect(snapshots.some((snapshot) => snapshot.projectId === videoProject.id)).toBe(false);
+  });
+
+  it("keeps the linked source script when another bridged video sibling still exists", async () => {
+    const dramaProject = createDramaFixture({
+      id: "bridge-drama-keep",
+      dramaTitle: "Bridge Drama Keep",
+    });
+    const firstVideoProject = createVideoFixture({
+      id: "bridge-video-keep-1",
+      title: "Bridge Drama Keep",
+      sourceProjectId: dramaProject.id,
+    });
+    const secondVideoProject = createVideoFixture({
+      id: "bridge-video-keep-2",
+      title: "Bridge Drama Keep B",
+      sourceProjectId: dramaProject.id,
+      updatedAt: "2026-04-03T02:00:00.000Z",
+    });
+
+    writeDramaProjects([dramaProject]);
+    localStorage.setItem(VIDEO_PROJECTS_KEY, JSON.stringify([firstVideoProject, secondVideoProject]));
+
+    const result = await deleteConversationProject({
+      projectId: firstVideoProject.id,
+      projectKind: "video",
+      sourceProjectId: dramaProject.id,
+    });
+    const snapshots = await listRecentConversationSnapshots(20, { fast: true });
+
+    expect(result.deletedProjectIds).toEqual([firstVideoProject.id]);
+    expect(loadStoredDramaProjectById(dramaProject.id)?.id).toBe(dramaProject.id);
+    expect(snapshots.some((snapshot) => snapshot.projectId === dramaProject.id)).toBe(true);
+    expect(snapshots.some((snapshot) => snapshot.projectId === secondVideoProject.id)).toBe(true);
+    expect(snapshots.some((snapshot) => snapshot.projectId === firstVideoProject.id)).toBe(false);
+  });
+
+  it("filters reset-marked projects out of recent snapshots even if lingering local project data still exists", async () => {
+    const dramaProject = createDramaFixture({
+      id: "deleted-drama-visible",
+      dramaTitle: "Deleted Drama Visible",
+    });
+    const videoProject = createVideoFixture({
+      id: "deleted-video-visible",
+      title: "Deleted Video Visible",
+    });
+
+    writeDramaProjects([dramaProject]);
+    localStorage.setItem(VIDEO_PROJECTS_KEY, JSON.stringify([videoProject]));
+    localStorage.setItem(
+      "storyforge-session-reset-marker-v1",
+      JSON.stringify([dramaProject.id, videoProject.id]),
+    );
+
+    const snapshots = await listRecentConversationSnapshots(20, { fast: true });
+
+    expect(snapshots.some((snapshot) => snapshot.projectId === dramaProject.id)).toBe(false);
+    expect(snapshots.some((snapshot) => snapshot.projectId === videoProject.id)).toBe(false);
+  });
+
+  it("purges lingering archive folders for reset-marked projects before building recent snapshots", async () => {
+    const projectId = "deleted-archive-visible";
+    const archiveDir = `C:/Storyforge/files/conversations/Deleted-Archive--${projectId}`;
+    const archiveFiles = new Map<string, string>([
+      [
+        `${archiveDir}/history-manifest.json`,
+        JSON.stringify({
+          archiveVersion: 1,
+          projectId,
+          title: "Deleted Archive",
+          projectKind: "adaptation",
+          updatedAt: "2026-05-09T12:37:45.578Z",
+          messageCount: 0,
+          artifactCount: 0,
+          currentObjective: "",
+          derivedStage: "",
+          agentSummary: "",
+          recommendedActions: [],
+          dirName: `Deleted-Archive--${projectId}`,
+          hasFullHistory: false,
+        }),
+      ],
+      [`${archiveDir}/project.json`, JSON.stringify(createDramaFixture({ id: projectId, dramaTitle: "Deleted Archive" }))],
+    ]);
+    const deletedDirs: string[] = [];
+
+    Object.defineProperty(window, "electronAPI", {
+      value: {
+        storage: {
+          getDefaultPath: async () => ({ files: "C:/Storyforge/files", db: "C:/Storyforge/db" }),
+          listDir: async (dirPath: string) => {
+            if (dirPath === "C:/Storyforge/files/conversations") {
+              return {
+                ok: true,
+                entries: [{ name: `Deleted-Archive--${projectId}`, isDirectory: true }],
+              };
+            }
+            return { ok: true, entries: [] };
+          },
+          readText: async (filePath: string) =>
+            archiveFiles.has(filePath)
+              ? { ok: true, exists: true, content: archiveFiles.get(filePath) }
+              : { ok: true, exists: false, content: "" },
+          writeText: async (filePath: string, content: string) => {
+            archiveFiles.set(filePath, content);
+            return { ok: true };
+          },
+          deleteDir: async (dirPath: string) => {
+            deletedDirs.push(dirPath);
+            for (const filePath of [...archiveFiles.keys()]) {
+              if (filePath === dirPath || filePath.startsWith(`${dirPath}/`)) {
+                archiveFiles.delete(filePath);
+              }
+            }
+            return { ok: true };
+          },
+        },
+      },
+      writable: true,
+      configurable: true,
+    });
+    localStorage.setItem("storyforge-session-reset-marker-v1", JSON.stringify([projectId]));
+
+    const snapshots = await listRecentConversationSnapshots(20, { fast: true });
+
+    expect(snapshots.some((snapshot) => snapshot.projectId === projectId)).toBe(false);
+    expect(deletedDirs).toEqual([archiveDir]);
+    expect(archiveFiles.size).toBe(0);
+  });
+
+  it("refuses to reopen a reset-marked project even if lingering local project data still exists", async () => {
+    const dramaProject = createDramaFixture({
+      id: "deleted-drama-source",
+      dramaTitle: "Deleted Drama Source",
+    });
+    const videoProject = createVideoFixture({
+      id: "deleted-video-source",
+      title: "Deleted Video Source",
+    });
+
+    writeDramaProjects([dramaProject]);
+    localStorage.setItem(VIDEO_PROJECTS_KEY, JSON.stringify([videoProject]));
+    localStorage.setItem(
+      "storyforge-session-reset-marker-v1",
+      JSON.stringify([dramaProject.id, videoProject.id]),
+    );
+
+    await expect(loadConversationSourceById(dramaProject.id)).resolves.toEqual({
+      snapshot: null,
+      dramaProject: null,
+      videoProject: null,
+    });
+    await expect(loadConversationSourceById(videoProject.id, { fastVideoLoad: true })).resolves.toEqual({
+      snapshot: null,
+      dramaProject: null,
+      videoProject: null,
+    });
   });
 });

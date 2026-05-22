@@ -103,6 +103,52 @@ var init_esm = __esm({
   }
 });
 
+// src/lib/server-proxy.ts
+function getServerProxyEndpoint(provider) {
+  return SERVER_PROXY_ENDPOINTS[provider];
+}
+function isServerProxyEndpoint(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return false;
+  if (trimmed.startsWith(`${SERVER_PROXY_PREFIX}/`)) {
+    return true;
+  }
+  try {
+    const parsed = typeof window !== "undefined" ? new URL(trimmed, window.location.href) : new URL(trimmed);
+    return parsed.pathname.startsWith(`${SERVER_PROXY_PREFIX}/`);
+  } catch {
+    return false;
+  }
+}
+function shouldUseServerProxyRouting() {
+  if (typeof window === "undefined") return false;
+  if (typeof window.electronAPI === "object" && window.electronAPI !== null) return false;
+  const { protocol } = window.location;
+  return protocol === "http:" || protocol === "https:";
+}
+function shouldPreferServerProxyDefaults() {
+  if (!shouldUseServerProxyRouting()) return false;
+  const { hostname } = window.location;
+  return !/^(localhost|127\.0\.0\.1|\[::1\]|::1)$/i.test(hostname);
+}
+var SERVER_PROXY_PREFIX, SERVER_PROXY_ENDPOINTS;
+var init_server_proxy = __esm({
+  "src/lib/server-proxy.ts"() {
+    SERVER_PROXY_PREFIX = "/api/proxy";
+    SERVER_PROXY_ENDPOINTS = {
+      gemini: `${SERVER_PROXY_PREFIX}/gemini`,
+      gpt: `${SERVER_PROXY_PREFIX}/gpt`,
+      claude: `${SERVER_PROXY_PREFIX}/claude`,
+      grok: `${SERVER_PROXY_PREFIX}/grok`,
+      aliyun: `${SERVER_PROXY_PREFIX}/aliyun`,
+      runninghub: `${SERVER_PROXY_PREFIX}/runninghub`,
+      seedream: `${SERVER_PROXY_PREFIX}/seedream`,
+      jimeng: `${SERVER_PROXY_PREFIX}/jimeng`,
+      tuzi: `${SERVER_PROXY_PREFIX}/tuzi`
+    };
+  }
+});
+
 // src/lib/api-config.ts
 function deobfuscate(value) {
   if (!value) return "";
@@ -118,27 +164,67 @@ function readEnvString(name) {
   const value = env[name];
   return typeof value === "string" ? value.trim() : "";
 }
+function getPreferredProxyDefaults() {
+  if (!shouldPreferServerProxyDefaults()) return {};
+  return {
+    geminiEndpoint: getServerProxyEndpoint("gemini"),
+    gptEndpoint: getServerProxyEndpoint("gpt"),
+    claudeEndpoint: getServerProxyEndpoint("claude"),
+    grokEndpoint: getServerProxyEndpoint("grok"),
+    aliyunEndpoint: getServerProxyEndpoint("aliyun"),
+    runninghubEndpoint: getServerProxyEndpoint("runninghub"),
+    seedreamEndpoint: getServerProxyEndpoint("seedream"),
+    jimengEndpoint: getServerProxyEndpoint("jimeng"),
+    tuziEndpoint: getServerProxyEndpoint("tuzi")
+  };
+}
 function getEnvDefaultApiConfig() {
+  const proxyDefaults = getPreferredProxyDefaults();
   const unifiedKey = readEnvString("VITE_DEFAULT_UNIFIED_API_KEY");
   const textEndpoint = readEnvString("VITE_DEFAULT_TEXT_ENDPOINT");
   const imageEndpoint = readEnvString("VITE_DEFAULT_IMAGE_ENDPOINT") || textEndpoint;
   const videoEndpoint = readEnvString("VITE_DEFAULT_VIDEO_ENDPOINT") || imageEndpoint || textEndpoint;
   return {
-    geminiEndpoint: readEnvString("VITE_DEFAULT_GEMINI_ENDPOINT") || imageEndpoint,
+    geminiEndpoint: readEnvString("VITE_DEFAULT_GEMINI_ENDPOINT") || proxyDefaults.geminiEndpoint || imageEndpoint,
     geminiKey: readEnvString("VITE_DEFAULT_GEMINI_KEY") || unifiedKey,
-    gptEndpoint: readEnvString("VITE_DEFAULT_GPT_ENDPOINT") || textEndpoint,
+    aliyunEndpoint: readEnvString("VITE_DEFAULT_ALIYUN_ENDPOINT"),
+    aliyunKey: readEnvString("VITE_DEFAULT_ALIYUN_KEY"),
+    runninghubEndpoint: readEnvString("VITE_DEFAULT_RUNNINGHUB_ENDPOINT"),
+    runninghubKey: readEnvString("VITE_DEFAULT_RUNNINGHUB_KEY"),
+    gptEndpoint: readEnvString("VITE_DEFAULT_GPT_ENDPOINT") || proxyDefaults.gptEndpoint || textEndpoint,
     gptKey: readEnvString("VITE_DEFAULT_GPT_KEY") || unifiedKey,
-    claudeEndpoint: readEnvString("VITE_DEFAULT_CLAUDE_ENDPOINT") || textEndpoint,
+    claudeEndpoint: readEnvString("VITE_DEFAULT_CLAUDE_ENDPOINT") || proxyDefaults.claudeEndpoint || textEndpoint,
     claudeKey: readEnvString("VITE_DEFAULT_CLAUDE_KEY") || unifiedKey,
-    grokEndpoint: readEnvString("VITE_DEFAULT_GROK_ENDPOINT") || textEndpoint,
+    grokEndpoint: readEnvString("VITE_DEFAULT_GROK_ENDPOINT") || proxyDefaults.grokEndpoint || textEndpoint,
     grokKey: readEnvString("VITE_DEFAULT_GROK_KEY") || unifiedKey,
-    seedreamEndpoint: readEnvString("VITE_DEFAULT_SEEDREAM_ENDPOINT") || imageEndpoint,
+    seedreamEndpoint: readEnvString("VITE_DEFAULT_SEEDREAM_ENDPOINT") || proxyDefaults.seedreamEndpoint || imageEndpoint,
     seedreamKey: readEnvString("VITE_DEFAULT_SEEDREAM_KEY") || unifiedKey,
-    jimengEndpoint: readEnvString("VITE_DEFAULT_JIMENG_ENDPOINT") || videoEndpoint,
+    jimengEndpoint: readEnvString("VITE_DEFAULT_JIMENG_ENDPOINT") || proxyDefaults.jimengEndpoint || videoEndpoint,
     jimengKey: readEnvString("VITE_DEFAULT_JIMENG_KEY") || unifiedKey,
-    jimengExecutionMode: readEnvString("VITE_DEFAULT_JIMENG_EXECUTION_MODE") === "api" || readEnvString("VITE_DEFAULT_JIMENG_EXECUTION_MODE") === "cli" ? readEnvString("VITE_DEFAULT_JIMENG_EXECUTION_MODE") : void 0,
-    tuziEndpoint: readEnvString("VITE_DEFAULT_TUZI_ENDPOINT") || textEndpoint,
+    tuziEndpoint: readEnvString("VITE_DEFAULT_TUZI_ENDPOINT") || proxyDefaults.tuziEndpoint || textEndpoint,
     tuziKey: readEnvString("VITE_DEFAULT_TUZI_KEY") || unifiedKey
+  };
+}
+function applyProxyEndpointFallbacks(config) {
+  const proxyDefaults = getPreferredProxyDefaults();
+  if (!Object.keys(proxyDefaults).length) return config;
+  return {
+    ...config,
+    geminiEndpoint: config.geminiEndpoint || proxyDefaults.geminiEndpoint || "",
+    aliyunEndpoint: config.aliyunEndpoint || proxyDefaults.aliyunEndpoint || "",
+    gptEndpoint: config.gptEndpoint || proxyDefaults.gptEndpoint || "",
+    claudeEndpoint: config.claudeEndpoint || proxyDefaults.claudeEndpoint || "",
+    grokEndpoint: config.grokEndpoint || proxyDefaults.grokEndpoint || "",
+    seedreamEndpoint: config.seedreamEndpoint || proxyDefaults.seedreamEndpoint || "",
+    jimengEndpoint: config.jimengEndpoint || proxyDefaults.jimengEndpoint || "",
+    tuziEndpoint: config.tuziEndpoint || proxyDefaults.tuziEndpoint || ""
+  };
+}
+function applyServerProxyEndpointRouting(config) {
+  if (!shouldUseServerProxyRouting()) return config;
+  return {
+    ...config,
+    ...SERVER_PROXY_ROUTE_ENDPOINTS
   };
 }
 function normalizeStoredConfig(config) {
@@ -148,6 +234,10 @@ function normalizeStoredConfig(config) {
     apiMode: "builtin",
     geminiEndpoint: typeof config.geminiEndpoint === "string" ? config.geminiEndpoint.trim() : "",
     geminiKey: typeof config.geminiKey === "string" ? config.geminiKey.trim() : "",
+    aliyunEndpoint: typeof config.aliyunEndpoint === "string" ? config.aliyunEndpoint.trim() : "",
+    aliyunKey: typeof config.aliyunKey === "string" ? config.aliyunKey.trim() : "",
+    runninghubEndpoint: typeof config.runninghubEndpoint === "string" ? config.runninghubEndpoint.trim() : "",
+    runninghubKey: typeof config.runninghubKey === "string" ? config.runninghubKey.trim() : "",
     gptEndpoint: typeof config.gptEndpoint === "string" ? config.gptEndpoint.trim() : "",
     gptKey: typeof config.gptKey === "string" ? config.gptKey.trim() : "",
     claudeEndpoint: typeof config.claudeEndpoint === "string" ? config.claudeEndpoint.trim() : "",
@@ -158,9 +248,10 @@ function normalizeStoredConfig(config) {
     seedreamKey: typeof config.seedreamKey === "string" ? config.seedreamKey.trim() : "",
     jimengEndpoint: typeof config.jimengEndpoint === "string" ? config.jimengEndpoint.trim() : "",
     jimengKey: typeof config.jimengKey === "string" ? config.jimengKey.trim() : "",
-    jimengExecutionMode: config.jimengExecutionMode === "api" || config.jimengExecutionMode === "cli" ? config.jimengExecutionMode : "api",
+    jimengExecutionMode: config.jimengExecutionMode === "cli" ? "cli" : "api",
     tuziEndpoint: typeof config.tuziEndpoint === "string" ? config.tuziEndpoint.trim() : "",
     tuziKey: typeof config.tuziKey === "string" ? config.tuziKey.trim() : "",
+    storagePath: "",
     modelMappings: normalizeModelMappings(config.modelMappings)
   };
 }
@@ -188,12 +279,13 @@ function getStoredApiConfig() {
     };
     merged = applyLegacyCompatibility(parsed, merged);
     merged = decodeSensitiveFields(merged);
-    return normalizeStoredConfig(merged);
+    merged = applyEmptyFieldFallbacks(merged, envDefaults);
+    return applyProxyEndpointFallbacks(normalizeStoredConfig(merged));
   } catch {
-    return normalizeStoredConfig({
+    return applyProxyEndpointFallbacks(normalizeStoredConfig({
       ...DEFAULT_API_CONFIG,
       ...getEnvDefaultApiConfig()
-    });
+    }));
   }
 }
 function normalizeModelMappings(value) {
@@ -216,6 +308,36 @@ function decodeSensitiveFields(config) {
     const value = next[key];
     if (typeof value === "string" && value) {
       next[key] = deobfuscate(value);
+    }
+  }
+  return next;
+}
+function applyEmptyFieldFallbacks(config, defaults) {
+  const next = { ...config };
+  for (const field of [
+    "geminiEndpoint",
+    "geminiKey",
+    "aliyunEndpoint",
+    "aliyunKey",
+    "runninghubEndpoint",
+    "runninghubKey",
+    "gptEndpoint",
+    "gptKey",
+    "claudeEndpoint",
+    "claudeKey",
+    "grokEndpoint",
+    "grokKey",
+    "seedreamEndpoint",
+    "seedreamKey",
+    "jimengEndpoint",
+    "jimengKey",
+    "tuziEndpoint",
+    "tuziKey"
+  ]) {
+    const currentValue = next[field];
+    const fallbackValue = defaults[field];
+    if (typeof currentValue === "string" && !currentValue.trim() && typeof fallbackValue === "string" && fallbackValue.trim()) {
+      next[field] = fallbackValue.trim();
     }
   }
   return next;
@@ -246,6 +368,10 @@ function applyBuiltinOverlay(config) {
     ...normalizedConfig,
     geminiEndpoint,
     geminiKey,
+    aliyunEndpoint: pick("aliyunEndpoint", "aliyunEndpoint"),
+    aliyunKey: pick("aliyunKey", "aliyunKey"),
+    runninghubEndpoint: pick("runninghubEndpoint", "runninghubEndpoint"),
+    runninghubKey: pick("runninghubKey", "runninghubKey"),
     gptEndpoint: pick("gptEndpoint", "gptEndpoint") || geminiEndpoint,
     gptKey: pick("gptKey", "gptKey") || geminiKey,
     claudeEndpoint: pick("claudeEndpoint", "claudeEndpoint") || geminiEndpoint,
@@ -256,7 +382,7 @@ function applyBuiltinOverlay(config) {
     seedreamKey: pick("seedreamKey", "seedreamKey") || geminiKey,
     jimengEndpoint: pick("jimengEndpoint", "jimengEndpoint") || geminiEndpoint,
     jimengKey: pick("jimengKey", "jimengKey") || geminiKey,
-    jimengExecutionMode: normalizedConfig.jimengExecutionMode,
+    jimengExecutionMode: "api",
     tuziEndpoint: pick("tuziEndpoint", "tuziEndpoint"),
     tuziKey: pick("tuziKey", "tuziKey"),
     modelMappings: {
@@ -271,14 +397,19 @@ function resolveApiConfigForRuntime(config) {
 }
 function getApiConfig() {
   try {
-    return resolveApiConfigForRuntime(getStoredApiConfig());
+    return applyServerProxyEndpointRouting(
+      applyProxyEndpointFallbacks(resolveApiConfigForRuntime(getStoredApiConfig()))
+    );
   } catch {
-    return applyBuiltinOverlay(DEFAULT_API_CONFIG);
+    return applyServerProxyEndpointRouting(
+      applyProxyEndpointFallbacks(applyBuiltinOverlay(DEFAULT_API_CONFIG))
+    );
   }
 }
-var import_meta, DEFAULT_NETWORK_RETRY_COUNT, DEFAULT_NETWORK_RETRY_DELAY_MS, STATIC_ARK_VIDEO_MODEL_MAPPING_FALLBACKS, STORAGE_KEY, OBF_PREFIX, builtinApiBundleCache, SENSITIVE_KEYS, DEFAULT_API_CONFIG;
+var import_meta, DEFAULT_NETWORK_RETRY_COUNT, DEFAULT_NETWORK_RETRY_DELAY_MS, STATIC_ARK_VIDEO_MODEL_MAPPING_FALLBACKS, STORAGE_KEY, OBF_PREFIX, builtinApiBundleCache, localProxySyncChain, SENSITIVE_KEYS, DEFAULT_API_CONFIG, SERVER_PROXY_ROUTE_ENDPOINTS;
 var init_api_config = __esm({
   "src/lib/api-config.ts"() {
+    init_server_proxy();
     import_meta = {};
     DEFAULT_NETWORK_RETRY_COUNT = 1;
     DEFAULT_NETWORK_RETRY_DELAY_MS = 800;
@@ -289,8 +420,11 @@ var init_api_config = __esm({
     };
     STORAGE_KEY = "storyforge_api_config";
     OBF_PREFIX = "obf:";
+    localProxySyncChain = Promise.resolve();
     SENSITIVE_KEYS = [
       "geminiKey",
+      "aliyunKey",
+      "runninghubKey",
       "gptKey",
       "claudeKey",
       "grokKey",
@@ -302,6 +436,10 @@ var init_api_config = __esm({
       apiMode: "builtin",
       geminiEndpoint: "",
       geminiKey: "",
+      aliyunEndpoint: "",
+      aliyunKey: "",
+      runninghubEndpoint: "",
+      runninghubKey: "",
       gptEndpoint: "",
       gptKey: "",
       claudeEndpoint: "",
@@ -321,6 +459,17 @@ var init_api_config = __esm({
       retryCount: DEFAULT_NETWORK_RETRY_COUNT,
       retryDelayMs: DEFAULT_NETWORK_RETRY_DELAY_MS,
       storagePath: ""
+    };
+    SERVER_PROXY_ROUTE_ENDPOINTS = {
+      geminiEndpoint: getServerProxyEndpoint("gemini"),
+      gptEndpoint: getServerProxyEndpoint("gpt"),
+      claudeEndpoint: getServerProxyEndpoint("claude"),
+      grokEndpoint: getServerProxyEndpoint("grok"),
+      aliyunEndpoint: getServerProxyEndpoint("aliyun"),
+      runninghubEndpoint: getServerProxyEndpoint("runninghub"),
+      seedreamEndpoint: getServerProxyEndpoint("seedream"),
+      jimengEndpoint: getServerProxyEndpoint("jimeng"),
+      tuziEndpoint: getServerProxyEndpoint("tuzi")
     };
   }
 });
@@ -387,16 +536,24 @@ function buildChatCompletionsApiUrl(baseUrl) {
   const root = String(baseUrl || DEFAULT_GEMINI_BASE_URL).replace(/\/v1beta(\/.*)?$/i, "").replace(/\/v1(\/.*)?$/i, "").replace(/\/+$/i, "");
   return `${root}/v1/chat/completions`;
 }
+function withOptionalAuthorization(headers, apiKey, url) {
+  if (!apiKey || isServerProxyEndpoint(url)) {
+    return headers;
+  }
+  return {
+    ...headers,
+    Authorization: `Bearer ${apiKey}`
+  };
+}
 async function fetchWithRetry(opts) {
   const { maxRetries, delayMs } = getNetworkRetrySettings();
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const response = await fetch(opts.url, {
       method: "POST",
-      headers: {
+      headers: withOptionalAuthorization({
         "content-type": "application/json",
-        Authorization: `Bearer ${opts.apiKey}`,
         ...opts.headers ?? {}
-      },
+      }, opts.apiKey, opts.url),
       body: JSON.stringify(opts.body),
       signal: opts.signal
     });
@@ -1068,10 +1225,9 @@ async function callModelAPI(opts) {
   }) : await (async () => {
     const response = await fetch(requestUrl, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        Authorization: `Bearer ${apiKey}`
-      },
+      headers: withOptionalAuthorization({
+        "content-type": "application/json"
+      }, apiKey, requestUrl),
       body: JSON.stringify(requestParams)
     });
     if (!response.ok) {
@@ -1223,11 +1379,10 @@ async function* callModelAPIStream(opts) {
   }
   const response = await fetch(requestUrl, {
     method: "POST",
-    headers: {
+    headers: withOptionalAuthorization({
       "content-type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
       "anthropic-version": "2023-06-01"
-    },
+    }, apiKey, requestUrl),
     body: JSON.stringify(requestParams)
   });
   if (!response.ok) {
@@ -1342,6 +1497,7 @@ var init_api_client = __esm({
   "src/lib/agent/api-client.ts"() {
     init_esm();
     init_network_retry_settings();
+    init_server_proxy();
     MAX_OUTPUT_TOKENS_DEFAULT = 16384;
     MAX_OUTPUT_TOKENS_THINKING = 32768;
     DEFAULT_GEMINI_BASE_URL = "https://api.tu-zi.com/v1beta";
@@ -1848,9 +2004,9 @@ var require_path = __commonJS({
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.convertPosixPathToPattern = exports2.convertWindowsPathToPattern = exports2.convertPathToPattern = exports2.escapePosixPath = exports2.escapeWindowsPath = exports2.escape = exports2.removeLeadingDotSegment = exports2.makeAbsolute = exports2.unixify = void 0;
-    var os2 = require("os");
+    var os = require("os");
     var path2 = require("path");
-    var IS_WINDOWS_PLATFORM = os2.platform() === "win32";
+    var IS_WINDOWS_PLATFORM = os.platform() === "win32";
     var LEADING_DOT_SEGMENT_CHARACTERS_COUNT = 2;
     var POSIX_UNESCAPED_GLOB_SYMBOLS_RE = /(\\?)([()*?[\]{|}]|^!|[!+@](?=\()|\\(?![!()*+?@[\]{|}]))/g;
     var WINDOWS_UNESCAPED_GLOB_SYMBOLS_RE = /(\\?)([()[\]{}]|^!|[!+@](?=\())/g;
@@ -7071,8 +7227,8 @@ var require_settings4 = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.DEFAULT_FILE_SYSTEM_ADAPTER = void 0;
     var fs2 = require("fs");
-    var os2 = require("os");
-    var CPU_COUNT = Math.max(os2.cpus().length, 1);
+    var os = require("os");
+    var CPU_COUNT = Math.max(os.cpus().length, 1);
     exports2.DEFAULT_FILE_SYSTEM_ADAPTER = {
       lstat: fs2.lstat,
       lstatSync: fs2.lstatSync,
@@ -7228,6 +7384,7 @@ var require_out4 = __commonJS({
 // electron/main.ts
 var path = require("node:path");
 var crypto = require("node:crypto");
+var http = require("node:http");
 var {
   app,
   BrowserWindow,
@@ -7238,22 +7395,52 @@ var {
   shell
 } = require("electron");
 var fs = require("node:fs");
-var os = require("node:os");
 var BUILTIN_API_ADMIN_PASSWORD_HASH = "d4f31b6def1e6e11148cbab15b400e91528ab18880b25225d9a9f840d4d0d192";
-var STARTUP_LOG_PATH = path.join(
-  process.env.TEMP || process.cwd(),
-  "infinio-startup.log"
-);
+function ensureDir(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+  return dirPath;
+}
+function getPortableExecutableDir() {
+  const portableDir = String(process.env.PORTABLE_EXECUTABLE_DIR || "").trim();
+  return portableDir ? path.resolve(portableDir) : null;
+}
+function getAppRootDir() {
+  const overrideDir = String(process.env.INFINIO_APP_ROOT_DIR || "").trim();
+  if (overrideDir) {
+    return path.resolve(overrideDir);
+  }
+  if (app.isPackaged) {
+    return getPortableExecutableDir() || path.dirname(process.execPath);
+  }
+  return path.resolve(__dirname, "..");
+}
+var APP_ROOT_DIR = getAppRootDir();
+var APP_LOGS_DIR = ensureDir(path.join(APP_ROOT_DIR, "logs"));
+var STARTUP_LOG_PATH = path.join(APP_LOGS_DIR, "infinio-startup.log");
+var APP_TEMP_DIR = ensureDir(path.join(APP_ROOT_DIR, "temp"));
+var APP_USER_DATA_DIR = ensureDir(path.join(APP_ROOT_DIR, "userData"));
+var APP_DB_DIR = ensureDir(path.join(APP_ROOT_DIR, "db"));
+var DEV_SERVER_WARMUP_POLL_INTERVAL_MS = 1e3;
+var DEV_SERVER_WARMUP_REQUEST_TIMEOUT_MS = 12e4;
+var DEV_SERVER_WARMUP_TIMEOUT_MS = 5 * 6e4;
 var mainWindow = null;
 var tray = null;
+var devLauncherWatchdog = null;
+var watchedDevServerPid = null;
+var allowTestMultiInstance = String(process.env.HOME_AGENT_ALLOW_TEST_MULTI_INSTANCE || "").trim() === "1";
+var singleInstanceLock = allowTestMultiInstance ? true : app.requestSingleInstanceLock();
+if (!singleInstanceLock) {
+  app.quit();
+}
 var INFINIO_USER_DATA = (() => {
-  const p = path.join(os.homedir(), "AppData", "Roaming", "InFinio");
   try {
-    fs.mkdirSync(p, { recursive: true });
-    app.setPath("userData", p);
+    app.setPath("userData", APP_USER_DATA_DIR);
+    app.setPath("sessionData", ensureDir(path.join(APP_ROOT_DIR, "sessionData")));
+    app.setPath("crashDumps", ensureDir(path.join(APP_ROOT_DIR, "crashDumps")));
+    app.setPath("temp", APP_TEMP_DIR);
   } catch {
   }
-  return p;
+  return APP_USER_DATA_DIR;
 })();
 var GPU_DISABLE_FLAG = path.join(INFINIO_USER_DATA, ".disable-gpu");
 var GPU_DISABLED = fs.existsSync(GPU_DISABLE_FLAG);
@@ -7263,24 +7450,78 @@ app.commandLine.appendSwitch("no-first-run");
 app.commandLine.appendSwitch("disable-background-networking");
 app.commandLine.appendSwitch("disable-sync");
 app.commandLine.appendSwitch("safebrowsing-disable-auto-update");
+var REMOTE_DEBUGGING_PORT = String(process.env.HOME_AGENT_ELECTRON_REMOTE_DEBUGGING_PORT || "").trim();
+if (/^\d+$/.test(REMOTE_DEBUGGING_PORT)) {
+  app.commandLine.appendSwitch("remote-debugging-port", REMOTE_DEBUGGING_PORT);
+}
 if (GPU_DISABLED) {
   app.commandLine.appendSwitch("disable-gpu");
   app.commandLine.appendSwitch("use-gl", "swiftshader");
   app.commandLine.appendSwitch("disable-gpu-compositing");
-  console.warn("[main] GPU \u5DF2\u7981\u7528\uFF0C\u4F7F\u7528\u8F6F\u4EF6\u6E32\u67D3\u6A21\u5F0F");
+  console.warn("[main] GPU \u5BB8\u832C\uE6E6\u9422\uE7D2\u7D1D\u6D63\u8DE8\u6564\u675E\uE219\u6B22\u5A13\u53C9\u714B\u59AF\u2033\u7D21");
 }
 function getUserDataPath() {
   return app.getPath("userData");
 }
+function parseEnvPid(value) {
+  if (!value) return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+function readSmokeSelectFolderOverride() {
+  const raw = String(process.env.HOME_AGENT_SMOKE_SELECT_FOLDER || "").trim();
+  if (!raw) return null;
+  return path.resolve(raw);
+}
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function killProcessTree(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) return;
+  try {
+    if (process.platform === "win32") {
+      const { spawn } = require("node:child_process");
+      const killer = spawn("taskkill", ["/pid", String(pid), "/t", "/f"], {
+        stdio: "ignore",
+        windowsHide: true
+      });
+      killer.on("error", () => {
+      });
+      return;
+    }
+    process.kill(pid, "SIGTERM");
+  } catch {
+  }
+}
+function stopDevLauncherWatchdog() {
+  if (devLauncherWatchdog) {
+    clearInterval(devLauncherWatchdog);
+    devLauncherWatchdog = null;
+  }
+}
+function startDevLauncherWatchdog() {
+  if (app.isPackaged) return;
+  const launcherPid = parseEnvPid(process.env.INFINIO_DEV_LAUNCH_PID);
+  watchedDevServerPid = parseEnvPid(process.env.INFINIO_DEV_SERVER_PID);
+  if (!launcherPid) return;
+  stopDevLauncherWatchdog();
+  devLauncherWatchdog = setInterval(() => {
+    if (processExists(launcherPid)) return;
+    stopDevLauncherWatchdog();
+    if (watchedDevServerPid) {
+      killProcessTree(watchedDevServerPid);
+      watchedDevServerPid = null;
+    }
+    app.quit();
+  }, 2e3);
+}
 function getDefaultFilesDir() {
-  const portableDir = process.env.PORTABLE_EXECUTABLE_DIR;
-  if (app.isPackaged && portableDir) {
-    return path.join(portableDir, "files");
-  }
-  if (app.isPackaged) {
-    return path.join(app.getPath("userData"), "files");
-  }
-  return path.join(__dirname, "..", "files");
+  return path.join(APP_ROOT_DIR, "files");
 }
 function getBundledFilesDir() {
   if (!app.isPackaged) return null;
@@ -7329,6 +7570,105 @@ function log(level, msg) {
   } catch {
   }
 }
+function isExpectedDevServer(body) {
+  return body.includes('<div id="root"></div>') && body.includes("/src/main.tsx");
+}
+function isExpectedMainModule(body) {
+  return body.includes("createRoot") && body.includes("App from") && body.includes("/src/App.tsx");
+}
+function probeDevServerOnce(devUrl) {
+  return new Promise((resolve) => {
+    const mainModuleUrl = new URL("/src/main.tsx", devUrl).toString();
+    const requestTextOnce = (targetUrl) => new Promise((innerResolve) => {
+      const request = http.get(targetUrl, (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => {
+          if (typeof chunk === "undefined") return;
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        response.on("end", () => {
+          innerResolve({
+            reachable: true,
+            statusCode: response.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString("utf8")
+          });
+        });
+      });
+      request.setTimeout(DEV_SERVER_WARMUP_REQUEST_TIMEOUT_MS, () => {
+        request.destroy(new Error("probe timeout"));
+      });
+      request.on("error", () => {
+        innerResolve({
+          reachable: false,
+          statusCode: 0,
+          body: ""
+        });
+      });
+    });
+    void (async () => {
+      const pageProbe = await requestTextOnce(devUrl);
+      const pageReusable = pageProbe.reachable && pageProbe.statusCode >= 200 && pageProbe.statusCode < 300 && isExpectedDevServer(pageProbe.body);
+      if (!pageReusable) {
+        resolve({
+          reachable: pageProbe.reachable,
+          reusable: false
+        });
+        return;
+      }
+      const mainModuleProbe = await requestTextOnce(mainModuleUrl);
+      const mainModuleReusable = mainModuleProbe.reachable && mainModuleProbe.statusCode >= 200 && mainModuleProbe.statusCode < 300 && isExpectedMainModule(mainModuleProbe.body);
+      resolve({
+        reachable: true,
+        reusable: mainModuleReusable
+      });
+    })();
+  });
+}
+async function waitForReusableDevServer(devUrl, win) {
+  const deadline = Date.now() + DEV_SERVER_WARMUP_TIMEOUT_MS;
+  while (Date.now() <= deadline) {
+    if (win.isDestroyed()) {
+      return false;
+    }
+    const probe = await probeDevServerOnce(devUrl);
+    if (probe.reusable) {
+      return true;
+    }
+    if (win.isDestroyed()) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, DEV_SERVER_WARMUP_POLL_INTERVAL_MS));
+  }
+  return false;
+}
+async function loadDevWarmupPage(win) {
+  const warmupPath = path.join(__dirname, "dev-warmup.html");
+  log("info", `loading dev warmup page: ${warmupPath}`);
+  await win.loadFile(warmupPath);
+}
+async function transitionWarmupWindowToDevServer(win, devUrl) {
+  const ready = await waitForReusableDevServer(devUrl, win);
+  if (!ready) {
+    if (!win.isDestroyed()) {
+      log("error", `timed out waiting for reusable dev server at ${devUrl}`);
+    }
+    return;
+  }
+  if (win.isDestroyed()) {
+    return;
+  }
+  try {
+    log("info", `dev warmup complete, loading live url: ${devUrl}`);
+    await win.loadURL(devUrl);
+    if (process.env.ELECTRON_OPEN_DEVTOOLS === "1" && !win.isDestroyed()) {
+      win.webContents.openDevTools();
+    }
+  } catch (error) {
+    if (!win.isDestroyed()) {
+      log("error", `failed to load live dev url: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
 process.on("uncaughtException", (error) => {
   log(
     "fatal",
@@ -7352,17 +7692,6 @@ function verifyBuiltinApiAdminPassword(password) {
     return false;
   }
   return crypto.timingSafeEqual(expectedBuffer, actualBuffer);
-}
-function getDreaminaCandidatePaths() {
-  const homeDir = os.homedir();
-  const executableName = process.platform === "win32" ? "dreamina.exe" : "dreamina";
-  return Array.from(
-    /* @__PURE__ */ new Set([
-      path.join(homeDir, "bin", executableName),
-      path.join(homeDir, ".local", "bin", executableName),
-      path.join(path.dirname(process.execPath), executableName)
-    ])
-  );
 }
 function setupIPC() {
   ipcMain.handle(
@@ -7409,58 +7738,6 @@ function setupIPC() {
       }
     }
   );
-  ipcMain.handle(
-    "dreamina:exec",
-    async (_event, { args, stdin }) => {
-      const executablePath = await resolveDreaminaExecutable();
-      if (!executablePath) {
-        return {
-          ok: false,
-          installed: false,
-          error: "\u672A\u68C0\u6D4B\u5230 dreamina CLI\uFF0C\u8BF7\u5148\u6267\u884C\u5B98\u65B9\u5B89\u88C5\u811A\u672C\u5B89\u88C5\u3002"
-        };
-      }
-      const safeArgs = Array.isArray(args) ? args.filter((value) => typeof value === "string" && value.length > 0) : [];
-      return await new Promise((resolve) => {
-        const proc = spawn(executablePath, safeArgs, {
-          stdio: ["pipe", "pipe", "pipe"],
-          windowsHide: true
-        });
-        let stdout = "";
-        let stderr = "";
-        proc.stdout.on("data", (chunk) => {
-          stdout += chunk.toString("utf8");
-        });
-        proc.stderr.on("data", (chunk) => {
-          stderr += chunk.toString("utf8");
-        });
-        proc.on("error", (error) => {
-          resolve({
-            ok: false,
-            installed: true,
-            path: executablePath,
-            error: error.message,
-            stdout,
-            stderr
-          });
-        });
-        proc.on("close", (code) => {
-          resolve({
-            ok: code === 0,
-            installed: true,
-            path: executablePath,
-            code: code ?? -1,
-            stdout,
-            stderr
-          });
-        });
-        if (typeof stdin === "string" && stdin.length > 0) {
-          proc.stdin.write(stdin);
-        }
-        proc.stdin.end();
-      });
-    }
-  );
   ipcMain.handle("storage:getDefaultPath", () => {
     const filesDir = getDefaultFilesDir();
     try {
@@ -7468,13 +7745,17 @@ function setupIPC() {
       seedRuntimeFilesDirFromBundle(filesDir);
     } catch {
     }
-    const userData = app.getPath("userData");
     return {
       files: filesDir,
-      db: path.join(userData, "db")
+      db: APP_DB_DIR
     };
   });
   ipcMain.handle("storage:selectFolder", async () => {
+    const smokeFolderOverride = readSmokeSelectFolderOverride();
+    if (smokeFolderOverride) {
+      fs.mkdirSync(smokeFolderOverride, { recursive: true });
+      return smokeFolderOverride;
+    }
     const { dialog } = require("electron");
     const result = await dialog.showOpenDialog(mainWindow, {
       properties: ["openDirectory"],
@@ -7521,7 +7802,7 @@ function setupIPC() {
       try {
         const { dialog } = require("electron");
         const result = await dialog.showSaveDialog(mainWindow, {
-          title: "\u4FDD\u5B58\u6587\u4EF6",
+          title: "\u6DC7\u6FC6\u74E8\u93C2\u56E6\u6B22",
           defaultPath: params.defaultFileName,
           filters: Array.isArray(params.filters) ? params.filters : void 0
         });
@@ -7536,6 +7817,23 @@ function setupIPC() {
         return {
           ok: false,
           cancelled: false,
+          filePath: null,
+          error: error instanceof Error ? error.message : String(error)
+        };
+      }
+    }
+  );
+  ipcMain.handle(
+    "storage:writeBase64File",
+    async (_event, { filePath, base64 }) => {
+      try {
+        const normalizedPath = path.normalize(filePath);
+        fs.mkdirSync(path.dirname(normalizedPath), { recursive: true });
+        fs.writeFileSync(normalizedPath, Buffer.from(base64, "base64"));
+        return { ok: true, filePath: normalizedPath };
+      } catch (error) {
+        return {
+          ok: false,
           filePath: null,
           error: error instanceof Error ? error.message : String(error)
         };
@@ -7922,22 +8220,6 @@ function setupIPC() {
       return null;
     }
   }
-  async function resolveDreaminaExecutable() {
-    for (const candidate of getDreaminaCandidatePaths()) {
-      if (fs.existsSync(candidate)) return candidate;
-    }
-    try {
-      const lookupCommand = process.platform === "win32" ? "where.exe" : "which";
-      const { stdout } = await execFileAsync(
-        lookupCommand,
-        ["dreamina"],
-        { windowsHide: true }
-      );
-      return String(stdout).split(/\r?\n/).map((line) => line.trim()).find((line) => !!line && fs.existsSync(line)) || null;
-    } catch {
-      return null;
-    }
-  }
   ipcMain.handle(
     "media:extractVideoFrames",
     async (_event, {
@@ -8067,7 +8349,7 @@ function setupIPC() {
         const ffmpegBin = await resolveBinaryExecutable("ffmpeg");
         if (!ffmpegBin) return { ok: false, error: "ffmpeg \u672A\u627E\u5230\u3002" };
         const normalizedInput = path.normalize(inputPath);
-        if (!fs.existsSync(normalizedInput)) return { ok: false, error: `\u8F93\u5165\u6587\u4EF6\u4E0D\u5B58\u5728: ${normalizedInput}` };
+        if (!fs.existsSync(normalizedInput)) return { ok: false, error: `\u6748\u64B3\u53C6\u93C2\u56E6\u6B22\u6D93\u5D85\u74E8\u9366? ${normalizedInput}` };
         fs.mkdirSync(path.dirname(path.normalize(outputPath)), { recursive: true });
         const srtFile = path.join(app.getPath("temp"), `infinio-subs-${Date.now()}.srt`);
         const toSrtTime = (ms) => {
@@ -8119,8 +8401,8 @@ ${entry.text}
       const lines = block.trim().split("\n");
       if (lines.length < 3) continue;
       const textLines = lines.slice(2).join("\n").trim();
-      if (/^[\s(（\[【♪♫]*[\)）\]】♪♫\s]*$/.test(textLines)) continue;
-      if (/^[\s(（\[【].*[\)）\]】]\s*$/.test(textLines)) continue;
+      if (/^[\s(锛圽[銆愨櫔鈾玗*[\)锛塡]銆戔櫔鈾玕s]*$/.test(textLines)) continue;
+      if (/^[\s(锛圽[銆怾.*[\)锛塡]銆慮\s*$/.test(textLines)) continue;
       if (textLines.replace(/[\s\p{P}]/gu, "").length < 1) continue;
       const [startStr, endStr] = lines[1].split(" --> ");
       entries.push({ startMs: parseMs(startStr.trim()), endMs: parseMs(endStr.trim()), text: textLines });
@@ -8346,8 +8628,8 @@ ${e.text}`).join("\n\n") + "\n";
             }).filter((e) => !!e);
             let entries = raw.filter((e) => {
               const t = e.text.trim();
-              if (/^[\s(（\[【♪♫]*[\)）\]】♪♫\s]*$/.test(t)) return false;
-              if (/^[\s(（\[【].*[\)）\]】]\s*$/.test(t)) return false;
+              if (/^[\s(锛圽[銆愨櫔鈾玗*[\)锛塡]銆戔櫔鈾玕s]*$/.test(t)) return false;
+              if (/^[\s(锛圽[銆怾.*[\)锛塡]銆慮\s*$/.test(t)) return false;
               if (t.replace(/[\s\p{P}]/gu, "").length < 1) return false;
               return true;
             });
@@ -8380,9 +8662,9 @@ ${e.text}`).join("\n\n") + "\n";
             });
             const deRepeat = deHallucinated.filter((e) => {
               const t = e.text.trim();
-              const parts = t.split(/[,，。.、；;]/).map((p) => p.trim()).filter(Boolean);
+              const parts = t.split(/[,锛屻€?銆侊紱;]/).map((p) => p.trim()).filter(Boolean);
               if (parts.length >= 2 && parts[0] === parts[1]) return false;
-              const clean = t.replace(/[,，。.、；;\s]/g, "");
+              const clean = t.replace(/[,锛屻€?銆侊紱;\s]/g, "");
               const half = Math.floor(clean.length / 2);
               if (half >= 3 && clean.slice(0, half) === clean.slice(half)) return false;
               return true;
@@ -8440,7 +8722,7 @@ ${e.text}`).join("\n\n") + "\n";
     async (_event, { toolName, args }) => {
       try {
         switch (toolName) {
-          // ── FileRead ──────────────────────────────────────────────────
+          // 鈹€鈹€ FileRead 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
           case "FileRead": {
             const filePath = String(args.filePath);
             const IMAGE_EXTS = /* @__PURE__ */ new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico"]);
@@ -8459,7 +8741,7 @@ ${e.text}`).join("\n\n") + "\n";
             const numbered = slice.map((line, i) => `${offset + i + 1}	${line}`).join("\n");
             return { content: numbered };
           }
-          // ── FileWrite ─────────────────────────────────────────────────
+          // 鈹€鈹€ FileWrite 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
           case "FileWrite": {
             const filePath = String(args.filePath);
             const content = String(args.content ?? "");
@@ -8467,7 +8749,7 @@ ${e.text}`).join("\n\n") + "\n";
             fs.writeFileSync(filePath, content, "utf8");
             return { ok: true };
           }
-          // ── FileEdit ──────────────────────────────────────────────────
+          // 鈹€鈹€ FileEdit 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
           case "FileEdit": {
             const filePath = String(args.filePath);
             if (!fs.existsSync(filePath)) return { error: `File not found: ${filePath}` };
@@ -8487,7 +8769,7 @@ ${e.text}`).join("\n\n") + "\n";
             fs.writeFileSync(filePath, content, "utf8");
             return { ok: true, message: `Edited ${filePath}` };
           }
-          // ── Glob ──────────────────────────────────────────────────────
+          // 鈹€鈹€ Glob 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
           case "Glob": {
             const pattern = String(args.pattern);
             const cwd = args.path ? String(args.path) : process.cwd();
@@ -8504,7 +8786,7 @@ ${e.text}`).join("\n\n") + "\n";
             withStat.sort((a, b) => b.mtime - a.mtime);
             return { files: withStat.map((x) => x.f) };
           }
-          // ── Grep ──────────────────────────────────────────────────────
+          // 鈹€鈹€ Grep 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
           case "Grep": {
             const pattern = String(args.pattern);
             const searchPath = args.path ? String(args.path) : process.cwd();
@@ -8535,7 +8817,7 @@ ${e.text}`).join("\n\n") + "\n";
               return { output: stdout.trim() };
             }
           }
-          // ── Bash ──────────────────────────────────────────────────────
+          // 鈹€鈹€ Bash 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
           case "Bash": {
             const command = String(args.command);
             const timeout = Math.min(Number(args.timeout ?? 12e4), 6e5);
@@ -8702,6 +8984,7 @@ async function createWindow() {
     minWidth: 1024,
     minHeight: 700,
     icon: path.join(__dirname, "../build/icon.ico"),
+    backgroundColor: "#090b11",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -8709,16 +8992,35 @@ async function createWindow() {
       sandbox: false,
       webSecurity: false,
       spellcheck: false,
-      // 低配优化：禁用拼写检查
-      backgroundThrottling: true
-      // 后台节流，减少低配机器资源占用
+      // 浣庨厤浼樺寲锛氱鐢ㄦ嫾鍐欐鏌?
+      backgroundThrottling: true,
+      // 鍚庡彴鑺傛祦锛屽噺灏戜綆閰嶆満鍣ㄨ祫婧愬崰鐢?
+      paintWhenInitiallyHidden: true
     },
     show: false,
-    title: "InFinio-\u4E00\u7AD9\u5F0F\u667A\u80FD\u4F53\u81EA\u52A8\u5316\u5E73\u53F0"
+    title: "InFinio - \u4E00\u7AD9\u5F0F\u667A\u80FD\u4F53\u81EA\u52A8\u5316\u5E73\u53F0"
   });
+  let hasRevealedMainWindow = false;
+  let startupRevealTimer = setTimeout(() => {
+    revealMainWindow("startup-timeout");
+  }, 1200);
+  const revealMainWindow = (reason) => {
+    if (!mainWindow || mainWindow.isDestroyed() || hasRevealedMainWindow) return;
+    hasRevealedMainWindow = true;
+    if (startupRevealTimer) {
+      clearTimeout(startupRevealTimer);
+      startupRevealTimer = null;
+    }
+    log("info", `main window revealed via ${reason}`);
+    mainWindow.show();
+  };
   mainWindow.once("ready-to-show", () => {
     log("info", "main window ready-to-show");
-    mainWindow?.show();
+    revealMainWindow("ready-to-show");
+  });
+  mainWindow.webContents.once("dom-ready", () => {
+    log("info", "main window dom-ready");
+    revealMainWindow("dom-ready");
   });
   mainWindow.webContents.on("did-finish-load", () => {
     log("info", "main window did-finish-load");
@@ -8726,18 +9028,24 @@ async function createWindow() {
   mainWindow.webContents.on("did-fail-load", (_event, code, description, url) => {
     log("error", `main window did-fail-load code=${code} description=${description} url=${url}`);
   });
+  mainWindow.on("closed", () => {
+    if (startupRevealTimer) {
+      clearTimeout(startupRevealTimer);
+      startupRevealTimer = null;
+    }
+  });
   mainWindow.webContents.on("render-process-gone", (event, details) => {
-    log("error", `========== \u6E32\u67D3\u8FDB\u7A0B\u5D29\u6E83 ==========`);
-    log("error", `\u539F\u56E0: ${details.reason}`);
-    log("error", `\u9000\u51FA\u7801: ${details.exitCode}`);
-    console.error("\u6E32\u67D3\u8FDB\u7A0B\u5D29\u6E83\u8BE6\u60C5:", details);
+    log("error", `========== \u5A13\u53C9\u714B\u6769\u6D9A\u25BC\u5B95\u2542\u7C1D ==========`);
+    log("error", `\u9358\u71B7\u6D1C: ${details.reason}`);
+    log("error", `\u95AB\u20AC\u9351\u8679\u721C: ${details.exitCode}`);
+    console.error("\u5A13\u53C9\u714B\u6769\u6D9A\u25BC\u5B95\u2542\u7C1D\u7487\uFE3D\u510F:", details);
     const crashInfo = {
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
       reason: details.reason,
       exitCode: details.exitCode,
-      // 添加内存使用信息
+      // 娣诲姞鍐呭瓨浣跨敤淇℃伅
       memoryUsage: process.memoryUsage(),
-      // 添加系统信息
+      // 娣诲姞绯荤粺淇℃伅
       platform: process.platform,
       arch: process.arch,
       nodeVersion: process.version
@@ -8751,9 +9059,9 @@ async function createWindow() {
       logs.unshift(crashInfo);
       if (logs.length > 20) logs.length = 20;
       fs.writeFileSync(crashLogPath, JSON.stringify(logs, null, 2));
-      log("info", `\u5D29\u6E83\u65E5\u5FD7\u5DF2\u4FDD\u5B58\u5230: ${crashLogPath}`);
+      log("info", `\u5B95\u2542\u7C1D\u93C3\u30E5\u7E54\u5BB8\u8E6D\u7E5A\u701B\u6A3A\u57CC: ${crashLogPath}`);
     } catch (err) {
-      log("error", `\u65E0\u6CD5\u4FDD\u5B58\u5D29\u6E83\u65E5\u5FD7: ${err}`);
+      log("error", `\u93C3\u72B3\u7876\u6DC7\u6FC6\u74E8\u5B95\u2542\u7C1D\u93C3\u30E5\u7E54: ${err}`);
     }
   });
   mainWindow.webContents.on("unresponsive", () => {
@@ -8764,11 +9072,13 @@ async function createWindow() {
   });
   await prepareWindowSession(mainWindow);
   if (process.env.VITE_DEV_SERVER_URL) {
-    log("info", `loading dev url: ${process.env.VITE_DEV_SERVER_URL}`);
-    await mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
-    if (process.env.ELECTRON_OPEN_DEVTOOLS === "1") {
-      mainWindow.webContents.openDevTools();
+    const devUrl = process.env.VITE_DEV_SERVER_URL;
+    try {
+      await loadDevWarmupPage(mainWindow);
+    } catch (error) {
+      log("warn", `failed to load dev warmup page: ${error instanceof Error ? error.message : String(error)}`);
     }
+    void transitionWarmupWindowToDevServer(mainWindow, devUrl);
   } else {
     const indexPath = path.join(__dirname, "../dist/index.html");
     log("info", `loading file: ${indexPath}`);
@@ -8784,31 +9094,104 @@ function createTray() {
     { type: "separator" },
     { label: "\u9000\u51FA", click: () => app.quit() }
   ]);
-  tray.setToolTip("InFinio-\u4E00\u7AD9\u5F0F\u667A\u80FD\u4F53\u81EA\u52A8\u5316\u5E73\u53F0");
+  tray.setToolTip("InFinio - \u4E00\u7AD9\u5F0F\u667A\u80FD\u4F53\u81EA\u52A8\u5316\u5E73\u53F0");
   tray.setContextMenu(contextMenu);
   tray.on("click", () => mainWindow?.show());
 }
+function configureApplicationMenu() {
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate([
+      {
+        label: "\u6587\u4EF6",
+        submenu: [
+          { role: "close", label: "\u5173\u95ED\u7A97\u53E3" },
+          { type: "separator" },
+          { role: "quit", label: "\u9000\u51FA" }
+        ]
+      },
+      {
+        label: "\u7F16\u8F91",
+        submenu: [
+          { role: "undo", label: "\u64A4\u9500" },
+          { role: "redo", label: "\u91CD\u505A" },
+          { type: "separator" },
+          { role: "cut", label: "\u526A\u5207" },
+          { role: "copy", label: "\u590D\u5236" },
+          { role: "paste", label: "\u7C98\u8D34" },
+          { role: "selectAll", label: "\u5168\u9009" }
+        ]
+      },
+      {
+        label: "\u89C6\u56FE",
+        submenu: [
+          { role: "reload", label: "\u91CD\u65B0\u52A0\u8F7D" },
+          { role: "forceReload", label: "\u5F3A\u5236\u91CD\u65B0\u52A0\u8F7D" },
+          { role: "toggleDevTools", label: "\u5F00\u53D1\u8005\u5DE5\u5177" },
+          { type: "separator" },
+          { role: "resetZoom", label: "\u91CD\u7F6E\u7F29\u653E" },
+          { role: "zoomIn", label: "\u653E\u5927" },
+          { role: "zoomOut", label: "\u7F29\u5C0F" },
+          { type: "separator" },
+          { role: "togglefullscreen", label: "\u5207\u6362\u5168\u5C4F" }
+        ]
+      },
+      {
+        label: "\u7A97\u53E3",
+        submenu: [
+          { role: "minimize", label: "\u6700\u5C0F\u5316" },
+          { role: "close", label: "\u5173\u95ED\u7A97\u53E3" }
+        ]
+      },
+      {
+        label: "\u5E2E\u52A9",
+        submenu: [
+          {
+            label: "\u6253\u5F00\u6570\u636E\u76EE\u5F55",
+            click: () => {
+              void shell.openPath(app.getPath("userData"));
+            }
+          }
+        ]
+      }
+    ])
+  );
+}
 app.whenReady().then(async () => {
-  log("info", "========== Electron \u4E3B\u8FDB\u7A0B\u542F\u52A8 ==========");
+  log("info", "========== Electron \u6D93\u660F\u7E58\u7ECB\u5B2A\u60CE\u9354?==========");
   log("info", `\u6E32\u67D3\u6A21\u5F0F: ${GPU_DISABLED ? "\u8F6F\u4EF6\u6E32\u67D3(SwiftShader)" : "\u786C\u4EF6\u52A0\u901F"}`);
   app.on("gpu-process-crashed", (_event, killed) => {
-    log("warn", `GPU \u8FDB\u7A0B\u5D29\u6E83 killed=${killed}\uFF0C\u4E0B\u6B21\u542F\u52A8\u5C06\u81EA\u52A8\u5207\u6362\u8F6F\u4EF6\u6E32\u67D3`);
+    log("warn", `GPU \u6769\u6D9A\u25BC\u5B95\u2542\u7C1D killed=${killed}\u951B\u5C7C\u7B05\u5A06\u2033\u60CE\u9354\u3125\u76A2\u9477\uE044\u59E9\u9352\u56E8\u5D32\u675E\uE219\u6B22\u5A13\u53C9\u714B`);
     try {
       fs.writeFileSync(GPU_DISABLE_FLAG, "1");
     } catch {
     }
   });
   setupIPC();
+  configureApplicationMenu();
   await createWindow();
   createTray();
+  startDevLauncherWatchdog();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) void createWindow();
   });
+});
+app.on("second-instance", () => {
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore();
+    }
+    mainWindow.focus();
+  }
 });
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 app.on("before-quit", () => {
+  stopDevLauncherWatchdog();
+  if (watchedDevServerPid) {
+    killProcessTree(watchedDevServerPid);
+    watchedDevServerPid = null;
+  }
 });
 /*! Bundled license information:
 

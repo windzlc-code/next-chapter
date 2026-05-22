@@ -205,7 +205,10 @@ export async function exportToDocx(
   dramaTitle: string,
   creativePlan: string,
   characters: string,
-  episodes: EpisodeScript[]
+  episodes: EpisodeScript[],
+  options?: {
+    preferredFilePath?: string;
+  }
 ): Promise<ExportToDocxResult> {
   const sortedEpisodes = [...episodes].sort((a, b) => a.number - b.number);
   const totalWords = episodes.reduce((s, e) => s + e.wordCount, 0);
@@ -511,6 +514,23 @@ export async function exportToDocx(
 
   const buffer = await Packer.toBlob(doc);
   const fileName = `${dramaTitle || "剧本"}.docx`;
+  const preferredFilePath = options?.preferredFilePath?.trim();
+  if (preferredFilePath) {
+    const writer = window.electronAPI?.jimeng?.writeFile;
+    if (!writer) {
+      throw new Error("当前环境不支持直接写入 Word 文件。");
+    }
+    const bytes = new Uint8Array(await buffer.arrayBuffer());
+    let binary = "";
+    bytes.forEach((byte) => {
+      binary += String.fromCharCode(byte);
+    });
+    const result = await writer(preferredFilePath, btoa(binary));
+    if (!result.ok) {
+      throw new Error(result.error || "保存 Word 文件失败。");
+    }
+    return { status: "saved", filePath: preferredFilePath };
+  }
   const saveBinaryFile = window.electronAPI?.storage?.saveBinaryFile;
 
   if (saveBinaryFile) {

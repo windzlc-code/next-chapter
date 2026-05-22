@@ -1,6 +1,6 @@
 import * as React from "react";
 import type { MessageInput } from "@/lib/agent/types";
-import { clearStudioSession, queueStudioSessionWrite } from "@/lib/home-agent/session-store";
+import { clearStudioSession, queueStudioSessionWrite, writeStudioSession } from "@/lib/home-agent/session-store";
 import { planConversationCompaction } from "@/lib/home-agent/conversation-compact";
 import {
   mergeRuntimeWithWorkflowDelta,
@@ -19,6 +19,7 @@ import type {
   ConversationProjectSnapshot,
   HomeAgentMessage,
   MaintenanceReport,
+  PendingWorkflowUploadKind,
   StudioQuestionState,
   StudioRuntimeState,
 } from "@/lib/home-agent/types";
@@ -26,12 +27,20 @@ import type { Task } from "@/lib/agent/tools/task-tools";
 import { createWorkflowShortcutUiBridge } from "./home-agent-workflow-ui";
 import { buildVideoBridgeRetryQuestion, recQuestion } from "./home-agent-project-questions";
 import {
+  resolveComposerDraftSnapshot,
+  shouldKeepSessionProjectIdForBridgedVideo,
+} from "./home-agent-session-utils";
+import {
   type BackgroundResearchGroup,
   isBackgroundResearchTask,
 } from "./home-agent-task-utils";
 import { isScriptPopoverCompatibleWithCurrentStage } from "./use-home-agent-question-view";
+import {
+  buildVideoBridgeResearchInput,
+  buildVideoBridgeResearchMessage,
+} from "./video-bridge-research-utils";
 
-const { useEffect, useRef, useState, startTransition } = React;
+const { useCallback, useEffect, useRef, useState, startTransition } = React;
 
 type AutoCharacterGenerationPlan = {
   action: "generate_characters" | "generate_character_transform";
@@ -44,76 +53,98 @@ type RestoredTaskFollowupSuppression = {
   restoredAt: number;
 };
 
-function summarizeBridgeResearchValue(output: string): string {
-  const normalized = output
-    .replace(/\r/g, "")
-    .split("\n")
-    .map((line) => line.replace(/^[-*•\d.\s]+/, "").trim())
-    .find(Boolean);
+type QueuedSessionArchiveSignature = {
+  projectId: string;
+  messages: HomeAgentMessage[];
+  snapshot: ConversationProjectSnapshot | null;
+  recentMessageSummary: string;
+  compactedMessageCount: number;
+  fullAutoRun: StudioRuntimeState["fullAutoRun"] | null;
+};
 
-  if (!normalized) return "";
+type QueuedSessionWriteSignature = {
+  sessionId: string;
+  mode: AgentConversationMode;
+  creationMode: CreationMode;
+  automationMode: AutomationMode;
+  devMode: boolean;
+  suppressHistoricalMemory: boolean;
+  messages: HomeAgentMessage[];
+  snapshot: ConversationProjectSnapshot | null;
+  recentMessageSummary: string;
+  projectId: string | null;
+  selectedTextModelKey: string;
+  selectedImageModelFamily: string;
+  imageGenerationPrefs: unknown;
+  selectedVideoModelKey: string;
+  videoGenerationPrefs: unknown;
+  compactedMessageCount: number;
+  draft: string;
+  qState: StudioQuestionState | null;
+  deferredQuestionState: StudioQuestionState | null;
+  pendingWorkflowUploadKind: PendingWorkflowUploadKind | null;
+  pendingChoiceQuestion: ComposerQuestion | null;
+  interruptedChoiceQuestion: ComposerQuestion | null;
+  selectedValues: string[];
+  deferredSelectedValues: string[];
+  deferredDraft: string;
+  surfacedTaskIdsKey: string;
+  surfacedTaskFollowupKeysKey: string;
+  surfacedProjectSuggestionKeysKey: string;
+  fullAutoRun: StudioRuntimeState["fullAutoRun"] | null;
+  fullAutoChecklistCollapsed: boolean;
+};
 
-  const matched =
-    normalized.match(/(?:目标平台|发布平台|平台|镜头风格|风格|视觉方向|出片目标|产出目标|目标)[:：]\s*(.+)$/) ??
-    normalized.match(/^建议[:：]\s*(.+)$/);
+const DUPLICATE_PROJECT_TITLE_SUFFIX_RE = /\s*-\s*副本\d*\s*$/u;
 
-  return matched?.[1]?.trim() ?? normalized;
+function stripDuplicateProjectTitleSuffix(title: string): string {
+  return title.trim().replace(DUPLICATE_PROJECT_TITLE_SUFFIX_RE, "").trim();
 }
 
-
-function buildVideoBridgeResearchInput(params: {
-  tasks: Array<Pick<Task, "prompt" | "output">>;
-  parseTaskHeading: (prompt: string) => string | null;
-}): {
-  targetPlatform: string;
-  shotStyle: string;
-  outputGoal: string;
-  productionNotes: string;
-} {
-  const { tasks, parseTaskHeading } = params;
-  let targetPlatform = "";
-  let shotStyle = "";
-  let outputGoal = "";
-
-  const notes = tasks
-    .map((task) => {
-      const heading = parseTaskHeading(task.prompt) || "研究结论";
-      const output = (task.output ?? "").trim();
-      if (!output) return null;
-
-      if (!targetPlatform && /平台/.test(heading)) {
-        targetPlatform = summarizeBridgeResearchValue(output);
-      } else if (!shotStyle && /(视觉|风格|镜头)/.test(heading)) {
-        shotStyle = summarizeBridgeResearchValue(output);
-      } else if (!outputGoal && /(出片|策略|目标)/.test(heading)) {
-        outputGoal = summarizeBridgeResearchValue(output);
-      }
-
-      return `【${heading}】\n${output}`;
-    })
-    .filter((value): value is string => Boolean(value));
-
-  return {
-    targetPlatform,
-    shotStyle,
-    outputGoal,
-    productionNotes: notes.join("\n\n"),
-  };
+function shouldPreserveDuplicateProjectTitle(currentTitle: string, nextTitle: string): boolean {
+  if (!DUPLICATE_PROJECT_TITLE_SUFFIX_RE.test(currentTitle)) return false;
+  return stripDuplicateProjectTitleSuffix(currentTitle) === nextTitle.trim();
 }
 
-function buildVideoBridgeResearchMessage(params: {
-  targetPlatform: string;
-  shotStyle: string;
-  outputGoal: string;
-  productionNotes: string;
-}): string {
-  const hasAnyBridgeValue = Boolean(
-    params.targetPlatform || params.shotStyle || params.outputGoal || params.productionNotes,
+function areQueuedSessionWriteSignaturesEqual(
+  previous: QueuedSessionWriteSignature | null,
+  next: QueuedSessionWriteSignature,
+): boolean {
+  if (!previous) return false;
+  return (
+    previous.sessionId === next.sessionId &&
+    previous.mode === next.mode &&
+    previous.creationMode === next.creationMode &&
+    previous.automationMode === next.automationMode &&
+    previous.devMode === next.devMode &&
+    previous.suppressHistoricalMemory === next.suppressHistoricalMemory &&
+    previous.messages === next.messages &&
+    previous.snapshot === next.snapshot &&
+    previous.recentMessageSummary === next.recentMessageSummary &&
+    previous.projectId === next.projectId &&
+    previous.selectedTextModelKey === next.selectedTextModelKey &&
+    previous.selectedImageModelFamily === next.selectedImageModelFamily &&
+    previous.imageGenerationPrefs === next.imageGenerationPrefs &&
+    previous.selectedVideoModelKey === next.selectedVideoModelKey &&
+    previous.videoGenerationPrefs === next.videoGenerationPrefs &&
+    previous.compactedMessageCount === next.compactedMessageCount &&
+    previous.draft === next.draft &&
+    previous.qState === next.qState &&
+    previous.deferredQuestionState === next.deferredQuestionState &&
+    previous.pendingWorkflowUploadKind === next.pendingWorkflowUploadKind &&
+    previous.pendingChoiceQuestion === next.pendingChoiceQuestion &&
+    previous.interruptedChoiceQuestion === next.interruptedChoiceQuestion &&
+    previous.selectedValues === next.selectedValues &&
+    previous.deferredSelectedValues === next.deferredSelectedValues &&
+    previous.deferredDraft === next.deferredDraft &&
+    previous.surfacedTaskIdsKey === next.surfacedTaskIdsKey &&
+    previous.surfacedTaskFollowupKeysKey === next.surfacedTaskFollowupKeysKey &&
+    previous.surfacedProjectSuggestionKeysKey === next.surfacedProjectSuggestionKeysKey &&
+    previous.fullAutoRun === next.fullAutoRun &&
+    previous.fullAutoChecklistCollapsed === next.fullAutoChecklistCollapsed
   );
-  return hasAnyBridgeValue
-    ? "\u524d\u7f6e\u53c2\u6570\u5df2\u5199\u5165\uff0c\u8fdb\u5165\u89c6\u9891\u5de5\u4f5c\u6d41\u3002"
-    : "\u8fdb\u5165\u89c6\u9891\u5de5\u4f5c\u6d41\u3002";
 }
+
 function hasRunningVideoGenerationTasks(
   videoProject: StudioRuntimeState["currentVideoProject"] | null | undefined,
 ): boolean {
@@ -132,6 +163,20 @@ function shouldSuppressRunningVideoRefreshPanel(
   return (
     question?.answerKey === "video-refresh-panel" &&
     hasRunningVideoGenerationTasks(runtime.currentVideoProject)
+  );
+}
+
+function canBackgroundResearchReplacePopover(
+  group: BackgroundResearchGroup,
+  popoverOverride: ComposerQuestion | null | undefined,
+): boolean {
+  if (!popoverOverride) return true;
+  if (group.kind !== "video-bridge-platform") return false;
+  const answerKey = popoverOverride.answerKey;
+  return (
+    answerKey === "video-bridge-prefix" ||
+    answerKey === "video-bridge-retry" ||
+    answerKey.startsWith("video-kickoff-prefs-")
   );
 }
 
@@ -162,13 +207,17 @@ export function useHomeAgentConversationEffects(params: {
   setMode: React.Dispatch<React.SetStateAction<AgentConversationMode>>;
   qState: StudioQuestionState | null;
   deferredQuestionState: StudioQuestionState | null;
+  pendingWorkflowUploadKind?: PendingWorkflowUploadKind | null;
+  question?: ComposerQuestion | null;
   popoverOverride: ComposerQuestion | null;
+  interruptedChoiceQuestion: ComposerQuestion | null;
   suggested: ComposerQuestion | null;
   suppressVideoWorkflowSuggestions?: boolean;
   draftPresence: boolean;
   persistedDraft: string;
   deferredDraft: string;
   recentSessionSummary: string;
+  fullAutoChecklistCollapsed: boolean;
   selectedValues: string[];
   deferredSelectedValues: string[];
   selectedTextModelKey: string;
@@ -181,6 +230,7 @@ export function useHomeAgentConversationEffects(params: {
   visibleTasks: Task[];
   engineRef: React.MutableRefObject<{ interrupt?: () => void } | null>;
   runtimeRef: React.MutableRefObject<StudioRuntimeState>;
+  projectHydrationInFlightRef?: React.MutableRefObject<string | null>;
   draftRef: React.MutableRefObject<string>;
   previousQuestionStepRef: React.MutableRefObject<string | null>;
   surfacedTaskIdsRef: React.MutableRefObject<Set<string>>;
@@ -241,13 +291,17 @@ export function useHomeAgentConversationEffects(params: {
     setMode,
     qState,
     deferredQuestionState,
+    pendingWorkflowUploadKind = null,
+    question = null,
     popoverOverride,
+    interruptedChoiceQuestion,
     suggested,
     suppressVideoWorkflowSuggestions = false,
     draftPresence,
     persistedDraft,
     deferredDraft,
     recentSessionSummary,
+    fullAutoChecklistCollapsed,
     selectedValues,
     deferredSelectedValues,
     selectedTextModelKey,
@@ -260,6 +314,7 @@ export function useHomeAgentConversationEffects(params: {
     visibleTasks,
     engineRef,
     runtimeRef,
+    projectHydrationInFlightRef,
     draftRef,
     previousQuestionStepRef,
     surfacedTaskIdsRef,
@@ -295,9 +350,17 @@ export function useHomeAgentConversationEffects(params: {
   const attemptedAutoWorkflowKeysRef = useRef<Set<string>>(new Set());
   const autoCharacterGenerationAttemptedKeysRef = useRef<Set<string>>(new Set());
   const autoCharacterGenerationInFlightKeyRef = useRef<string | null>(null);
+  const lastQueuedArchiveSignatureRef = useRef<QueuedSessionArchiveSignature | null>(null);
+  const lastQueuedSessionWriteSignatureRef = useRef<QueuedSessionWriteSignature | null>(null);
+  const lastImmediateSessionWriteSignatureRef = useRef<QueuedSessionWriteSignature | null>(null);
+  const currentSnapshotProjectId = runtime.currentProjectSnapshot?.projectId ?? null;
+  const isCurrentProjectTrackedInRecentProjects = Boolean(
+    currentSnapshotProjectId &&
+      runtime.recentProjects.some((project) => project.projectId === currentSnapshotProjectId),
+  );
 
   useEffect(() => {
-    if (qState || streaming || popoverOverride || draftPresence) return;
+    if (pendingWorkflowUploadKind || qState || streaming || popoverOverride || draftPresence) return;
 
     const plan = getAutoCharacterGenerationPlan({
       activeProjectId,
@@ -325,7 +388,9 @@ export function useHomeAgentConversationEffects(params: {
         const currentRuntime = runtimeRef.current;
         const nextProjectSnapshot = result.projectSnapshot ?? result.data?.projectSnapshot ?? null;
         const nextRuntime = result.data
-          ? mergeRuntimeWithWorkflowDelta(currentRuntime, result.data)
+          ? mergeRuntimeWithWorkflowDelta(currentRuntime, result.data, {
+              deferRecentProjectUpsert: true,
+            })
           : currentRuntime;
 
         if (result.data) {
@@ -378,6 +443,7 @@ export function useHomeAgentConversationEffects(params: {
     runtime.currentDramaProject,
     runtime.currentProjectSnapshot,
     runtimeRef,
+    pendingWorkflowUploadKind,
     setPopoverOverride,
     setRuntime,
     setSelectedValues,
@@ -412,6 +478,11 @@ export function useHomeAgentConversationEffects(params: {
   ]);
 
   useEffect(() => {
+    if (pendingWorkflowUploadKind) {
+      setPopoverOverride(null);
+      setSuggested(null);
+      return;
+    }
     if (qState || streaming || popoverOverride) return;
     if (draftPresence) return;
     if (suppressVideoWorkflowSuggestions) {
@@ -503,12 +574,15 @@ export function useHomeAgentConversationEffects(params: {
     dismissedProjectSuggestionKeysRef,
     draftPresence,
     popoverOverride,
+    projectHydrationInFlightRef,
     qState,
     runtime.currentDramaProject,
     runtime.currentProjectSnapshot,
     runtime.maintenanceReports,
     runtime.currentVideoProject,
+    runtime.sessionId,
     runtime.skillDrafts,
+    pendingWorkflowUploadKind,
     suppressVideoWorkflowSuggestions,
     streaming,
     suggested,
@@ -521,7 +595,7 @@ export function useHomeAgentConversationEffects(params: {
   useEffect(() => {
     if (creationMode !== "fast") return;
     if (suppressVideoWorkflowSuggestions) return;
-    if (idle || streaming || qState || popoverOverride || draftPresence) return;
+    if (pendingWorkflowUploadKind || idle || streaming || qState || popoverOverride || draftPresence) return;
 
     const snapshot = runtime.currentProjectSnapshot;
     if (!snapshot) return;
@@ -543,7 +617,11 @@ export function useHomeAgentConversationEffects(params: {
       commitRuntime: (nextRuntime, projectId) => {
         startTransition(() => {
           setRuntime(nextRuntime);
-          if (projectId) {
+          const shouldKeepSessionProjectId = shouldKeepSessionProjectIdForBridgedVideo({
+            currentSessionProjectId: activeProjectId,
+            snapshot: nextRuntime.currentProjectSnapshot,
+          });
+          if (projectId && !shouldKeepSessionProjectId) {
             setActiveProjectId(projectId);
           }
         });
@@ -568,6 +646,7 @@ export function useHomeAgentConversationEffects(params: {
           action: autoFollowup.action,
           input: autoFollowup.input,
           runtime: runtimeRef.current,
+          deferRecentProjectUpsert: true,
           runAction: (action, input, nextRuntime) => workflow.runWorkflowAction(action, input, nextRuntime),
           ui,
           userBubble: "",
@@ -587,6 +666,7 @@ export function useHomeAgentConversationEffects(params: {
     runtime.currentVideoProject,
     runtime.sessionId,
     runtimeRef,
+    pendingWorkflowUploadKind,
     suppressVideoWorkflowSuggestions,
     setActiveProjectId,
     setMode,
@@ -609,6 +689,7 @@ export function useHomeAgentConversationEffects(params: {
 
     const nextTitle = extractAssistantProjectTitle(latestAssistantMessage.content);
     if (!nextTitle || nextTitle === snapshot.title) return;
+    if (shouldPreserveDuplicateProjectTitle(snapshot.title, nextTitle)) return;
 
     const applyKey = `${snapshot.projectId}:${nextTitle}`;
     if (appliedProjectTitleKeyRef.current === applyKey) return;
@@ -760,35 +841,382 @@ export function useHomeAgentConversationEffects(params: {
     streaming,
   ]);
 
-  useEffect(() => {
+  const persistSessionImmediately = useCallback((force = false) => {
     if (idle) {
+      lastImmediateSessionWriteSignatureRef.current = null;
+      lastQueuedSessionWriteSignatureRef.current = null;
+      lastQueuedArchiveSignatureRef.current = null;
       clearStudioSession();
       return;
     }
 
-    const persistedProjectId = runtime.currentProjectSnapshot?.projectId ?? activeProjectId;
+    const persistedProjectId =
+      projectHydrationInFlightRef?.current ??
+      activeProjectId ??
+      deferredProjectSnapshot?.projectId ??
+      currentSnapshotProjectId;
+    const shouldKeepLiveSessionProjectId = shouldKeepSessionProjectIdForBridgedVideo({
+      currentSessionProjectId: persistedProjectId,
+      snapshot: runtime.currentProjectSnapshot,
+    });
+    const livePersistedProjectSnapshot =
+      runtime.currentProjectSnapshot &&
+      (
+        runtime.currentProjectSnapshot.projectId === persistedProjectId ||
+        shouldKeepLiveSessionProjectId
+      )
+        ? {
+            ...runtime.currentProjectSnapshot,
+            automationMode: runtime.currentProjectSnapshot.automationMode ?? automationMode,
+          }
+        : null;
+    const shouldKeepDeferredSessionProjectId = shouldKeepSessionProjectIdForBridgedVideo({
+      currentSessionProjectId: persistedProjectId,
+      snapshot: deferredProjectSnapshot,
+    });
+    const persistedProjectSnapshot =
+      deferredProjectSnapshot &&
+      (
+        deferredProjectSnapshot.projectId === persistedProjectId ||
+        shouldKeepDeferredSessionProjectId
+      )
+        ? {
+            ...deferredProjectSnapshot,
+            automationMode: deferredProjectSnapshot.automationMode ?? automationMode,
+          }
+        : livePersistedProjectSnapshot;
+    const hasDeferredSnapshotProjectMismatch = Boolean(
+      persistedProjectId &&
+        deferredProjectSnapshot?.projectId &&
+        deferredProjectSnapshot.projectId !== persistedProjectId &&
+        !shouldKeepDeferredSessionProjectId,
+    );
+    const hasLiveSnapshotProjectMismatch = Boolean(
+      persistedProjectId &&
+        currentSnapshotProjectId &&
+        currentSnapshotProjectId !== persistedProjectId &&
+        !shouldKeepLiveSessionProjectId,
+    );
+    if (hasDeferredSnapshotProjectMismatch || (hasLiveSnapshotProjectMismatch && !persistedProjectSnapshot)) {
+      return;
+    }
+
+    const hydrationProjectId = projectHydrationInFlightRef?.current ?? null;
+    if (mode === "recovering" && persistedProjectId && hydrationProjectId === persistedProjectId) {
+      return;
+    }
+
+    const shouldDelayProjectSessionWrite =
+      streaming &&
+      Boolean(
+        persistedProjectId &&
+          currentSnapshotProjectId &&
+          !isCurrentProjectTrackedInRecentProjects,
+      );
+    if (shouldDelayProjectSessionWrite) {
+      return;
+    }
+
+    const recentMessageSummaryForPersistence =
+      compactedMessageCount > 0 ? runtime.recentMessageSummary : recentSessionSummary;
+    const pendingChoiceQuestion =
+      pendingWorkflowUploadKind || qState || deferredQuestionState
+        ? null
+        : (() => {
+            const candidate = question ?? popoverOverride ?? suggested ?? interruptedChoiceQuestion ?? null;
+            return shouldSuppressRunningVideoRefreshPanel(candidate, runtimeRef.current) ? null : candidate;
+          })();
+    const resolvedDraft = resolveComposerDraftSnapshot(draftRef.current, persistedDraft);
+    const fullAutoRun = runtimeRef.current.fullAutoRun ?? null;
+    const nextSessionWriteSignature: QueuedSessionWriteSignature = {
+      sessionId: runtimeRef.current.sessionId,
+      mode,
+      creationMode,
+      automationMode,
+      devMode,
+      suppressHistoricalMemory: runtimeRef.current.suppressHistoricalMemory,
+      messages: deferredMessages,
+      snapshot: persistedProjectSnapshot,
+      recentMessageSummary: recentMessageSummaryForPersistence,
+      projectId: persistedProjectId ?? null,
+      selectedTextModelKey,
+      selectedImageModelFamily,
+      imageGenerationPrefs,
+      selectedVideoModelKey,
+      videoGenerationPrefs,
+      compactedMessageCount,
+      draft: resolvedDraft,
+      qState,
+      deferredQuestionState,
+      pendingWorkflowUploadKind,
+      pendingChoiceQuestion,
+      interruptedChoiceQuestion: pendingWorkflowUploadKind ? null : interruptedChoiceQuestion,
+      selectedValues,
+      deferredSelectedValues,
+      deferredDraft,
+      surfacedTaskIdsKey: [...surfacedTaskIdsRef.current].join("\u0001"),
+      surfacedTaskFollowupKeysKey: [...surfacedTaskFollowupIdsRef.current].join("\u0001"),
+      surfacedProjectSuggestionKeysKey: [...surfacedProjectSuggestionKeysRef.current].join("\u0001"),
+      fullAutoRun,
+      fullAutoChecklistCollapsed,
+    };
+    if (
+      !force &&
+      areQueuedSessionWriteSignaturesEqual(
+        lastImmediateSessionWriteSignatureRef.current,
+        nextSessionWriteSignature,
+      )
+    ) {
+      return;
+    }
+    lastImmediateSessionWriteSignatureRef.current = nextSessionWriteSignature;
+
+    writeStudioSession({
+      sessionId: nextSessionWriteSignature.sessionId,
+      mode,
+      creationMode,
+      automationMode,
+      devMode,
+      suppressHistoricalMemory: runtimeRef.current.suppressHistoricalMemory,
+      messages: deferredMessages,
+      currentProjectSnapshot: persistedProjectSnapshot,
+      recentMessageSummary: recentMessageSummaryForPersistence,
+      projectId: persistedProjectId,
+      selectedTextModelKey,
+      selectedImageModelFamily,
+      imageGenerationPrefs,
+      selectedVideoModelKey,
+      videoGenerationPrefs,
+      compactedMessageCount,
+      draft: resolvedDraft,
+      qState,
+      deferredQuestionState,
+      pendingWorkflowUploadKind,
+      pendingChoiceQuestion,
+      interruptedChoiceQuestion: pendingWorkflowUploadKind ? null : interruptedChoiceQuestion,
+      selectedValues,
+      deferredSelectedValues,
+      deferredDraft,
+      surfacedTaskIds: [...surfacedTaskIdsRef.current],
+      surfacedTaskFollowupKeys: [...surfacedTaskFollowupIdsRef.current],
+      surfacedProjectSuggestionKeys: [...surfacedProjectSuggestionKeysRef.current],
+      fullAutoRun: nextSessionWriteSignature.fullAutoRun,
+      fullAutoChecklistCollapsed: nextSessionWriteSignature.fullAutoChecklistCollapsed,
+    }, { persistFullBackup: false });
+  }, [
+    activeProjectId,
+    automationMode,
+    compactedMessageCount,
+    creationMode,
+    currentSnapshotProjectId,
+    deferredDraft,
+    deferredMessages,
+    deferredProjectSnapshot,
+    deferredQuestionState,
+    deferredSelectedValues,
+    devMode,
+    draftRef,
+    fullAutoChecklistCollapsed,
+    idle,
+    imageGenerationPrefs,
+    interruptedChoiceQuestion,
+    isCurrentProjectTrackedInRecentProjects,
+    mode,
+    pendingWorkflowUploadKind,
+    persistedDraft,
+    popoverOverride,
+    projectHydrationInFlightRef,
+    qState,
+    question,
+    recentSessionSummary,
+    runtime.currentProjectSnapshot,
+    runtime.recentMessageSummary,
+    runtimeRef,
+    selectedImageModelFamily,
+    selectedTextModelKey,
+    selectedValues,
+    selectedVideoModelKey,
+    streaming,
+    suggested,
+    surfacedProjectSuggestionKeysRef,
+    surfacedTaskFollowupIdsRef,
+    surfacedTaskIdsRef,
+    videoGenerationPrefs,
+    lastImmediateSessionWriteSignatureRef,
+  ]);
+
+  useEffect(() => {
+    if (idle) {
+      lastQueuedSessionWriteSignatureRef.current = null;
+      lastQueuedArchiveSignatureRef.current = null;
+      lastImmediateSessionWriteSignatureRef.current = null;
+      clearStudioSession();
+      return;
+    }
+
+    const persistedProjectId =
+      projectHydrationInFlightRef?.current ??
+      activeProjectId ??
+      deferredProjectSnapshot?.projectId ??
+      currentSnapshotProjectId;
+    const shouldKeepLiveSessionProjectId = shouldKeepSessionProjectIdForBridgedVideo({
+      currentSessionProjectId: persistedProjectId,
+      snapshot: runtime.currentProjectSnapshot,
+    });
+    const livePersistedProjectSnapshot =
+      runtime.currentProjectSnapshot &&
+      (
+        runtime.currentProjectSnapshot.projectId === persistedProjectId ||
+        shouldKeepLiveSessionProjectId
+      )
+        ? {
+            ...runtime.currentProjectSnapshot,
+            automationMode: runtime.currentProjectSnapshot.automationMode ?? automationMode,
+          }
+        : null;
+    const shouldKeepDeferredSessionProjectId = shouldKeepSessionProjectIdForBridgedVideo({
+      currentSessionProjectId: persistedProjectId,
+      snapshot: deferredProjectSnapshot,
+    });
+    const persistedProjectSnapshot =
+      deferredProjectSnapshot &&
+      (
+        deferredProjectSnapshot.projectId === persistedProjectId ||
+        shouldKeepDeferredSessionProjectId
+      )
+        ? {
+            ...deferredProjectSnapshot,
+            automationMode: deferredProjectSnapshot.automationMode ?? automationMode,
+          }
+        : livePersistedProjectSnapshot;
+    const hasDeferredSnapshotProjectMismatch = Boolean(
+      persistedProjectId &&
+        deferredProjectSnapshot?.projectId &&
+        deferredProjectSnapshot.projectId !== persistedProjectId &&
+        !shouldKeepDeferredSessionProjectId,
+    );
+    const hasLiveSnapshotProjectMismatch = Boolean(
+      persistedProjectId &&
+        currentSnapshotProjectId &&
+        currentSnapshotProjectId !== persistedProjectId &&
+        !shouldKeepLiveSessionProjectId,
+    );
+    if (hasDeferredSnapshotProjectMismatch || (hasLiveSnapshotProjectMismatch && !persistedProjectSnapshot)) {
+      return;
+    }
+    const hydrationProjectId = projectHydrationInFlightRef?.current ?? null;
+    if (mode === "recovering" && persistedProjectId && hydrationProjectId === persistedProjectId) {
+      return;
+    }
+    const shouldDelayProjectSessionWrite =
+      streaming &&
+      Boolean(
+        persistedProjectId &&
+          currentSnapshotProjectId &&
+          !isCurrentProjectTrackedInRecentProjects,
+      );
+    if (shouldDelayProjectSessionWrite) {
+      return;
+    }
+    const recentMessageSummaryForPersistence =
+      compactedMessageCount > 0 ? runtime.recentMessageSummary : recentSessionSummary;
+    const nextArchiveSignature: QueuedSessionArchiveSignature | null = persistedProjectId
+      ? {
+          projectId: persistedProjectId,
+          messages: deferredMessages,
+          snapshot: persistedProjectSnapshot,
+          recentMessageSummary: recentMessageSummaryForPersistence,
+          compactedMessageCount,
+          fullAutoRun: runtimeRef.current.fullAutoRun ?? null,
+        }
+      : null;
+    const shouldPersistFullBackup =
+      !nextArchiveSignature ||
+      !lastQueuedArchiveSignatureRef.current ||
+      lastQueuedArchiveSignatureRef.current.projectId !== nextArchiveSignature.projectId ||
+      lastQueuedArchiveSignatureRef.current.messages !== nextArchiveSignature.messages ||
+      lastQueuedArchiveSignatureRef.current.snapshot !== nextArchiveSignature.snapshot ||
+      lastQueuedArchiveSignatureRef.current.recentMessageSummary !== nextArchiveSignature.recentMessageSummary ||
+      lastQueuedArchiveSignatureRef.current.compactedMessageCount !== nextArchiveSignature.compactedMessageCount ||
+      lastQueuedArchiveSignatureRef.current.fullAutoRun !== nextArchiveSignature.fullAutoRun;
+
+    if (shouldPersistFullBackup && nextArchiveSignature) {
+      lastQueuedArchiveSignatureRef.current = nextArchiveSignature;
+    }
+    const shouldPersistKickoffSessionImmediately =
+      !persistedProjectId &&
+      !persistedProjectSnapshot &&
+      Boolean(
+        qState ||
+          deferredQuestionState ||
+          pendingWorkflowUploadKind ||
+          popoverOverride ||
+          interruptedChoiceQuestion ||
+          suggested,
+      );
+    const persistenceDelayMs = shouldPersistKickoffSessionImmediately ? 0 : 720;
+    const pendingChoiceQuestion =
+      pendingWorkflowUploadKind || qState || deferredQuestionState
+        ? null
+        : (() => {
+            const candidate = question ?? popoverOverride ?? suggested ?? interruptedChoiceQuestion ?? null;
+            return shouldSuppressRunningVideoRefreshPanel(candidate, runtimeRef.current) ? null : candidate;
+          })();
+    const resolvedDraft = resolveComposerDraftSnapshot(draftRef.current, persistedDraft);
+    const fullAutoRun = runtimeRef.current.fullAutoRun ?? null;
+    const nextSessionWriteSignature: QueuedSessionWriteSignature = {
+      sessionId: runtimeRef.current.sessionId,
+      mode,
+      creationMode,
+      automationMode,
+      devMode,
+      suppressHistoricalMemory: runtimeRef.current.suppressHistoricalMemory,
+      messages: deferredMessages,
+      snapshot: persistedProjectSnapshot,
+      recentMessageSummary: recentMessageSummaryForPersistence,
+      projectId: persistedProjectId ?? null,
+      selectedTextModelKey,
+      selectedImageModelFamily,
+      imageGenerationPrefs,
+      selectedVideoModelKey,
+      videoGenerationPrefs,
+      compactedMessageCount,
+      draft: resolvedDraft,
+      qState,
+      deferredQuestionState,
+      pendingWorkflowUploadKind,
+      pendingChoiceQuestion,
+      interruptedChoiceQuestion: pendingWorkflowUploadKind ? null : interruptedChoiceQuestion,
+      selectedValues,
+      deferredSelectedValues,
+      deferredDraft,
+      surfacedTaskIdsKey: [...surfacedTaskIdsRef.current].join("\u0001"),
+      surfacedTaskFollowupKeysKey: [...surfacedTaskFollowupIdsRef.current].join("\u0001"),
+      surfacedProjectSuggestionKeysKey: [...surfacedProjectSuggestionKeysRef.current].join("\u0001"),
+      fullAutoRun,
+      fullAutoChecklistCollapsed,
+    };
+    if (
+      !shouldPersistFullBackup &&
+      areQueuedSessionWriteSignaturesEqual(
+        lastQueuedSessionWriteSignatureRef.current,
+        nextSessionWriteSignature,
+      )
+    ) {
+      return;
+    }
+    lastQueuedSessionWriteSignatureRef.current = nextSessionWriteSignature;
     const cancelTask = scheduleBackgroundTask(() => {
-      const pendingChoiceQuestion =
-        qState || deferredQuestionState
-          ? null
-          : (() => {
-              const candidate = popoverOverride ?? suggested ?? null;
-              return shouldSuppressRunningVideoRefreshPanel(candidate, runtimeRef.current) ? null : candidate;
-            })();
       queueStudioSessionWrite({
-        sessionId: runtimeRef.current.sessionId,
+        sessionId: nextSessionWriteSignature.sessionId,
         mode,
         creationMode,
         automationMode,
         devMode,
+        suppressHistoricalMemory: nextSessionWriteSignature.suppressHistoricalMemory,
         messages: deferredMessages,
-        currentProjectSnapshot: deferredProjectSnapshot
-          ? {
-              ...deferredProjectSnapshot,
-              automationMode: deferredProjectSnapshot.automationMode ?? automationMode,
-            }
-          : null,
-        recentMessageSummary: compactedMessageCount > 0 ? runtime.recentMessageSummary : recentSessionSummary,
+        currentProjectSnapshot: persistedProjectSnapshot,
+        recentMessageSummary: recentMessageSummaryForPersistence,
         projectId: persistedProjectId,
         selectedTextModelKey,
         selectedImageModelFamily,
@@ -796,19 +1224,22 @@ export function useHomeAgentConversationEffects(params: {
         selectedVideoModelKey,
         videoGenerationPrefs,
         compactedMessageCount,
-        draft: draftRef.current || persistedDraft,
+        draft: resolvedDraft,
         qState,
         deferredQuestionState,
+        pendingWorkflowUploadKind,
         pendingChoiceQuestion,
+        interruptedChoiceQuestion: pendingWorkflowUploadKind ? null : interruptedChoiceQuestion,
         selectedValues,
         deferredSelectedValues,
         deferredDraft,
         surfacedTaskIds: [...surfacedTaskIdsRef.current],
         surfacedTaskFollowupKeys: [...surfacedTaskFollowupIdsRef.current],
         surfacedProjectSuggestionKeys: [...surfacedProjectSuggestionKeysRef.current],
-        fullAutoRun: runtimeRef.current.fullAutoRun ?? null,
-      });
-    }, 720);
+        fullAutoRun,
+        fullAutoChecklistCollapsed,
+      }, 120, { persistFullBackup: shouldPersistFullBackup });
+    }, persistenceDelayMs);
 
     return cancelTask;
   }, [
@@ -822,10 +1253,15 @@ export function useHomeAgentConversationEffects(params: {
     deferredQuestionState,
     deferredSelectedValues,
     draftRef,
+    fullAutoChecklistCollapsed,
     idle,
+    interruptedChoiceQuestion,
     mode,
+    pendingWorkflowUploadKind,
     persistedDraft,
+    question,
     popoverOverride,
+    projectHydrationInFlightRef,
     qState,
     recentSessionSummary,
     runtime.recentMessageSummary,
@@ -842,8 +1278,32 @@ export function useHomeAgentConversationEffects(params: {
     surfacedTaskFollowupIdsRef,
     surfacedTaskIdsRef,
     suggested,
-    runtime.currentProjectSnapshot?.projectId,
+    currentSnapshotProjectId,
+    isCurrentProjectTrackedInRecentProjects,
+    streaming,
   ]);
+
+  useEffect(() => {
+    if (typeof document === "undefined" || typeof window === "undefined") return;
+
+    const flushOnPageExit = () => {
+      persistSessionImmediately();
+    };
+    const flushOnVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        flushOnPageExit();
+      }
+    };
+
+    document.addEventListener("visibilitychange", flushOnVisibilityChange);
+    window.addEventListener("pagehide", flushOnPageExit);
+    window.addEventListener("beforeunload", flushOnPageExit);
+    return () => {
+      document.removeEventListener("visibilitychange", flushOnVisibilityChange);
+      window.removeEventListener("pagehide", flushOnPageExit);
+      window.removeEventListener("beforeunload", flushOnPageExit);
+    };
+  }, [persistSessionImmediately]);
 
   useEffect(() => {
     if (typeof document === "undefined" || typeof window === "undefined") return;
@@ -865,27 +1325,68 @@ export function useHomeAgentConversationEffects(params: {
 
   useEffect(() => {
     if (!activeProjectId) return;
-    if (runtime.currentDramaProject || runtime.currentVideoProject) return;
+    const activeSnapshot = runtime.currentProjectSnapshot;
+    const isBridgedVideoSnapshot = shouldKeepSessionProjectIdForBridgedVideo({
+      currentSessionProjectId: activeProjectId,
+      snapshot: activeSnapshot,
+    });
+    const hasResolvedActiveProjectData = isBridgedVideoSnapshot
+      ? Boolean(runtime.currentDramaProject && runtime.currentVideoProject)
+      : Boolean(runtime.currentDramaProject || runtime.currentVideoProject);
+    if (hasResolvedActiveProjectData) return;
+    if (projectHydrationInFlightRef?.current === activeProjectId) return;
 
     let cancelled = false;
+    const bridgedVideoProjectId = isBridgedVideoSnapshot ? activeSnapshot?.projectId ?? null : null;
 
     void loadProjectStore()
       .then((store) =>
-        store.loadConversationSourceById(activeProjectId, {
-          includeSnapshot: false,
-          fastVideoLoad: true,
-        })
+        Promise.all([
+          store.loadConversationSourceById(activeProjectId, {
+            includeSnapshot: false,
+            fastVideoLoad: true,
+          }),
+          bridgedVideoProjectId
+            ? store.loadConversationSourceById(bridgedVideoProjectId, {
+                includeSnapshot: false,
+                fastVideoLoad: true,
+              })
+            : Promise.resolve(null),
+        ])
       )
-      .then((source) => {
-        if (cancelled || (!source.dramaProject && !source.videoProject)) return;
+      .then(([source, bridgedVideoSource]) => {
+        if (
+          cancelled ||
+          (!source.dramaProject && !source.videoProject && !bridgedVideoSource?.videoProject)
+        ) {
+          return;
+        }
+
+        const refreshedSnapshot =
+          source.snapshot ??
+          (source.videoProject && activeSnapshot?.projectId === source.videoProject.id
+            ? store.createVideoSnapshot(source.videoProject)
+            : source.dramaProject && activeSnapshot?.projectId === source.dramaProject.id
+              ? store.createDramaSnapshot(source.dramaProject)
+              : activeSnapshot);
 
         startTransition(() => {
           setRuntime((prev) => {
-            if (prev.currentProjectSnapshot?.projectId !== activeProjectId) return prev;
+            const stillBridgedVideoSnapshot = shouldKeepSessionProjectIdForBridgedVideo({
+              currentSessionProjectId: activeProjectId,
+              snapshot: prev.currentProjectSnapshot,
+            });
+            const matchesActiveHistorySession =
+              prev.currentProjectSnapshot?.projectId === activeProjectId ||
+              stillBridgedVideoSnapshot;
+            if (!matchesActiveHistorySession) return prev;
             return {
               ...prev,
-              currentDramaProject: source.dramaProject,
-              currentVideoProject: source.videoProject,
+              currentProjectSnapshot: refreshedSnapshot ?? prev.currentProjectSnapshot,
+              currentDramaProject: source.dramaProject ?? prev.currentDramaProject,
+              currentVideoProject: stillBridgedVideoSnapshot
+                ? (bridgedVideoSource?.videoProject ?? prev.currentVideoProject)
+                : (source.videoProject ?? prev.currentVideoProject),
             };
           });
         });
@@ -898,6 +1399,8 @@ export function useHomeAgentConversationEffects(params: {
   }, [
     activeProjectId,
     loadProjectStore,
+    projectHydrationInFlightRef,
+    runtime.currentProjectSnapshot,
     runtime.currentDramaProject,
     runtime.currentVideoProject,
     setRuntime,
@@ -919,8 +1422,11 @@ export function useHomeAgentConversationEffects(params: {
       );
     });
 
-    if (!qState && !draftPresence && !popoverOverride && readyGroups.length) {
+    if (!pendingWorkflowUploadKind && !qState && !draftPresence && readyGroups.length) {
       for (const group of readyGroups) {
+        if (!canBackgroundResearchReplacePopover(group, popoverOverride)) {
+          continue;
+        }
         const groupTasks = group.taskIds
           .map((taskId) => taskMap.get(taskId))
           .filter((task): task is Task => Boolean(task));
@@ -970,15 +1476,25 @@ export function useHomeAgentConversationEffects(params: {
               const nextProjectSnapshot =
                 result.projectSnapshot ?? result.data?.projectSnapshot ?? runtimeRef.current.currentProjectSnapshot;
               const nextRuntime = result.data
-                ? mergeRuntimeWithWorkflowDelta(runtimeRef.current, result.data)
+                ? mergeRuntimeWithWorkflowDelta(runtimeRef.current, result.data, {
+                    deferRecentProjectUpsert: streaming,
+                  })
                 : runtimeRef.current;
 
               startTransition(() => {
                 push("assistant", bridgeMessage);
                 if (result.data) {
-                  setRuntime((previous) => mergeRuntimeWithWorkflowDelta(previous, result.data));
+                  setRuntime((previous) =>
+                    mergeRuntimeWithWorkflowDelta(previous, result.data, {
+                      deferRecentProjectUpsert: streaming,
+                    }),
+                  );
                   const nextProjectId = nextProjectSnapshot?.projectId;
-                  if (nextProjectId) {
+                  const shouldKeepSessionProjectId = shouldKeepSessionProjectIdForBridgedVideo({
+                    currentSessionProjectId: activeProjectId,
+                    snapshot: nextProjectSnapshot,
+                  });
+                  if (nextProjectId && !shouldKeepSessionProjectId) {
                     setActiveProjectId(nextProjectId);
                   }
                 }
@@ -1034,7 +1550,7 @@ export function useHomeAgentConversationEffects(params: {
     }
 
     if (!newlySurfacedTasks.length) return;
-    if (qState || streaming || draftPresence || popoverOverride) return;
+    if (pendingWorkflowUploadKind || qState || streaming || draftPresence || popoverOverride) return;
 
     const pendingTaskCount = visibleTasks.filter(
       (task) => task.status === "running" || task.status === "pending",
@@ -1071,6 +1587,7 @@ export function useHomeAgentConversationEffects(params: {
     draftPresence,
     loadWorkflowActionsModule,
     parseTaskHeading,
+    pendingWorkflowUploadKind,
     popoverOverride,
     push,
     qState,

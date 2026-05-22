@@ -1,5 +1,8 @@
-import HomeAgentStudio from "@/components/home-agent/HomeAgentStudio";
+import { Suspense, lazy } from "react";
 import { useSearchParams } from "react-router-dom";
+import HomeStudioStartupFallback from "@/components/home-agent/HomeStudioStartupFallback";
+
+const HomeAgentStudio = lazy(() => import("@/components/home-agent/HomeAgentStudioBootstrap"));
 
 export default function Home() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -15,5 +18,9 @@ export default function Home() {
     setSearchParams(updated, { replace: true });
   };
 
-  return <HomeAgentStudio initialUtility={utility} onUtilityChange={handleUtilityChange} />;
+  return (
+    <Suspense fallback={<HomeStudioStartupFallback />}>
+      <HomeAgentStudio initialUtility={utility} onUtilityChange={handleUtilityChange} />
+    </Suspense>
+  );
 }

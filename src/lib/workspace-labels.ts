@@ -235,7 +235,7 @@ export function matchCharacterCostumeForText(
   text: string,
   explicitCostumeId?: string,
 ): string | null {
-  if (!character.costumes || character.costumes.length <= 1) return null;
+  if (!character.costumes?.length) return null;
 
   if (explicitCostumeId) {
     // Try matching by id first
@@ -254,6 +254,8 @@ export function matchCharacterCostumeForText(
     );
     if (byPartial?.label?.trim()) return byPartial.label.trim();
   }
+
+  if (character.costumes.length <= 1) return null;
 
   let bestLabel: string | null = null;
   let bestScore = 0;
@@ -387,7 +389,7 @@ export function matchSceneTimeVariantForText(
   text: string,
   explicitTimeVariantId?: string,
 ): TimeVariantSetting | null {
-  if (!matchedScene?.timeVariants || matchedScene.timeVariants.length <= 1) {
+  if (!matchedScene?.timeVariants?.length) {
     return null;
   }
 
@@ -407,6 +409,10 @@ export function matchSceneTimeVariantForText(
         (explicitTimeVariantId.includes(item.label.trim()) || item.label.trim().includes(explicitTimeVariantId.trim())),
     );
     if (byPartial) return byPartial;
+  }
+
+  if (matchedScene.timeVariants.length <= 1) {
+    return null;
   }
 
   let bestVariant: TimeVariantSetting | null = null;

@@ -1,6 +1,5 @@
 import type { ChatAttachment } from "@/lib/agent/chat-attachments";
 import type { AskUserQuestionRequest } from "@/lib/agent/tools/ask-user-question";
-import { invokeFunction } from "@/lib/invoke-with-key";
 
 export const VIDEO_WORKFLOW_TEMPLATE_ID = "video";
 const VIDEO_KICKOFF_PREFIX = "video-workflow-kickoff";
@@ -23,6 +22,24 @@ interface VideoUploadScriptRecognitionResult {
   script?: string;
   title?: string;
   summary?: string;
+}
+
+let invokeWithKeyModulePromise: Promise<typeof import("@/lib/invoke-with-key")> | null = null;
+
+function loadInvokeWithKeyModule() {
+  if (!invokeWithKeyModulePromise) {
+    invokeWithKeyModulePromise = import("@/lib/invoke-with-key");
+  }
+  return invokeWithKeyModulePromise;
+}
+
+async function invokeFunctionLazy<T>(
+  channel: string,
+  input?: Record<string, unknown>,
+  options?: { abortSignal?: AbortSignal },
+) {
+  const { invokeFunction } = await loadInvokeWithKeyModule();
+  return invokeFunction<T>(channel, input, options);
 }
 
 const VIDEO_WORKFLOW_EPISODE_HEADER_RE =
@@ -131,7 +148,7 @@ export function buildVideoUploadExtractionSummary(payload: VideoWorkflowUploadSc
 
 export async function recognizeVideoWorkflowUploadScript(
   payload: VideoWorkflowUploadScriptPayload,
-  options?: { abortSignal?: AbortSignal },
+  options?: { abortSignal?: AbortSignal; model?: string },
 ): Promise<VideoWorkflowUploadScriptPayload> {
   const localScript = trimToLikelyEpisodeScriptBody(payload.script);
   if (!localScript) return payload;
@@ -144,12 +161,13 @@ export async function recognizeVideoWorkflowUploadScript(
     };
   }
 
-  const { data, error } = await invokeFunction<VideoUploadScriptRecognitionResult>(
+  const { data, error } = await invokeFunctionLazy<VideoUploadScriptRecognitionResult>(
     "extract-video-upload-script",
     {
       script: localScript,
       title: payload.title,
       fileNames: payload.fileNames,
+      ...(options?.model ? { model: options.model } : {}),
     },
     { abortSignal: options?.abortSignal },
   );
@@ -198,6 +216,14 @@ export function buildVideoWorkflowKickoffIntro(): string {
   return "视频工作流已启动。我会引导你完成脚本拆解、角色与场景整理、分镜图生成和视频出片的完整流程。请先告诉我你的剧本来源。";
 }
 
+export function buildVideoWorkflowUploadInstruction(): string {
+  return "好的，请通过下方的回形针按钮上传你的剧本文档（支持 txt、docx、pdf 格式），上传后直接发送即可。";
+}
+
+export function isVideoWorkflowUploadInstructionMessage(content: string | null | undefined): boolean {
+  return String(content || "").includes("请通过下方的回形针按钮上传你的剧本文档");
+}
+
 export function buildVideoWorkflowKickoffRequest(hasDramaProject: boolean): AskUserQuestionRequest {
   const flowId = crypto.randomUUID();
   const options = [
@@ -216,11 +242,12 @@ export function buildVideoWorkflowKickoffRequest(hasDramaProject: boolean): AskU
       rationale: "上传 txt、docx、pdf 等格式的剧本文件，LLM 会严格按照剧本内容推进视频工作流。",
     },
     {
-      label: "直接开始",
+      label: "从零开始",
       value: "start-fresh",
-      rationale: "没有现成剧本，由 Agent 引导你从头开始视频工作流。",
+      rationale: "还没有完整剧本时，由 Agent 从零开始带你确认剧本起点、平台、镜头风格和出片目标。",
     },
   ];
+  const visibleOptions = options.filter((option) => option.value !== "start-fresh");
 
   return {
     id: `${VIDEO_KICKOFF_PREFIX}:${flowId}:source`,
@@ -233,7 +260,7 @@ export function buildVideoWorkflowKickoffRequest(hasDramaProject: boolean): AskU
         header: "剧本来源",
         question: "你的剧本来源是什么？",
         multiSelect: false,
-        options,
+        options: visibleOptions,
       },
     ],
   };
@@ -279,8 +306,9 @@ export function buildVideoWorkflowStartPrompt(source: VideoKickoffSource, script
     default:
       return [
         "我要开始一个新的视频工作流项目。",
-        "请通过 AskUserQuestion 逐步询问我：1）是否有剧本内容；2）目标平台；3）镜头风格；4）出片目标。",
-        "收集完信息后再推进脚本拆解，每一步都需要先确认我的选择。",
+        "请从零开始引导，不要默认我已经准备好剧本、素材或熟悉流程，也不要一上来直接执行工作流动作。",
+        "请通过 AskUserQuestion 逐步询问我当前所处的起点：1）是否已有剧本或参考内容；2）目标平台；3）镜头风格；4）出片目标。",
+        "每确认一步，都先用一句话说明我们当前进入了哪个工作流步骤；只收集当前步骤最必要的信息，确认后再继续推进到脚本拆解。",
       ].join("\n");
   }
 }

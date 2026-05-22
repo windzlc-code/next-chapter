@@ -1,4 +1,5 @@
 import { getProjectRootPath } from "@/lib/file-cache";
+import { cacheRemoteMediaToCloud } from "./cloud-media-storage";
 
 const VIDEO_CACHE_DIR = "media\\videos\\generated";
 
@@ -97,7 +98,7 @@ export async function cacheProjectVideoSource(
   fileName: string,
   projectId: string | undefined,
 ): Promise<CachedProjectVideo | null> {
-  if (!projectId || !isRemoteHttpUrl(url) || !window.electronAPI?.jimeng?.writeFile) return null;
+  if (!projectId || !isRemoteHttpUrl(url)) return null;
 
   const dedupeKey = `${projectId}::${url}`;
   const existing = inFlightVideoDownloads.get(dedupeKey);
@@ -105,6 +106,22 @@ export async function cacheProjectVideoSource(
 
   const promise = (async () => {
     try {
+      if (!window.electronAPI?.jimeng?.writeFile) {
+        const cloudAsset = await cacheRemoteMediaToCloud({
+          sourceUrl: url,
+          folder: `projects/${projectId}/media/videos/generated`,
+          fileName,
+          mimeType: "video/mp4",
+        });
+        if (!cloudAsset?.url) return null;
+        return {
+          localPath: cloudAsset.url,
+          previewUrl: cloudAsset.url,
+          size: cloudAsset.size,
+          mimeType: cloudAsset.mimeType || "video/mp4",
+        };
+      }
+
       const projectRoot = await getProjectRootPath(projectId);
       if (!projectRoot) return null;
 

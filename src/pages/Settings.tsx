@@ -37,25 +37,28 @@ import {
   DEFAULT_API_CONFIG,
   getStoredApiConfig,
   loadBuiltinApiBundleFromDisk,
-  resolveJimengExecutionMode,
   saveBuiltinApiBundle,
   saveApiConfig,
+  syncApiConfigToServerProxy,
   type BuiltinApiBundle,
   type ApiConfig,
-  type JimengExecutionMode,
 } from "@/lib/api-config";
-import {
-  dreaminaCliGetStatus,
-  dreaminaCliLogin,
-  dreaminaCliRelogin,
-} from "@/lib/dreamina-cli";
 import { readHomeAgentLaunchReadiness, type HomeAgentLaunchReadiness } from "@/lib/home-agent/launch-readiness";
 import { getHistorySettings, saveHistorySettings, type HistorySettings } from "@/lib/home-agent/history-settings";
 import { readStoredAutomationMode, writeStoredAutomationMode } from "@/lib/home-agent/automation-mode";
 import type { AutomationMode } from "@/lib/home-agent/types";
 import { cn } from "@/lib/utils";
 
-type ProviderId = "gemini" | "gpt" | "claude" | "grok" | "seedream" | "jimeng" | "tuzi";
+type ProviderId =
+  | "gemini"
+  | "gpt"
+  | "claude"
+  | "grok"
+  | "seedream"
+  | "jimeng"
+  | "aliyun"
+  | "runninghub"
+  | "tuzi";
 
 const API_ROWS: Array<{
   id: ProviderId;
@@ -101,24 +104,40 @@ const API_ROWS: Array<{
     id: "seedream",
     title: "Seedream API",
     endpointPlaceholder: "默认：https://api.tu-zi.com/v1beta",
-    endpointHint: "Seedream 图片生成 API 根地址。留空时复用 Gemini API 端点。",
-    keyHint: "Seedream API Key。留空时复用 Gemini API Key。",
+    endpointHint: "Seedream 图片 API 地址。留空复用 Gemini API 地址。",
+    keyHint: "Seedream API Key。填写后点击保存设置生效；留空复用 Gemini API Key，未配置 Gemini 时当前未生效。",
     models: "doubao-seedream-5-0-260128",
+  },
+  {
+    id: "aliyun",
+    title: "Aliyun HappyHorse API",
+    endpointPlaceholder: "默认：https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis",
+    endpointHint: "Aliyun HappyHorse 视频 API 地址。留空使用默认值。",
+    keyHint: "Aliyun API Key。填写后点击保存设置生效；未填写则当前未生效。",
+    models: "happyhorse-1.0（底层自动切换 happyhorse-1.0-t2v / happyhorse-1.0-i2v / happyhorse-1.0-r2v）",
+  },
+  {
+    id: "runninghub",
+    title: "RunningHub Fallback API",
+    endpointPlaceholder: "榛樿锛歨ttps://www.runninghub.cn",
+    endpointHint: "RunningHub 鍏滃簳瑙嗛 API 鍦板潃銆傜暀绌轰娇鐢ㄩ粯璁ゅ€笺€?",
+    keyHint: "RunningHub API Key銆傚～鍐欏悗鍙敤浜?Seedance 2.0 / Seedance 2.0 Fast / HappyHorse 瀹℃牳鍏滃簳锛屼互鍙?Seedance 2.0 2K/4K 鐩磋繛銆?",
+    models: "seedance-2.0 fallback, seedance-2.0-fast fallback, happyhorse-1.0 fallback",
   },
   {
     id: "jimeng",
     title: "Seedance API",
     endpointPlaceholder: "默认：https://api.tu-zi.com/v1beta",
-    endpointHint: "Seedance 视频生成 API 根地址。留空时复用 Gemini API 端点；若填火山方舟 Ark `/contents/generations/tasks`，下方必须填写专用 Ark Key。实际走 API 还是 CLI，由下方运行通道开关决定。",
-    keyHint: "Seedance API Key。普通网关可留空复用 Gemini API Key；若切到 Ark 直连，必须填写专用 Ark Key。若切到 CLI，本项不会参与本轮出片。",
-    models: "doubao-seedance-1-5-pro_720p, doubao-seedance-1-5-pro_1080p, seedance2.0, seedance2.0fast",
+    endpointHint: "Seedance 视频 API 地址。留空复用 Gemini API 地址。",
+    keyHint: "Seedance API Key。填写后点击保存设置生效；留空复用 Gemini API Key，未配置 Gemini 时当前未生效。",
+    models: "doubao-seedance-1-5-pro_480p, doubao-seedance-1-5-pro_720p, doubao-seedance-1-5-pro_1080p, doubao-seedance-2-0-260128, doubao-seedance-2-0-fast-260128",
   },
   {
     id: "tuzi",
     title: "Sora API",
     endpointPlaceholder: "默认：https://api.tuziapi.com",
-    endpointHint: "Sora 视频生成 API 根地址。留空使用默认值。",
-    keyHint: "Sora API Key。",
+    endpointHint: "Sora 视频 API 地址。留空使用默认值。",
+    keyHint: "Sora API Key。填写后点击保存设置生效；未填写则当前未生效。",
     models: "sora-2, sora-2-pro",
   },
 ];
@@ -129,6 +148,8 @@ const ENDPOINT_FIELD_MAP = {
   claude: "claudeEndpoint",
   grok: "grokEndpoint",
   seedream: "seedreamEndpoint",
+  aliyun: "aliyunEndpoint",
+  runninghub: "runninghubEndpoint",
   jimeng: "jimengEndpoint",
   tuzi: "tuziEndpoint",
 } as const;
@@ -139,6 +160,8 @@ const KEY_FIELD_MAP = {
   claude: "claudeKey",
   grok: "grokKey",
   seedream: "seedreamKey",
+  aliyun: "aliyunKey",
+  runninghub: "runninghubKey",
   jimeng: "jimengKey",
   tuzi: "tuziKey",
 } as const;
@@ -149,20 +172,12 @@ type SettingsProps = {
   onSaved?: () => void;
 };
 
-type DreaminaCliStatusState = Awaited<ReturnType<typeof dreaminaCliGetStatus>>;
-type DreaminaCliStatusViewState = Omit<DreaminaCliStatusState, "path"> & { path?: string };
-const JIMENG_EXECUTION_OPTIONS: Array<{ id: JimengExecutionMode; label: string; description: string }> = [
-  {
-    id: "api",
-    label: "API",
-    description: "统一走 Seedance API，适合固定 Key / 网关配置。",
-  },
-  {
-    id: "cli",
-    label: "CLI",
-    description: "统一走本机 Dreamina CLI，直接复用登录态。",
-  },
-];
+const SETTINGS_BLUE_VIOLET_TEXT = "text-[rgb(156,174,255)]";
+const SETTINGS_BLUE_VIOLET_TEXT_SOFT = "text-[rgba(156,174,255,0.78)]";
+const SETTINGS_BLUE_VIOLET_BG = "bg-[rgba(108,126,210,0.16)]";
+const SETTINGS_BLUE_VIOLET_BG_HOVER = "hover:bg-[rgba(108,126,210,0.12)]";
+const SETTINGS_BLUE_VIOLET_BORDER = "border-[rgba(132,150,236,0.24)]";
+const SETTINGS_BLUE_VIOLET_SWITCH = "data-[state=checked]:bg-[rgb(128,108,232)]";
 
 export default function Settings({ embedded = false, onClose, onSaved }: SettingsProps) {
   const navigate = useNavigate();
@@ -185,6 +200,10 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
     grokKey: "",
     seedreamEndpoint: "",
     seedreamKey: "",
+    aliyunEndpoint: "",
+    aliyunKey: "",
+    runninghubEndpoint: "",
+    runninghubKey: "",
     jimengEndpoint: "",
     jimengKey: "",
     tuziEndpoint: "",
@@ -192,9 +211,6 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
     modelMappings: {},
   });
   const [builtinSaving, setBuiltinSaving] = useState(false);
-  const [dreaminaStatus, setDreaminaStatus] = useState<DreaminaCliStatusViewState | null>(null);
-  const [dreaminaLoading, setDreaminaLoading] = useState(false);
-  const [dreaminaAction, setDreaminaAction] = useState<"login" | "relogin" | null>(null);
   const [launchReadiness, setLaunchReadiness] = useState<HomeAgentLaunchReadiness | null>(null);
 
   useEffect(() => {
@@ -208,53 +224,6 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
       }
     };
     void loadDefaultPath();
-  }, []);
-
-  const refreshDreaminaStatus = useCallback(async (silent = false) => {
-    if (!window.electronAPI?.dreaminaCli?.exec) {
-      setDreaminaStatus({
-        ok: false,
-        installed: false,
-        loggedIn: false,
-        message: "当前环境不支持 Dreamina CLI，仅 Electron 桌面端可用。",
-      });
-      return;
-    }
-
-    setDreaminaLoading(true);
-    try {
-      const status = await dreaminaCliGetStatus();
-      setDreaminaStatus(status);
-      if (!silent) {
-        const title = status.loggedIn
-          ? "Dreamina CLI 已就绪"
-          : status.installed
-            ? "Dreamina CLI 已检测到"
-            : "未检测到 Dreamina CLI";
-        toast({
-          title,
-          description: status.message,
-          variant: status.installed || status.loggedIn ? "default" : "destructive",
-        });
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setDreaminaStatus({
-        ok: false,
-        installed: true,
-        loggedIn: false,
-        message,
-      });
-      if (!silent) {
-        toast({
-          title: "Dreamina CLI 状态检查失败",
-          description: message,
-          variant: "destructive",
-        });
-      }
-    } finally {
-      setDreaminaLoading(false);
-    }
   }, []);
 
   const refreshLaunchReadiness = useCallback(async () => {
@@ -289,9 +258,8 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
   }, []);
 
   useEffect(() => {
-    void refreshDreaminaStatus(true);
     void refreshLaunchReadiness();
-  }, [refreshDreaminaStatus, refreshLaunchReadiness]);
+  }, [refreshLaunchReadiness]);
 
   useEffect(() => {
     const handleConfigUpdate = () => {
@@ -301,42 +269,27 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
     return () => window.removeEventListener(API_CONFIG_UPDATED_EVENT, handleConfigUpdate);
   }, [refreshLaunchReadiness]);
 
-  const handleDreaminaAction = async (action: "login" | "relogin") => {
-    setDreaminaAction(action);
-    try {
-      const result = action === "login" ? await dreaminaCliLogin() : await dreaminaCliRelogin();
-      toast({
-        title: result.ok
-          ? action === "login"
-            ? "Dreamina 登录已启动"
-            : "Dreamina 重新登录已启动"
-          : action === "login"
-            ? "Dreamina 登录启动失败"
-            : "Dreamina 重新登录失败",
-        description: result.message,
-        variant: result.ok ? "default" : "destructive",
-      });
-      await refreshDreaminaStatus(true);
-      await refreshLaunchReadiness();
-    } catch (error) {
-      toast({
-        title: action === "login" ? "Dreamina 登录启动失败" : "Dreamina 重新登录失败",
-        description: error instanceof Error ? error.message : String(error),
-        variant: "destructive",
-      });
-    } finally {
-      setDreaminaAction(null);
-    }
-  };
-
-  const handleSave = () => {
+  const handleSave = async () => {
     saveApiConfig(config);
+    let proxySyncWarning = "";
+    try {
+      await syncApiConfigToServerProxy(config);
+    } catch (error) {
+      proxySyncWarning = error instanceof Error ? error.message : String(error);
+      console.warn("API config saved locally, but local proxy sync failed:", error);
+    }
     saveHistorySettings(historyCfg);
     writeStoredAutomationMode(automationMode);
     setConfig(getStoredApiConfig());
     void refreshLaunchReadiness();
     onSaved?.();
-    toast({ title: "已保存", description: "设置已保存到本地。" });
+    toast({
+      title: "已保存",
+      description: proxySyncWarning
+        ? `设置已保存到本地，但同步到本地代理失败：${proxySyncWarning}`
+        : "设置已保存到本地，并已同步到本地代理。",
+      variant: proxySyncWarning ? "destructive" : undefined,
+    });
   };
 
   const handleAutomationModeChange = (mode: AutomationMode) => {
@@ -470,9 +423,6 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
   const embeddedMonoMutedTextClass = embedded
     ? "mt-1.5 break-all font-mono text-[11.5px] text-muted-foreground"
     : "mt-1.5 break-all font-mono text-[11.5px] text-muted-foreground";
-  const resolvedJimengMode = resolveJimengExecutionMode(config, {
-    dreaminaCliAccessible: !!window.electronAPI?.dreaminaCli?.exec,
-  });
   const launchTextBadgeClass = launchReadiness?.textReady
     ? "border border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
     : "border border-rose-500/40 bg-rose-500/10 text-rose-400";
@@ -483,14 +433,6 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
     ? "border border-sky-500/40 bg-sky-500/10 text-sky-400"
     : "border border-amber-500/40 bg-amber-500/10 text-amber-400";
   const uniqueModeBadgeClass = "border border-border bg-muted text-muted-foreground";
-  const dreaminaBadgeClass = dreaminaStatus?.loggedIn
-    ? "border border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
-    : dreaminaStatus?.installed
-      ? "border border-amber-500/40 bg-amber-500/10 text-amber-400"
-      : "border border-rose-500/40 bg-rose-500/10 text-rose-400";
-  const executionModeBadgeClass = resolvedJimengMode === "cli"
-    ? "border border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
-    : "border border-sky-500/40 bg-sky-500/10 text-sky-400";
 
   return (
     <div
@@ -545,7 +487,7 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
                     普通模式和全自动模式的入口、会话历史与项目状态会分开保存。
                   </p>
                 </div>
-                <div className="inline-flex shrink-0 rounded-[10px] border border-border bg-muted/30 p-0.5">
+                <div className={cn("inline-flex shrink-0 rounded-[10px] border bg-muted/30 p-0.5", SETTINGS_BLUE_VIOLET_BORDER)}>
                   {([
                     ["manual", "普通模式"],
                     ["full-auto", "全自动模式"],
@@ -557,8 +499,8 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
                       className={cn(
                         "h-8 rounded-[8px] px-3 text-[12px] font-medium transition-colors",
                         automationMode === mode
-                          ? "bg-background text-primary font-semibold shadow-sm"
-                          : "text-muted-foreground hover:text-foreground",
+                          ? `${SETTINGS_BLUE_VIOLET_BG} ${SETTINGS_BLUE_VIOLET_TEXT} font-semibold shadow-sm`
+                          : `${SETTINGS_BLUE_VIOLET_TEXT_SOFT} ${SETTINGS_BLUE_VIOLET_BG_HOVER} hover:text-[rgb(156,174,255)]`,
                       )}
                     >
                       {label}
@@ -637,134 +579,10 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
           <Card className={cardClass}>
             <CardContent className={cardContentClass}>
               <div className="space-y-1">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <h3 className={embeddedTitleTextClass}>Dreamina CLI</h3>
-                  <Badge className={dreaminaBadgeClass}>
-                    {dreaminaStatus?.loggedIn ? "已登录" : dreaminaStatus?.installed ? "待登录" : "未安装"}
-                  </Badge>
-                </div>
+                <h3 className={embeddedTitleTextClass}>Seedance 视频通道</h3>
                 <p className={embeddedMutedTextClass}>
-                  桌面端可直接复用 Dreamina 本机登录态使用 Seedance 2.0 / Fast。下面的运行通道开关会决定默认走 API 还是 CLI。
+                  Dreamina CLI 已从项目配置中移除，当前仅保留 Seedance API 通道。
                 </p>
-              </div>
-
-              <div className="space-y-2">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <p className={embeddedTitleTextClass}>Seedance 运行通道</p>
-                    <p className={embeddedMutedTextClass}>
-                      默认用于首页会话和视频工作流的出片通道。
-                    </p>
-                  </div>
-                  <Badge className={executionModeBadgeClass}>
-                    当前：{resolvedJimengMode === "cli" ? "CLI" : "API"}
-                  </Badge>
-                </div>
-
-                <div
-                  className={cn(
-                    "inline-flex rounded-full border p-1",
-                    embedded ? "border-border bg-muted/50" : "border-border/60 bg-muted/30",
-                  )}
-                >
-                  {JIMENG_EXECUTION_OPTIONS.map((option) => {
-                    const active = resolvedJimengMode === option.id;
-                    return (
-                      <button
-                        key={option.id}
-                        type="button"
-                        className={cn(
-                          "rounded-full px-3 py-1.5 text-xs font-semibold transition",
-                          active
-                            ? "bg-foreground text-background shadow-sm"
-                            : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
-                        )}
-                        onClick={() => setConfig((prev) => ({ ...prev, jimengExecutionMode: option.id }))}
-                        aria-pressed={active}
-                      >
-                        {option.label}
-                      </button>
-                    );
-                  })}
-                </div>
-
-                <p className={embeddedMutedTextClass}>
-                  {config.jimengExecutionMode
-                    ? JIMENG_EXECUTION_OPTIONS.find((option) => option.id === config.jimengExecutionMode)?.description
-                    : `当前未手动锁定，程序会自动判定为 ${resolvedJimengMode === "cli" ? "CLI" : "API"}。`}
-                </p>
-
-                <p className={embeddedMutedTextClass}>
-                  {resolvedJimengMode === "cli"
-                    ? "当前默认会走 Dreamina CLI；如果本机未安装或未登录，提交出片时会直接提示修复。"
-                    : "当前默认会走 Seedance API；即使本机已登录 Dreamina，也不会自动改走 CLI。"}
-                </p>
-                {config.jimengExecutionMode ? (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className={cn("h-auto", embeddedGhostTextButtonClass)}
-                    onClick={() =>
-                      setConfig((prev) => ({
-                        ...prev,
-                        jimengExecutionMode: undefined,
-                      }))
-                    }
-                  >
-                    恢复自动判定
-                  </Button>
-                ) : null}
-              </div>
-
-              <div className={cn(
-                "rounded-[16px] border px-3.5 py-3 text-sm",
-                embedded ? "border-border bg-muted/40" : "border-border/60 bg-muted/35",
-              )}>
-                <p className={embeddedTitleTextClass}>
-                  {dreaminaLoading ? "正在检查 Dreamina CLI 状态..." : dreaminaStatus?.message || "尚未检查 Dreamina CLI 状态。"}
-                </p>
-                {dreaminaStatus?.path ? (
-                  <p className={embeddedMonoMutedTextClass}>
-                    {dreaminaStatus.path}
-                  </p>
-                ) : null}
-              </div>
-
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className={embeddedOutlineButtonClass}
-                  onClick={() => void refreshDreaminaStatus()}
-                  disabled={dreaminaLoading || !!dreaminaAction}
-                >
-                  {dreaminaLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  检查状态
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className={embeddedOutlineButtonClass}
-                  onClick={() => void handleDreaminaAction("login")}
-                  disabled={!window.electronAPI?.dreaminaCli?.exec || !!dreaminaAction}
-                >
-                  {dreaminaAction === "login" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  浏览器登录
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className={embeddedOutlineButtonClass}
-                  onClick={() => void handleDreaminaAction("relogin")}
-                  disabled={!window.electronAPI?.dreaminaCli?.exec || !!dreaminaAction}
-                >
-                  {dreaminaAction === "relogin" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  重新登录
-                </Button>
               </div>
             </CardContent>
           </Card>
@@ -807,7 +625,7 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
             <DialogHeader>
               <DialogTitle>修改内置 API</DialogTitle>
               <DialogDescription>
-                保存后会直接写入内置配置文件。API 地址留空将使用默认值。
+                填写后点击保存设置生效。API 地址留空将使用默认值；未填写的 API Key 当前未生效。
               </DialogDescription>
             </DialogHeader>
             <div className="settings-scrollbar space-y-4 max-h-[70vh] overflow-y-auto pr-1">
@@ -839,6 +657,9 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
                       <Label className="text-sm font-medium">API Key</Label>
                       <Input
                         type="password"
+                        autoComplete="new-password"
+                        data-testid={`builtin-api-key-${row.id}`}
+                        name={`${row.id}-api-key`}
                         value={String(builtinDraft[keyField] ?? "")}
                         onChange={(e) => setBuiltinField(keyField, e.target.value)}
                         placeholder="请输入 API Key"
@@ -856,7 +677,7 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
               </Button>
               <Button type="button" onClick={() => void handleSaveBuiltinApi()} disabled={builtinSaving}>
                 {builtinSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                保存内置 API
+                保存设置
               </Button>
             </DialogFooter>
           </DialogContent>
@@ -877,6 +698,7 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
                 <Switch
                   checked={historyCfg.autoDelete}
                   onCheckedChange={(checked) => setHistoryCfg((prev) => ({ ...prev, autoDelete: checked }))}
+                  className={SETTINGS_BLUE_VIOLET_SWITCH}
                 />
               </div>
               <div>
@@ -911,7 +733,11 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
                   <Label className={embeddedLabelTextClass}>深色模式</Label>
                   <p className={embeddedMutedTextClass}>切换亮色 / 深色界面主题。</p>
                 </div>
-                <Switch checked={theme === "dark"} onCheckedChange={(checked) => setTheme(checked ? "dark" : "light")} />
+                <Switch
+                  checked={theme === "dark"}
+                  onCheckedChange={(checked) => setTheme(checked ? "dark" : "light")}
+                  className={SETTINGS_BLUE_VIOLET_SWITCH}
+                />
               </div>
             </CardContent>
           </Card>
@@ -926,15 +752,14 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
             <CardContent className={cardContentClass}>
               <div>
                 <Label className={embeddedLabelTextClass}>缓存存储路径</Label>
-                <div className={embedded ? "mt-1.5 space-y-2" : "mt-1.5 flex gap-2"}>
+                <div className={embedded ? "mt-1.5 space-y-2" : "mt-1.5 space-y-2"}>
                   <Input
                     value={
-                      config.storagePath ||
                       defaultStoragePath ||
                       (window.electronAPI?.storage ? "正在获取路径..." : "仅桌面端可显示本地路径")
                     }
                     readOnly
-                    className={cn(compactInputClass, !embedded && "flex-1")}
+                    className={compactInputClass}
                   />
                   <Button
                     variant="outline"
@@ -944,12 +769,15 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
                         : "shrink-0 gap-1.5",
                     )}
                     onClick={handleSelectStoragePath}
-                    disabled={!window.electronAPI?.storage?.selectFolder}
+                    disabled
                   >
                     <FolderCog className="h-4 w-4" />
                     设置路径
                   </Button>
                 </div>
+                <p className={cn("mt-2 text-xs text-muted-foreground", embedded && "mt-1")}>
+                  Fixed to the app root directory. External storage overrides are ignored.
+                </p>
                 {config.storagePath ? (
                   <Button
                     variant="ghost"

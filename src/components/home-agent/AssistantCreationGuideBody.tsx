@@ -29,15 +29,36 @@ const markdownComponents = {
   li: ({ children }: { children?: React.ReactNode }) => <li className="leading-[1.8]">{children}</li>,
   hr: () => <hr className="my-3.5 border-white/[0.12]" />,
   table: ({ children }: { children?: React.ReactNode }) => (
-    <div className="my-3 overflow-x-auto rounded-[14px] border border-white/[0.1] bg-white/[0.025] shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
-      <table className="w-full border-collapse text-left text-[13px] leading-[1.65]">{children}</table>
+    <div
+      className={cn(
+        "my-3 overflow-hidden rounded-[14px] border border-white/[0.1] bg-white/[0.025] shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]",
+        "[&_th:nth-child(1)]:w-[52px] [&_th:nth-child(1)]:text-center [&_th:nth-child(1)]:whitespace-nowrap [&_th:nth-child(1)]:break-keep",
+        "[&_td:nth-child(1)]:w-[52px] [&_td:nth-child(1)]:text-center [&_td:nth-child(1)]:whitespace-nowrap [&_td:nth-child(1)]:break-keep",
+        "[&_th:nth-child(2)]:w-[104px] [&_th:nth-child(2)]:whitespace-nowrap [&_th:nth-child(2)]:break-keep",
+        "[&_td:nth-child(2)]:w-[104px] [&_td:nth-child(2)]:font-medium",
+        "[&_th:nth-child(3)]:w-[35%] [&_td:nth-child(3)]:w-[35%]",
+        "[&_th:nth-child(4)]:w-[43%] [&_td:nth-child(4)]:w-[43%]",
+        "[&_th:nth-child(5)]:w-[35%] [&_td:nth-child(5)]:w-[35%]",
+      )}
+    >
+      <table className="w-full table-fixed border-collapse text-left text-[12px] leading-5.5 tracking-[0.01em]">{children}</table>
     </div>
   ),
   thead: ({ children }: { children?: React.ReactNode }) => <thead className="bg-white/[0.05] text-white/86">{children}</thead>,
   tbody: ({ children }: { children?: React.ReactNode }) => <tbody className="text-white/80">{children}</tbody>,
   tr: ({ children }: { children?: React.ReactNode }) => <tr className="border-b border-white/[0.08] transition-colors hover:bg-white/[0.02] last:border-b-0">{children}</tr>,
-  th: ({ children }: { children?: React.ReactNode }) => <th className="px-3 py-2.5 font-medium tracking-[0.01em]">{children}</th>,
-  td: ({ children }: { children?: React.ReactNode }) => <td className="px-3 py-2.5 align-top text-white/78">{children}</td>,
+  th: ({ children }: { children?: React.ReactNode }) => (
+    <th className="px-3 py-2.5 align-top text-[12px] font-medium leading-5 tracking-normal text-white/86 whitespace-nowrap">
+      <div className="overflow-hidden text-ellipsis whitespace-nowrap">{children}</div>
+    </th>
+  ),
+  td: ({ children }: { children?: React.ReactNode }) => (
+    <td className="px-3 py-2.5 align-top text-[12px] leading-5.5 text-white/78">
+      <div className="overflow-hidden break-words [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:3]">
+        {children}
+      </div>
+    </td>
+  ),
   code: ({ inline, children }: { inline?: boolean; children?: React.ReactNode }) =>
     inline ? (
       <code className="rounded bg-white/[0.1] px-1.5 py-0.5 font-mono text-[0.92em] text-white/90">{children}</code>

@@ -1,6 +1,8 @@
 {
   "geminiEndpoint": "https://api.tu-zi.com/v1beta",
   "geminiKey": "",
+  "aliyunEndpoint": "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis",
+  "aliyunKey": "",
   "jimengEndpoint": "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks",
   "jimengKey": "",
   "viduEndpoint": "",
@@ -38,6 +40,9 @@
     "doubao-seedance-1-5-pro_480p": "ep-m-20260414192742-59w88",
     "doubao-seedance-1-5-pro_720p": "ep-m-20260414192742-59w88",
     "doubao-seedance-1-5-pro_1080p": "ep-m-20260414192742-59w88",
+    "doubao-seedance-2-0-260128": "doubao-seedance-2-0-260128",
+    "doubao-seedance-2-0-fast-260128": "doubao-seedance-2-0-fast-260128",
+    "happyhorse-1.0": "happyhorse-1.0",
     "viduq3-pro": "viduq3-pro",
     "kling-v3": "kling-v3"
   }

@@ -11,7 +11,13 @@ vi.mock("@/lib/gemini-text-models", () => ({
 import { callGeminiStream } from "@/lib/gemini-client";
 import type { StudioRuntimeState } from "@/lib/home-agent/types";
 import {
+  createDramaSnapshot,
+  loadStoredDramaProjectById,
+  upsertStoredDramaProject,
+} from "@/lib/home-agent/project-store";
+import {
   analyzeExportPatchAction,
+  autoAdjustComplianceAction,
   analyzeReferenceScriptAction,
   enterDramaStepAction,
   generateDirectoryAction,
@@ -22,9 +28,15 @@ import {
   rewriteEpisodeFromReviewAction,
   runComplianceReviewAction,
   skipComplianceReviewAction,
+  updateComplianceWorkspaceAction,
   updateDramaArtifactTextAction,
 } from "./drama-workflow-service";
-import { createEmptyDramaProject, type DramaProject, type DramaSetup } from "@/types/drama";
+import {
+  createEmptyComplianceWorkspace,
+  createEmptyDramaProject,
+  type DramaProject,
+  type DramaSetup,
+} from "@/types/drama";
 
 const mockedCallGeminiStream = vi.mocked(callGeminiStream);
 
@@ -634,10 +646,7 @@ ${"body".repeat(140)}
       .mockResolvedValueOnce("filled episode 2")
       .mockResolvedValueOnce("filled episode 3");
 
-    const result = await generateEpisodeBatchAction(
-      { fillMissingEpisodes: true },
-      createRuntime(project),
-    );
+    const result = await generateEpisodeBatchAction({}, createRuntime(project));
     const nextProject = result.data?.dramaProject as DramaProject;
     const firstPrompt = String(mockedCallGeminiStream.mock.calls[0]?.[1]?.[0]?.parts?.[0]?.text ?? "");
     const secondPrompt = String(mockedCallGeminiStream.mock.calls[1]?.[1]?.[0]?.parts?.[0]?.text ?? "");
@@ -646,7 +655,7 @@ ${"body".repeat(140)}
     expect(nextProject.episodes.map((episode) => episode.number)).toEqual([1, 2, 3]);
     expect(nextProject.episodes.find((episode) => episode.number === 2)?.content).toBe("filled episode 2");
     expect(nextProject.episodes.find((episode) => episode.number === 3)?.content).toBe("filled episode 3");
-    expect(firstPrompt).toContain("批量自动撰写补齐任务");
+    expect(firstPrompt).toContain("自动批量补齐任务");
     expect(secondPrompt).toContain("filled episode 2");
     expect(result.summary).toContain("补齐 2 集");
   });
@@ -976,6 +985,55 @@ ${"body".repeat(140)}
       requestedCount: 4,
     });
     expect(nextProject.episodeQualityReviewPackets?.map((packet) => packet.episodeNumber)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("persists completed review packets before a later batch failure", async () => {
+    const project = createProject({
+      creativePlan: "Creative plan",
+      characters: "Characters",
+      currentStep: "episodes",
+      setup: {
+        ...createSetup(),
+        totalEpisodes: 2,
+      },
+      directoryRaw: "目录原文",
+      directory: Array.from({ length: 2 }, (_, index) => ({
+        number: index + 1,
+        title: `Episode ${index + 1}`,
+        summary: `summary ${index + 1}`,
+        hookType: "反转",
+        isKey: index === 0,
+        isClimax: index === 1,
+        isPaywall: false,
+        outline: `outline ${index + 1}`,
+      })),
+      episodes: Array.from({ length: 2 }, (_, index) => ({
+        number: index + 1,
+        title: `Episode ${index + 1}`,
+        content: `body ${index + 1}`,
+        wordCount: 1000 + index,
+      })),
+    });
+    upsertStoredDramaProject(project);
+
+    mockedCallGeminiStream
+      .mockResolvedValueOnce(JSON.stringify(createReviewResult(41)))
+      .mockImplementationOnce(
+        () =>
+          new Promise((_, reject) => {
+            setTimeout(() => reject(new Error("review failed")), 0);
+          }),
+      );
+
+    await expect(reviewEpisodeQualityAction({}, createRuntime(project))).rejects.toThrow("review failed");
+
+    const savedProject = loadStoredDramaProjectById(project.id);
+    expect(savedProject?.episodeQualityReviewPackets?.map((packet) => packet.episodeNumber)).toEqual([1]);
+    expect(savedProject?.lastEpisodeQualityReviewBatch).toMatchObject({
+      mode: "default-count",
+      episodeNumbers: [1],
+      requestedCount: 2,
+    });
   });
 
   it("falls back to the most recently completed episodes when all completed episodes already have review packets", async () => {
@@ -1350,6 +1408,419 @@ ${"body".repeat(140)}
     expect(nextProject.complianceReport).toBe("Structured compliance report");
     expect(nextProject.complianceReviewMode).toBe("script");
     expect(nextProject.currentStep).toBe("compliance");
+    expect(nextProject.complianceWorkspace.reviewBaselineSourceText).toContain("body 1");
+    expect(nextProject.complianceWorkspace.reviewBaselineReviewedAt).toBeTruthy();
+    expect(mockedCallGeminiStream).toHaveBeenCalled();
+    expect(mockedCallGeminiStream.mock.calls[0]?.[3]).toMatchObject({ temperature: 0.1 });
+  });
+
+  it("prefers the latest episode script when project-script source is requested", async () => {
+    const staleSourceText = "stale workspace source";
+    const latestScriptContent = "latest episode content";
+    const project = createProject({
+      creativePlan: "Creative plan",
+      characters: "Characters",
+      currentStep: "compliance",
+      directoryRaw: "directory raw",
+      episodes: [{ number: 1, title: "Episode 1", content: latestScriptContent, wordCount: 1000 }],
+      complianceWorkspace: {
+        ...createEmptyComplianceWorkspace(),
+        sourceText: staleSourceText,
+      },
+    });
+
+    mockedCallGeminiStream.mockResolvedValueOnce("Structured compliance report");
+
+    const result = await runComplianceReviewAction(
+      { reviewMode: "text", sourceStrategy: "project-script" },
+      createRuntime(project),
+    );
+    const nextProject = result.data?.dramaProject as DramaProject;
+    const prompt = String(mockedCallGeminiStream.mock.calls[0]?.[1]?.[0]?.parts?.[0]?.text ?? "");
+
+    expect(nextProject.complianceWorkspace.sourceText).toContain(latestScriptContent);
+    expect(nextProject.complianceWorkspace.sourceText).not.toContain(staleSourceText);
+    expect(nextProject.complianceWorkspace.paletteText).toContain(latestScriptContent);
+    expect(prompt).toContain(latestScriptContent);
+    expect(prompt).not.toContain(staleSourceText);
+  });
+
+  it("writes dialogue review markers into the palette text when dialogue review is enabled", async () => {
+    const longDialogue = `角色A：${"这是一次很长的对话".repeat(8)}`;
+    const project = createProject({
+      creativePlan: "Creative plan",
+      characters: "Characters",
+      currentStep: "compliance",
+      directoryRaw: "目录原文",
+      episodes: [{ number: 1, title: "Episode 1", content: longDialogue, wordCount: 1000 }],
+      complianceWorkspace: {
+        ...createEmptyComplianceWorkspace(),
+        dialogueReviewEnabled: true,
+      },
+    });
+
+    mockedCallGeminiStream.mockResolvedValueOnce("Structured compliance report");
+
+    const result = await runComplianceReviewAction({ reviewMode: "script" }, createRuntime(project));
+    const nextProject = result.data?.dramaProject as DramaProject;
+
+    expect(nextProject.complianceWorkspace.dialogueReviewEnabled).toBe(true);
+    expect(nextProject.complianceWorkspace.paletteText).toContain("【对话审查】");
+    expect(nextProject.complianceWorkspace.paletteText).toContain(longDialogue);
+    expect(nextProject.complianceWorkspace.dialogueOverLimitLineIndexes.length).toBeGreaterThan(0);
+  });
+
+  it("refreshes dialogue review markers from the latest script content on rerun", async () => {
+    const staleDialogue = `角色A：${"旧版本对话".repeat(10)}`;
+    const latestDialogue = `角色B：${"新版本对话".repeat(10)}`;
+    const project = createProject({
+      creativePlan: "Creative plan",
+      characters: "Characters",
+      currentStep: "compliance",
+      directoryRaw: "目录原文",
+      episodes: [{ number: 1, title: "Episode 1", content: latestDialogue, wordCount: 1000 }],
+      complianceWorkspace: {
+        ...createEmptyComplianceWorkspace(),
+        sourceText: staleDialogue,
+        paletteText: `【对话审查】 ${staleDialogue}`,
+        dialogueReviewEnabled: true,
+      },
+    });
+
+    mockedCallGeminiStream.mockResolvedValueOnce("Structured compliance report");
+
+    const result = await runComplianceReviewAction({ reviewMode: "script" }, createRuntime(project));
+    const nextProject = result.data?.dramaProject as DramaProject;
+
+    expect(nextProject.complianceWorkspace.sourceText).toContain(latestDialogue);
+    expect(nextProject.complianceWorkspace.paletteText).toContain(latestDialogue);
+    expect(nextProject.complianceWorkspace.paletteText).toContain("【对话审查】");
+    expect(nextProject.complianceWorkspace.paletteText).not.toContain(staleDialogue);
+  });
+
+  it("starts a rerun from a fresh palette and history even when the source text is unchanged", async () => {
+    const sourceText = "角色A：这是当前待审正文";
+    const stalePaletteText = "角色A：这是上一次调色后的正文";
+    const project = createProject({
+      creativePlan: "Creative plan",
+      characters: "Characters",
+      currentStep: "compliance",
+      directoryRaw: "目录原文",
+      episodes: [{ number: 1, title: "Episode 1", content: sourceText, wordCount: 1000 }],
+      complianceWorkspace: {
+        ...createEmptyComplianceWorkspace(),
+        sourceText,
+        paletteText: stalePaletteText,
+        riskPhrases: [
+          {
+            id: "old-risk",
+            level: "high",
+            text: "旧风险片段",
+            reason: "old",
+            segmentIndex: 0,
+            replacement: "旧改写",
+            status: "resolved",
+          },
+        ],
+        phraseReplacements: { "old-risk": "旧改写" },
+        history: ["更早版本", stalePaletteText],
+        historyIndex: 1,
+      },
+      complianceReport: "Old report",
+      complianceRevisionPackets: [
+        {
+          id: "old-packet",
+          issueTitle: "Old packet",
+          riskLevel: "medium",
+          recommendation: "Old recommendation",
+          status: "resolved",
+          replacement: "旧改写",
+        },
+      ],
+    });
+
+    mockedCallGeminiStream.mockResolvedValueOnce("Structured compliance report");
+
+    const result = await runComplianceReviewAction({ reviewMode: "script" }, createRuntime(project));
+    const nextProject = result.data?.dramaProject as DramaProject;
+
+    expect(nextProject.complianceReport).toBe("Structured compliance report");
+    expect(nextProject.complianceWorkspace.sourceText).toContain(sourceText);
+    expect(nextProject.complianceWorkspace.paletteText).toBe(nextProject.complianceWorkspace.sourceText);
+    expect(nextProject.complianceWorkspace.history).toEqual([nextProject.complianceWorkspace.sourceText]);
+    expect(nextProject.complianceWorkspace.historyIndex).toBe(0);
+    expect(nextProject.complianceWorkspace.phraseReplacements).toEqual({});
+    expect(nextProject.complianceWorkspace.riskPhrases).toEqual([]);
+    expect(nextProject.complianceRevisionPackets.some((packet) => packet.id === "old-packet")).toBe(false);
+  });
+
+  it("uses smart incremental rerun to keep unresolved risks while reviewing only changed content", async () => {
+    const oldRiskText = "角色A：旧风险";
+    const newRiskyLine = "新增风险段";
+    const baselineSourceText = `第1集 Episode 1\n${oldRiskText}\n中间安全段落\n结尾安全段落`;
+    const project = createProject({
+      creativePlan: "Creative plan",
+      characters: "Characters",
+      currentStep: "compliance",
+      directoryRaw: "目录原文",
+      episodes: [
+        {
+          number: 1,
+          title: "Episode 1",
+          content: `${oldRiskText}\n中间安全段落\n结尾安全段落\n${newRiskyLine}`,
+          wordCount: 64,
+        },
+      ],
+      complianceReport: "Old compliance report",
+      complianceWorkspace: {
+        ...createEmptyComplianceWorkspace(),
+        sourceText: baselineSourceText,
+        paletteText: baselineSourceText,
+        reviewBaselineSourceText: baselineSourceText,
+        reviewBaselineReviewedAt: "2026-04-01T00:00:00.000Z",
+        riskPhrases: [
+          {
+            id: "risk-1",
+            level: "high",
+            text: oldRiskText,
+            reason: "keep watching this line",
+            segmentIndex: 0,
+            status: "pending",
+          },
+        ],
+      },
+    });
+
+    mockedCallGeminiStream.mockResolvedValueOnce("Structured compliance report");
+
+    const result = await runComplianceReviewAction(
+      { reviewMode: "text", sourceStrategy: "project-script", smartRerun: true },
+      createRuntime(project),
+    );
+    const nextProject = result.data?.dramaProject as DramaProject;
+    const prompt = String(mockedCallGeminiStream.mock.calls[0]?.[1]?.[0]?.parts?.[0]?.text ?? "");
+
+    expect(prompt).toContain(newRiskyLine);
+    expect(prompt).not.toContain(oldRiskText);
+    expect(nextProject.complianceReport).toContain("智能重审摘要");
+    expect(nextProject.complianceWorkspace.riskPhrases.map((phrase) => phrase.text)).toContain(oldRiskText);
+    expect(nextProject.complianceWorkspace.reviewBaselineSourceText).toContain(newRiskyLine);
+  });
+
+  it("falls back to a full rerun when the source text changes too much", async () => {
+    const baselineSourceText = "第1集 Episode 1\n角色A：旧风险\n旧段落";
+    const nextSourceText = "全新场景一\n全新场景二\n全新场景三\n全新场景四";
+    const project = createProject({
+      creativePlan: "Creative plan",
+      characters: "Characters",
+      currentStep: "compliance",
+      directoryRaw: "目录原文",
+      episodes: [{ number: 1, title: "Episode 1", content: nextSourceText, wordCount: nextSourceText.length }],
+      complianceReport: "Old compliance report",
+      complianceWorkspace: {
+        ...createEmptyComplianceWorkspace(),
+        sourceText: baselineSourceText,
+        paletteText: baselineSourceText,
+        reviewBaselineSourceText: baselineSourceText,
+        reviewBaselineReviewedAt: "2026-04-01T00:00:00.000Z",
+        riskPhrases: [
+          {
+            id: "risk-1",
+            level: "high",
+            text: "角色A：旧风险",
+            reason: "old risk",
+            segmentIndex: 0,
+            status: "pending",
+          },
+        ],
+      },
+    });
+
+    mockedCallGeminiStream.mockResolvedValueOnce("Structured compliance report");
+
+    const result = await runComplianceReviewAction(
+      { reviewMode: "text", sourceStrategy: "project-script", smartRerun: true },
+      createRuntime(project),
+    );
+    const nextProject = result.data?.dramaProject as DramaProject;
+    const prompt = String(mockedCallGeminiStream.mock.calls[0]?.[1]?.[0]?.parts?.[0]?.text ?? "");
+
+    expect(prompt).toContain("全新场景一");
+    expect(prompt).toContain("全新场景四");
+    expect(nextProject.complianceReport).toBe("Structured compliance report");
+    expect(nextProject.complianceWorkspace.reviewBaselineSourceText).toContain("全新场景四");
+    expect(nextProject.complianceWorkspace.riskPhrases).toEqual([]);
+  });
+
+  it("removes dialogue review markers when the toggle is turned off", async () => {
+    const markedDialogue = `【对话审查】 角色A：${"这是一次很长的对话".repeat(8)}`;
+    const project = createProject({
+      creativePlan: "Creative plan",
+      characters: "Characters",
+      currentStep: "compliance",
+      directoryRaw: "目录原文",
+      episodes: [{ number: 1, title: "Episode 1", content: "body 1", wordCount: 1000 }],
+      complianceWorkspace: {
+        ...createEmptyComplianceWorkspace(),
+        sourceText: markedDialogue.replace("【对话审查】 ", ""),
+        paletteText: markedDialogue,
+        history: [markedDialogue],
+        historyIndex: 0,
+        dialogueReviewEnabled: true,
+        dialogueOverLimitLineIndexes: [0],
+      },
+    });
+
+    const result = await updateComplianceWorkspaceAction(
+      { dialogueReviewEnabled: false },
+      createRuntime(project),
+    );
+    const nextProject = result.data?.dramaProject as DramaProject;
+
+    expect(nextProject.complianceWorkspace.dialogueReviewEnabled).toBe(false);
+    expect(nextProject.complianceWorkspace.paletteText).not.toContain("【对话审查】");
+    expect(nextProject.complianceWorkspace.dialogueOverLimitLineIndexes).toEqual([]);
+  });
+
+  it("syncs auto-adjusted compliance text back into episodes before rerun", async () => {
+    const originalText = "角色A：危险表达";
+    const replacementText = "角色A：安全表达";
+    const sourceText = `第1集 Episode 1\n${originalText}`;
+    const project = createProject({
+      creativePlan: "Creative plan",
+      characters: "Characters",
+      currentStep: "compliance",
+      directoryRaw: "目录原文",
+      episodes: [{ number: 1, title: "Episode 1", content: originalText, wordCount: originalText.length }],
+      complianceWorkspace: {
+        ...createEmptyComplianceWorkspace(),
+        sourceText,
+        paletteText: sourceText,
+        riskPhrases: [
+          {
+            id: "risk-1",
+            level: "high",
+            text: originalText,
+            reason: "weaken the expression",
+            segmentIndex: 0,
+            status: "pending",
+          },
+        ],
+      },
+    });
+
+    mockedCallGeminiStream.mockResolvedValueOnce(
+      JSON.stringify({ items: [{ id: "risk-1", replacement: replacementText }] }),
+    );
+
+    const adjusted = await autoAdjustComplianceAction(
+      { sourceStrategy: "project-script" },
+      createRuntime(project),
+    );
+    const adjustedProject = adjusted.data?.dramaProject as DramaProject;
+
+    expect(adjustedProject.episodes[0]?.content).toBe(replacementText);
+    expect(adjustedProject.complianceWorkspace.sourceText).toContain(replacementText);
+    expect(adjustedProject.complianceWorkspace.sourceText).not.toContain(originalText);
+
+    mockedCallGeminiStream.mockResolvedValueOnce("Structured compliance report");
+
+    await runComplianceReviewAction(
+      { reviewMode: "text", sourceStrategy: "project-script" },
+      createRuntime(adjustedProject),
+    );
+    const rerunPrompt = String(mockedCallGeminiStream.mock.calls[1]?.[1]?.[0]?.parts?.[0]?.text ?? "");
+
+    expect(rerunPrompt).toContain(replacementText);
+    expect(rerunPrompt).not.toContain(originalText);
+  });
+
+  it("keeps unmatched compliance risks pending when auto-adjust returns no replacement", async () => {
+    const sourceText = "第1集 Episode 1\n角色A：危险表达";
+    const project = createProject({
+      creativePlan: "Creative plan",
+      characters: "Characters",
+      currentStep: "compliance",
+      directoryRaw: "目录原文",
+      episodes: [{ number: 1, title: "Episode 1", content: "角色A：危险表达", wordCount: 9 }],
+      complianceWorkspace: {
+        ...createEmptyComplianceWorkspace(),
+        sourceText,
+        paletteText: sourceText,
+        riskPhrases: [
+          {
+            id: "risk-1",
+            level: "high",
+            text: "角色A：危险表达",
+            reason: "weaken the expression",
+            segmentIndex: 0,
+            status: "pending",
+          },
+        ],
+      },
+    });
+
+    mockedCallGeminiStream.mockResolvedValueOnce(JSON.stringify({ items: [] }));
+
+    const result = await autoAdjustComplianceAction(
+      { sourceStrategy: "project-script" },
+      createRuntime(project),
+    );
+    const nextProject = result.data?.dramaProject as DramaProject;
+
+    expect(nextProject.complianceWorkspace.riskPhrases[0]?.status).toBe("pending");
+  });
+
+  it("reuses the synced compliance workspace text after auto-adjust instead of re-reviewing the repaired lines", async () => {
+    const originalText = "角色A：危险表达";
+    const replacementText = "角色A：安全表达";
+    const sourceText = `第1集 Episode 1\n${originalText}`;
+    const project = createProject({
+      creativePlan: "Creative plan",
+      characters: "Characters",
+      currentStep: "compliance",
+      directoryRaw: "目录原文",
+      episodes: [{ number: 1, title: "Episode 1", content: originalText, wordCount: originalText.length }],
+      complianceWorkspace: {
+        ...createEmptyComplianceWorkspace(),
+        sourceText,
+        paletteText: sourceText,
+        reviewBaselineSourceText: sourceText,
+        reviewBaselineReviewedAt: "2026-04-01T00:00:00.000Z",
+        riskPhrases: [
+          {
+            id: "risk-1",
+            level: "high",
+            text: originalText,
+            reason: "weaken the expression",
+            segmentIndex: 0,
+            status: "pending",
+          },
+        ],
+      },
+    });
+
+    mockedCallGeminiStream.mockResolvedValueOnce(
+      JSON.stringify({ items: [{ id: "risk-1", replacement: replacementText }] }),
+    );
+
+    const adjusted = await autoAdjustComplianceAction(
+      { sourceStrategy: "project-script" },
+      createRuntime(project),
+    );
+    const adjustedProject = adjusted.data?.dramaProject as DramaProject;
+
+    const rerun = await runComplianceReviewAction(
+      { reviewMode: "text", sourceStrategy: "project-script", smartRerun: true },
+      createRuntime(adjustedProject),
+    );
+    const rerunProject = rerun.data?.dramaProject as DramaProject;
+
+    expect(mockedCallGeminiStream).toHaveBeenCalledTimes(1);
+    expect(rerunProject.complianceWorkspace.sourceText).toContain(replacementText);
+    expect(rerunProject.complianceWorkspace.riskPhrases).toEqual([]);
+    expect(rerunProject.complianceRevisionPackets).toEqual([]);
+    expect(rerunProject.complianceReport).toContain("智能重审摘要");
   });
 
   it("can skip compliance review and move the project into export", async () => {
@@ -1366,6 +1837,38 @@ ${"body".repeat(140)}
 
     expect(nextProject.currentStep).toBe("export");
     expect(nextProject.complianceReport).toBe("");
+  });
+
+  it("reuses the stored project when compliance skip runs before drama hydration finishes", async () => {
+    const project = createProject({
+      id: "script-project-skip",
+      dramaTitle: "Named Script Project",
+      currentStep: "episodes",
+      creativePlan: "Creative plan",
+      characters: "Characters",
+      directoryRaw: "目录原文",
+      episodes: [{ number: 1, title: "Episode 1", content: "body 1", wordCount: 1000 }],
+    });
+    upsertStoredDramaProject(project);
+
+    const runtime: StudioRuntimeState = {
+      sessionId: "session-1",
+      currentProjectSnapshot: createDramaSnapshot(project),
+      currentDramaProject: null,
+      currentVideoProject: null,
+      currentSetupDraft: null,
+      skillDrafts: [],
+      maintenanceReports: [],
+      recentProjects: [],
+      recentMessageSummary: "",
+    };
+
+    const result = await skipComplianceReviewAction({ projectId: project.id }, runtime);
+    const nextProject = result.data?.dramaProject as DramaProject;
+
+    expect(nextProject.id).toBe(project.id);
+    expect(nextProject.dramaTitle).toBe("Named Script Project");
+    expect(nextProject.currentStep).toBe("export");
   });
 
   it("builds and persists a structured export patch plan", async () => {

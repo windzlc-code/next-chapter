@@ -10,16 +10,79 @@
   100% { transform: translateX(250%); }
 }
 @keyframes dot-pulse {
-  0%, 80%, 100% { transform: scale(0.55); opacity: 0.35; }
-  40%            { transform: scale(1);    opacity: 1;    }
+  0%, 20%, 100% { transform: scale(0.58); opacity: 0.32; }
+  45%           { transform: scale(1);    opacity: 1;    }
+  70%           { transform: scale(0.58); opacity: 0.32; }
+}
+@keyframes status-text-shimmer {
+  0%, 6% {
+    background-position: var(--agent-shimmer-start, 240px) 50%;
+  }
+  94%, 100% {
+    background-position: var(--agent-shimmer-end, -240px) 50%;
+  }
 }
 .animate-shimmer-sweep {
   will-change: transform;
   animation: shimmer-sweep 1.8s ease-in-out infinite;
 }
-.animate-dot-pulse-0 { animation: dot-pulse 1.4s ease-in-out 0ms    infinite; }
-.animate-dot-pulse-1 { animation: dot-pulse 1.4s ease-in-out 160ms  infinite; }
-.animate-dot-pulse-2 { animation: dot-pulse 1.4s ease-in-out 320ms  infinite; }
+.animate-dot-pulse-0 { animation: dot-pulse 1.2s linear 0s infinite; }
+.animate-dot-pulse-1 { animation: dot-pulse 1.2s linear -0.8s infinite; }
+.animate-dot-pulse-2 { animation: dot-pulse 1.2s linear -0.4s infinite; }
+.agent-status-shimmer-text {
+  position: relative;
+  display: inline-block;
+  color: hsl(var(--muted-foreground) / 0.72);
+}
+
+.agent-status-shimmer-text::after {
+  content: attr(data-text);
+  position: absolute;
+  inset: 0;
+  color: transparent;
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    transparent 33%,
+    hsl(var(--foreground) / 0.05) 38%,
+    hsl(var(--foreground) / 0.14) 43%,
+    hsl(var(--foreground) / 0.28) 47%,
+    hsl(var(--foreground) / 0.92) 50%,
+    hsl(var(--foreground) / 0.28) 53%,
+    hsl(var(--foreground) / 0.18) 57%,
+    hsl(var(--foreground) / 0.10) 61%,
+    hsl(var(--foreground) / 0.05) 66%,
+    hsl(var(--foreground) / 0.025) 72%,
+    transparent 79%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: var(--agent-shimmer-band-span, 240px) 100%;
+  background-position: var(--agent-shimmer-start, 240px) 50%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  pointer-events: none;
+  animation: status-text-shimmer var(--agent-shimmer-duration, 2.8s) cubic-bezier(0.33, 0, 0.2, 1) var(--agent-shimmer-sync-delay, 0ms) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-shimmer-sweep,
+  .animate-dot-pulse-0,
+  .animate-dot-pulse-1,
+  .animate-dot-pulse-2,
+  .agent-status-shimmer-text {
+    animation: none !important;
+  }
+
+  .agent-status-shimmer-text {
+    color: hsl(var(--muted-foreground) / 0.72);
+  }
+
+  .agent-status-shimmer-text::after {
+    animation: none !important;
+    background-position: var(--agent-shimmer-start, 240px) 50%;
+  }
+}
 
 @layer base {
   :root {
@@ -235,6 +298,283 @@
     overflow: hidden;
     border-radius: 28px;
     background: hsl(var(--card) / 0.97);
+  }
+  .home-agent-unread-composer-line {
+    background-image: linear-gradient(
+      90deg,
+      rgba(92, 126, 255, 0) 0%,
+      rgba(92, 126, 255, 0.12) 10%,
+      rgba(108, 123, 255, 0.28) 28%,
+      rgba(136, 109, 255, 0.52) 50%,
+      rgba(108, 123, 255, 0.28) 72%,
+      rgba(92, 126, 255, 0.12) 90%,
+      rgba(92, 126, 255, 0) 100%
+    );
+    box-shadow:
+      0 0 8px rgba(96, 121, 255, 0.1),
+      0 0 16px rgba(134, 109, 255, 0.08);
+    animation: home-agent-unread-composer-line-breathe 2.8s ease-in-out infinite;
+    transform-origin: center;
+  }
+  @keyframes home-agent-unread-composer-line-breathe {
+    0%,
+    100% {
+      opacity: 0.3;
+      transform: scaleX(0.972) scaleY(0.92);
+      filter: saturate(0.9) brightness(0.92);
+      box-shadow:
+        0 0 6px rgba(96, 121, 255, 0.08),
+        0 0 12px rgba(134, 109, 255, 0.06);
+    }
+    50% {
+      opacity: 0.62;
+      transform: scaleX(1) scaleY(1.12);
+      filter: saturate(1.02) brightness(0.98);
+      box-shadow:
+        0 0 10px rgba(96, 121, 255, 0.14),
+        0 0 22px rgba(134, 109, 255, 0.12);
+    }
+  }
+  .composer-shell-style-capture {
+    position: relative;
+    border: 1px solid hsl(var(--primary) / 0.38);
+    box-shadow:
+      0 0 0 1px hsl(var(--primary) / 0.08),
+      0 18px 48px rgba(0, 0, 0, 0.24);
+    animation: composer-style-capture-breathe 4.8s ease-in-out infinite;
+  }
+  .composer-shell-style-capture::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(
+      115deg,
+      transparent 0%,
+      hsl(var(--primary) / 0.05) 24%,
+      hsl(193 96% 68% / 0.58) 42%,
+      hsl(var(--primary) / 0.36) 52%,
+      hsl(193 96% 68% / 0.54) 62%,
+      transparent 100%
+    );
+    background-size: 220% 220%;
+    animation: composer-style-capture-flow 7.4s linear infinite;
+    pointer-events: none;
+    -webkit-mask:
+      linear-gradient(#fff 0 0) content-box,
+      linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    opacity: 0.95;
+  }
+  .composer-shell-style-capture::after {
+    content: "";
+    position: absolute;
+    inset: -14px;
+    border-radius: inherit;
+    background:
+      radial-gradient(circle at 18% 22%, hsl(var(--primary) / 0.14), transparent 36%),
+      radial-gradient(circle at 82% 18%, hsl(193 96% 68% / 0.12), transparent 34%);
+    filter: blur(18px);
+    opacity: 0.6;
+    pointer-events: none;
+    z-index: -1;
+  }
+  .composer-shell-style-capture-action {
+    position: relative;
+    isolation: isolate;
+    box-shadow:
+      0 0 0 1px hsl(var(--primary) / 0.12),
+      0 8px 24px rgba(0, 0, 0, 0.16);
+    animation: composer-style-capture-breathe 4.8s ease-in-out infinite;
+  }
+  @keyframes composer-style-capture-breathe {
+    0%,
+    100% {
+      box-shadow:
+        0 0 0 1px hsl(var(--primary) / 0.08),
+        0 18px 48px rgba(0, 0, 0, 0.24);
+    }
+    50% {
+      box-shadow:
+        0 0 0 1px hsl(var(--primary) / 0.16),
+        0 0 0 6px hsl(var(--primary) / 0.04),
+        0 22px 56px rgba(0, 0, 0, 0.28);
+    }
+  }
+  @keyframes composer-style-capture-flow {
+    0% {
+      background-position: 0% 50%;
+      opacity: 0.7;
+    }
+    50% {
+      background-position: 100% 50%;
+      opacity: 1;
+    }
+    100% {
+      background-position: 0% 50%;
+      opacity: 0.7;
+    }
+  }
+  .home-agent-full-auto-frame-active,
+  .home-agent-full-auto-frame-stopped {
+    position: relative;
+    isolation: isolate;
+    background: transparent;
+  }
+  .home-agent-full-auto-frame-active {
+    border: 1px solid hsl(var(--primary) / 0.38);
+    box-shadow:
+      0 0 0 1px hsl(var(--primary) / 0.04),
+      0 18px 48px rgba(0, 0, 0, 0.24);
+    animation: composer-style-capture-breathe 4.8s ease-in-out infinite;
+  }
+  .home-agent-full-auto-frame-active::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(
+      115deg,
+      transparent 0%,
+      hsl(var(--primary) / 0.05) 24%,
+      hsl(193 96% 68% / 0.58) 42%,
+      hsl(var(--primary) / 0.36) 52%,
+      hsl(193 96% 68% / 0.54) 62%,
+      transparent 100%
+    );
+    background-size: 220% 220%;
+    animation: composer-style-capture-flow 7.4s linear infinite;
+    pointer-events: none;
+    -webkit-mask:
+      linear-gradient(#fff 0 0) content-box,
+      linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    opacity: 0.95;
+  }
+  .home-agent-full-auto-frame-active::after {
+    content: "";
+    position: absolute;
+    inset: -14px;
+    border-radius: inherit;
+    background: transparent;
+    filter: blur(18px);
+    opacity: 0;
+    pointer-events: none;
+    z-index: -1;
+  }
+  .home-agent-full-auto-frame-stopped {
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    box-shadow:
+      0 0 0 1px rgba(148, 163, 184, 0.05),
+      0 18px 42px rgba(0, 0, 0, 0.18);
+  }
+  .home-agent-full-auto-frame-stopped::before,
+  .home-agent-full-auto-frame-stopped::after {
+    content: none;
+  }
+  .composer-shell-media-locked {
+    position: relative;
+    isolation: isolate;
+    --composer-media-locked-shadow-rest:
+      0 0 0 1px rgba(148, 163, 184, 0.12),
+      0 14px 34px rgba(15, 23, 42, 0.14);
+    --composer-media-locked-shadow-breathe:
+      0 0 0 1px rgba(148, 163, 184, 0.2),
+      0 0 0 6px rgba(148, 163, 184, 0.04),
+      0 18px 40px rgba(15, 23, 42, 0.18);
+    box-shadow: var(--composer-media-locked-shadow-rest);
+    animation: composer-media-locked-breathe 4.6s ease-in-out infinite;
+  }
+  .composer-shell-media-locked::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(
+      118deg,
+      transparent 0%,
+      rgba(255, 255, 255, 0.04) 18%,
+      rgba(226, 232, 240, 0.2) 34%,
+      rgba(148, 163, 184, 0.38) 50%,
+      rgba(226, 232, 240, 0.24) 66%,
+      transparent 100%
+    );
+    background-size: 220% 220%;
+    animation: composer-media-locked-flow 7.2s linear infinite;
+    pointer-events: none;
+    -webkit-mask:
+      linear-gradient(#fff 0 0) content-box,
+      linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    opacity: 0.9;
+  }
+  .composer-shell-media-locked::after {
+    content: "";
+    position: absolute;
+    inset: -12px;
+    border-radius: inherit;
+    background:
+      radial-gradient(circle at 18% 24%, rgba(226, 232, 240, 0.08), transparent 36%),
+      radial-gradient(circle at 82% 18%, rgba(148, 163, 184, 0.08), transparent 34%);
+    filter: blur(16px);
+    opacity: 0.42;
+    pointer-events: none;
+    z-index: -1;
+  }
+  .dark .composer-shell-media-locked {
+    --composer-media-locked-shadow-rest:
+      0 0 0 1px rgba(148, 163, 184, 0.16),
+      0 18px 42px rgba(0, 0, 0, 0.24);
+    --composer-media-locked-shadow-breathe:
+      0 0 0 1px rgba(148, 163, 184, 0.24),
+      0 0 0 6px rgba(148, 163, 184, 0.05),
+      0 22px 48px rgba(0, 0, 0, 0.28);
+  }
+  .dark .composer-shell-media-locked::before {
+    background: linear-gradient(
+      118deg,
+      transparent 0%,
+      rgba(255, 255, 255, 0.05) 18%,
+      rgba(226, 232, 240, 0.22) 34%,
+      rgba(148, 163, 184, 0.46) 50%,
+      rgba(226, 232, 240, 0.26) 66%,
+      transparent 100%
+    );
+  }
+  .dark .composer-shell-media-locked::after {
+    background:
+      radial-gradient(circle at 18% 24%, rgba(226, 232, 240, 0.1), transparent 36%),
+      radial-gradient(circle at 82% 18%, rgba(148, 163, 184, 0.1), transparent 34%);
+    opacity: 0.5;
+  }
+  @keyframes composer-media-locked-breathe {
+    0%,
+    100% {
+      box-shadow: var(--composer-media-locked-shadow-rest);
+    }
+    50% {
+      box-shadow: var(--composer-media-locked-shadow-breathe);
+    }
+  }
+  @keyframes composer-media-locked-flow {
+    0% {
+      background-position: 0% 50%;
+      opacity: 0.72;
+    }
+    50% {
+      background-position: 100% 50%;
+      opacity: 1;
+    }
+    100% {
+      background-position: 0% 50%;
+      opacity: 0.72;
+    }
   }
 
   /* Composer dock fade: theme-aware gradient */

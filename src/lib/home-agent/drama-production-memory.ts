@@ -6,6 +6,10 @@ import type {
   StoryBeatPacket,
 } from "@/types/drama";
 import type { VideoStyleLock, VideoWorldModel } from "@/types/project";
+import {
+  deriveComplianceRevisionPackets,
+  normalizeComplianceWorkspace,
+} from "./compliance-workspace";
 import { repairDramaDirectoryFromRaw } from "./script-artifact-helpers";
 
 function truncate(text: string, max = 180): string {
@@ -146,6 +150,10 @@ function splitComplianceBlocks(report: string): string[] {
   return parts.length ? parts.slice(0, 12) : [normalized];
 }
 
+function isSmartComplianceSummaryReport(report: string): boolean {
+  return /^#?\s*智能重审摘要(?:\s|$)/m.test(report.replace(/\r/g, "").trim());
+}
+
 function inferRiskLevel(block: string): ComplianceRevisionPacket["riskLevel"] {
   if (/(高风险|严重|违规|禁止|敏感)/.test(block)) return "high";
   if (/(中风险|注意|谨慎|建议调整)/.test(block)) return "medium";
@@ -153,6 +161,11 @@ function inferRiskLevel(block: string): ComplianceRevisionPacket["riskLevel"] {
 }
 
 export function deriveDramaComplianceRevisionPackets(project: DramaProject): ComplianceRevisionPacket[] {
+  const workspace = normalizeComplianceWorkspace(project.complianceWorkspace);
+  if (workspace.riskPhrases.length) {
+    return deriveComplianceRevisionPackets(workspace.riskPhrases, workspace.phraseReplacements);
+  }
+  if (isSmartComplianceSummaryReport(project.complianceReport)) return [];
   if (!project.complianceReport.trim()) return [];
 
   const existingStatusMap = new Map(

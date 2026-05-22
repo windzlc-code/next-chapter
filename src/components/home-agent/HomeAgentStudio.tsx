@@ -1,10 +1,13 @@
 ﻿import * as React from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import { flushSync } from "react-dom";
 import {
   Wand2,
   Compass,
   PanelsTopLeft,
+  X,
 } from "lucide-react";
+import { useIsMobile } from "@/hooks/use-mobile";
 import type { QueryEngine } from "@/lib/agent/query-engine";
 import {
   buildMessageInputFromAttachments,
@@ -21,6 +24,7 @@ import type {
   ConversationProjectSnapshot,
   CreationMode,
   HomeAgentMessage,
+  PendingWorkflowUploadKind,
   StudioQuestionState,
   StudioRuntimeState,
   StudioSessionState,
@@ -36,29 +40,37 @@ import {
   localizeMediaSettingValue,
 } from "@/lib/home-agent/media-generation-copy";
 import {
-  DesktopSidebar,
-  MobileSidebarSheet,
-} from "./home-agent-sidebar";
-import {
   ActiveConversationShell,
+  HOME_AGENT_DESKTOP_LAYOUT_INVALIDATE_EVENT,
   HomeSurfaceBackdrop,
   IdleLanding,
   MobileTopbar,
 } from "./home-agent-shell";
 import HomeAgentConfirmDialog from "./HomeAgentConfirmDialog";
 import {
+  createAutomationModeProjectMemory,
   areProjectSnapshotsEquivalent,
   areRecentSessionsEquivalent,
   buildProjectSuggestionKey,
   createInitialStudioSeed,
+  didSessionScopedProjectSwitch,
   hasSavedSessionContent,
-  qStepKey,
   mergeRecentProjects,
+  qStepKey,
+  reconcileRecentProjectsWithStableOrder,
+  rememberProjectForAutomationMode,
+  resolveSessionProjectIdForSnapshot,
+  resolveComposerDraftSnapshot,
+  resolvePendingWorkflowUploadKind,
+  selectRecentProjectForAutomationMode,
+  upsertRecentProjectSession,
 } from "./home-agent-session-utils";
 import { createQuestionState, textOf, toQuery } from "./home-agent-protocol-utils";
 import {
   buildBeatPacketDecisionQuestion,
   buildBeatPacketListQuestion,
+  buildVideoBridgeQuestion,
+  buildVideoBridgePrefixQuestion,
   buildCharacterCardDecisionQuestion,
   buildCharacterCardListQuestion,
   buildComplianceDecisionQuestion,
@@ -75,11 +87,15 @@ import {
   listFailedVideoScenes,
   listGeneratableVideoScenes,
   listPendingCompliancePackets,
+  listRunningSegmentVideoLabels,
   listRunningVideoScenes,
   listUnlockedBeatPackets,
   listUnlockedCharacterCards,
-  buildVideoBridgeRetryQuestion,
 } from "./home-agent-project-questions";
+import {
+  resolveInterruptedWorkflowQuestion,
+  shouldRestoreLastSuggestedAfterInterrupt,
+} from "./home-agent-interrupt-recovery";
 import {
   DesktopSettingsPanel,
   MobileSettingsSheet,
@@ -93,11 +109,18 @@ import { useHomeAgentBootstrapEffects } from "./use-home-agent-bootstrap-effects
 import { useHomeAgentChoiceHandlers } from "./use-home-agent-choice-handlers";
 import type { ExportLocalAction } from "./home-agent-script-choice-handlers";
 import { useHomeAgentConversationEffects } from "./use-home-agent-conversation-effects";
-import { useHomeAgentRuntimeActions } from "./use-home-agent-runtime-actions";
+import {
+  isBridgeableVideoWorkflowSourceSnapshot,
+  replacePlaceholderRecentProject,
+  useHomeAgentRuntimeActions,
+  waitForAbortableDelay,
+} from "./use-home-agent-runtime-actions";
 import { useHomeAgentRecoveryFlow } from "./use-home-agent-recovery-flow";
 import { useHomeAgentQuestionView } from "./use-home-agent-question-view";
 import { useHomeAgentShellHandlers } from "./use-home-agent-shell-handlers";
 import { useHomeAgentSurfaceState } from "./use-home-agent-surface-state";
+import type { HomeAgentMaintenanceHintNotice } from "./use-home-agent-surface-state";
+import { useHomeAgentLastSessionRecovery } from "./use-home-agent-last-session-recovery";
 import {
   areTaskListsEquivalent,
   buildTaskResultMessage,
@@ -107,6 +130,7 @@ import {
 } from "./home-agent-task-utils";
 import { useHomeAgentWorkflowShortcuts } from "./use-home-agent-workflow-shortcuts";
 import { useHomeAgentComposerBindings } from "./use-home-agent-composer-bindings";
+import { shouldForceSilentWorkflowShortcut } from "./workflow-shortcut-silence";
 import { getAllTasks, stopTask, type Task } from "@/lib/agent/tools/task-tools";
 import type { CreationGuideDimensionId } from "@/lib/home-agent/creation-guide-presets";
 import { recordAssistantFeedbackLog } from "@/lib/home-agent/assistant-feedback-log";
@@ -120,6 +144,7 @@ import {
   writeStoredHomeAgentTextModelKey,
 } from "@/lib/home-agent/text-models";
 import {
+  applyVideoImageViewModeConstraints,
   DEFAULT_HOME_AGENT_IMAGE_GENERATION_PREFS,
   buildVideoImageGenerationSummary,
   buildVideoImageStyleSummary,
@@ -143,6 +168,7 @@ import {
 import {
   analyzeHomeAgentImageStyleFiles,
   buildImagePrefsPatchFromRecognition,
+  type HomeAgentImageStyleRecognitionResult,
   isSupportedImageFile,
 } from "@/lib/home-agent/image-style-analysis";
 import { buildQuickExportMarkdown } from "@/lib/home-agent/script-artifact-helpers";
@@ -155,7 +181,11 @@ import {
   buildVideoWorkflowKickoffIntro,
   buildVideoWorkflowKickoffRequest,
 } from "@/lib/home-agent/video-workflow-kickoff";
-import { upsertStoredVideoProject } from "@/hooks/use-local-persistence";
+import {
+  loadStoredVideoProjectById,
+  upsertStoredVideoProject,
+  type PersistedVideoProject,
+} from "@/hooks/use-local-persistence";
 import { useSmartScroll } from "@/hooks/use-smart-scroll";
 import {
   exportChatHistory,
@@ -167,6 +197,7 @@ import {
   type ChatHistoryPreview,
 } from "@/lib/home-agent/chat-history-io";
 import {
+  hasSessionResetMarkerForProject,
   readStudioSession,
   readProjectSessionFromFile,
   readStudioProjectSession,
@@ -179,6 +210,12 @@ import {
   normalizeAutomationMode,
   readStoredAutomationMode,
 } from "@/lib/home-agent/automation-mode";
+import {
+  CHARACTER_AUDIO_PRESET_PICKER_ANSWER_KEY,
+  buildCharacterAudioPresetPickerQuestion,
+  loadCharacterAudioPresetLibrary,
+  type CharacterAudioPresetBindSelection,
+} from "@/lib/home-agent/character-audio-preset-library";
 import type {
   VideoGenerationModelKey,
   VideoGenerationPrefs,
@@ -189,7 +226,7 @@ import type {
 } from "@/types/project";
 import {
   isLocalSidebarAssetUrl,
-  normalizeSidebarAssetPath,
+  type SidebarAssetItem,
 } from "./home-agent-sidebar-utils";
 import { resolveArtifactSnapshots } from "@/lib/home-agent/message-artifact-snapshots";
 import {
@@ -197,9 +234,35 @@ import {
   resolveVideoAttachmentSource,
 } from "@/lib/home-agent/video-cache";
 import { synchronizeVideoProductionState } from "@/lib/home-agent/video-production-memory";
-import { isExpiredRemoteSignedMediaUrl } from "@/lib/home-agent/media-url";
-
+import {
+  isExpiredRemoteSignedMediaUrl,
+  isMediaAssetDefinitelyMissing,
+  isKnownPlaceholderMediaUrl,
+  resolveLocalMediaPreviewDataUrl,
+} from "@/lib/home-agent/media-url";
 const { useCallback, useEffect, useMemo, useRef, useState, startTransition } = React;
+type DesktopSidebarProps = React.ComponentProps<typeof import("./home-agent-sidebar")["DesktopSidebar"]>;
+type MobileSidebarSheetProps = React.ComponentProps<typeof import("./home-agent-sidebar")["MobileSidebarSheet"]>;
+
+const LazyDesktopSidebar = React.lazy(async () => {
+  const mod = await import("./home-agent-sidebar");
+  return { default: mod.DesktopSidebar };
+});
+const LazyMobileSidebarSheet = React.lazy(async () => {
+  const mod = await import("./home-agent-sidebar");
+  return { default: mod.MobileSidebarSheet };
+});
+
+let videoWorkflowServiceModulePromise:
+  | Promise<typeof import("@/lib/home-agent/services/video-workflow-service")>
+  | null = null;
+
+function loadVideoWorkflowService() {
+  if (!videoWorkflowServiceModulePromise) {
+    videoWorkflowServiceModulePromise = import("@/lib/home-agent/services/video-workflow-service");
+  }
+  return videoWorkflowServiceModulePromise;
+}
 
 type UtilityPanelId = "settings" | undefined;
 type ActiveVideoProject = NonNullable<StudioRuntimeState["currentVideoProject"]>;
@@ -226,6 +289,7 @@ type AssetLibraryEventDetail = {
   preferredTab?: "image" | "video";
   preferredImageSubTab?: AssetLibraryImageSubTab;
   isHistoricalVersion?: boolean;
+  historyEntryId?: string;
 };
 type IncomingAssetItem = {
   url: string;
@@ -235,7 +299,133 @@ type IncomingAssetItem = {
   preferredTab?: "image" | "video";
   preferredImageSubTab?: AssetLibraryImageSubTab;
   isHistoricalVersion?: boolean;
+  historyEntryId?: string;
 };
+type PendingWorkflowPopoverAfterAssistantReply = {
+  question: ComposerQuestion;
+  lastAssistantMessageId: string | null;
+  projectId: string | null;
+};
+type PendingDeferredQuestionRestoreAfterAssistantReply = {
+  stepKey: string;
+  lastAssistantMessageId: string | null;
+  projectId: string | null;
+};
+type PendingCharacterAudioUploadRestoreContext = {
+  question: ComposerQuestion | null;
+  qState: StudioQuestionState | null;
+  selectedValues: string[];
+  draft: string;
+};
+type PendingCharacterAudioUploadRequest = {
+  label: string;
+  characterId: string;
+  characterName?: string;
+  restoreQuestion?: ComposerQuestion | null;
+  restoreContext?: PendingCharacterAudioUploadRestoreContext | null;
+};
+type CharacterAudioPresetPickerRequest = {
+  characterId: string;
+  characterName?: string;
+  restoreQuestion?: ComposerQuestion | null;
+};
+
+type SubmittedStyleReferenceRecognitionResult =
+  HomeAgentImageStyleRecognitionResult & {
+    handledLocally?: boolean;
+  };
+
+const STYLE_REFERENCE_RECOGNITION_TIMEOUT_MS = 12_000;
+
+function DesktopSidebarFallback({
+  collapsed,
+  expandedWidth,
+  collapsedWidth,
+}: Pick<DesktopSidebarProps, "collapsed" | "expandedWidth" | "collapsedWidth">) {
+  const width = collapsed ? collapsedWidth : expandedWidth;
+  return (
+    <aside
+      aria-hidden="true"
+      className="fixed inset-y-0 left-0 z-40 hidden border-r border-border/60 bg-background/70 backdrop-blur-sm lg:block"
+      style={{ width }}
+    >
+      <div className="flex h-full animate-pulse flex-col gap-3 px-3 py-4">
+        <div className="h-10 rounded-2xl bg-muted/70" />
+        <div className="h-9 rounded-xl bg-muted/50" />
+        <div className="h-9 rounded-xl bg-muted/45" />
+        <div className="h-9 rounded-xl bg-muted/40" />
+      </div>
+    </aside>
+  );
+}
+
+function MobileSidebarFallback({
+  open,
+}: Pick<MobileSidebarSheetProps, "open">) {
+  if (!open) return null;
+
+  return (
+    <div aria-hidden="true" className="fixed inset-0 z-50 lg:hidden">
+      <div className="absolute inset-0 bg-black/58" />
+      <div className="absolute inset-y-0 left-0 w-full max-w-[440px] border-r border-border bg-background p-4 shadow-[18px_0_48px_rgba(0,0,0,0.4)]">
+        <div className="flex animate-pulse flex-col gap-3">
+          <div className="h-10 rounded-2xl bg-muted/70" />
+          <div className="h-9 rounded-xl bg-muted/50" />
+          <div className="h-9 rounded-xl bg-muted/45" />
+          <div className="h-9 rounded-xl bg-muted/40" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function projectMatchesAutomationMode(
+  snapshot: Pick<ConversationProjectSnapshot, "automationMode"> | null | undefined,
+  mode: AutomationMode,
+): boolean {
+  if (!snapshot) return false;
+  return normalizeAutomationMode(snapshot?.automationMode) === mode;
+}
+
+export function resolveModeIsolationAction(params: {
+  currentSnapshot: Pick<ConversationProjectSnapshot, "projectId" | "automationMode"> | null | undefined;
+  targetMode: AutomationMode;
+  nextProjectId?: string | null;
+  activeProjectId?: string | null;
+  hasMessages: boolean;
+  hasDraft: boolean;
+  mode: "idle" | "active" | "recovering" | "maintenance-review";
+}): { type: "activate-mode-only" | "open-project" | "reset-home"; projectId?: string } {
+  const {
+    currentSnapshot,
+    targetMode,
+    nextProjectId = null,
+    activeProjectId = null,
+    hasMessages,
+    hasDraft,
+    mode,
+  } = params;
+
+  if (projectMatchesAutomationMode(currentSnapshot, targetMode)) {
+    return { type: "activate-mode-only" };
+  }
+
+  if (nextProjectId) {
+    return nextProjectId !== currentSnapshot?.projectId
+      ? { type: "open-project", projectId: nextProjectId }
+      : { type: "reset-home" };
+  }
+
+  const shouldResetHomeSurface = Boolean(
+    currentSnapshot ||
+    activeProjectId ||
+    hasMessages ||
+    hasDraft ||
+    mode !== "idle",
+  );
+
+  return shouldResetHomeSurface ? { type: "reset-home" } : { type: "activate-mode-only" };
+}
 
 function decodeMediaFileName(value: string): string {
   try {
@@ -368,6 +558,17 @@ function clearAssetFromVideoProject(
   project: ActiveVideoProject,
   assetId: string,
 ): ActiveVideoProject {
+  const segmentContinuityGridMatch = assetId.match(/^segment:(.+):continuity-grid$/);
+  if (segmentContinuityGridMatch) {
+    const segmentLabel = segmentContinuityGridMatch[1];
+    if (!segmentLabel || !project.segmentContinuityGridImages?.[segmentLabel]) return project;
+    const { [segmentLabel]: _removed, ...rest } = project.segmentContinuityGridImages;
+    return {
+      ...project,
+      segmentContinuityGridImages: Object.keys(rest).length ? rest : undefined,
+    };
+  }
+
   if (assetId.startsWith("manual:")) {
     return {
       ...project,
@@ -502,6 +703,47 @@ function clearAssetFromVideoProject(
   }
 
   return project;
+}
+
+export function shouldAutoCleanupInvalidAsset(
+  asset: Pick<ProductionAssetRecord, "kind" | "origin">,
+): boolean {
+  return asset.kind === "video-segment";
+}
+
+export function hasSegmentContinuityGridForProject(
+  project: Pick<ActiveVideoProject, "segmentContinuityGridImages">,
+  segmentLabel: string,
+): boolean {
+  const normalizedSegmentLabel = String(segmentLabel || "").trim();
+  if (!normalizedSegmentLabel) return false;
+  return Boolean(project.segmentContinuityGridImages?.[normalizedSegmentLabel]?.imageUrl?.trim());
+}
+
+function resolveLocalSegmentContinuityBackfillVideoUrl(
+  project: Pick<ActiveVideoProject, "segmentVideos" | "assetManifest">,
+  segmentLabel: string,
+): string | undefined {
+  const normalizedSegmentLabel = String(segmentLabel || "").trim();
+  if (!normalizedSegmentLabel) return undefined;
+
+  const directSegmentUrl = String(project.segmentVideos?.[normalizedSegmentLabel] || "").trim();
+  if (isLocalSidebarAssetUrl(directSegmentUrl)) return directSegmentUrl;
+
+  const manifestCandidates = (project.assetManifest?.items ?? [])
+    .filter((item) => item.kind === "video-segment")
+    .filter((item) => {
+      const sourceEntityId = String(item.sourceEntityId || "").trim();
+      const assetId = String(item.id || "").trim();
+      return (
+        sourceEntityId === normalizedSegmentLabel ||
+        assetId === `segment:${normalizedSegmentLabel}:video`
+      );
+    })
+    .map((item) => String(item.url || "").trim())
+    .filter((url) => isLocalSidebarAssetUrl(url));
+
+  return manifestCandidates[0] || undefined;
 }
 
 function applyAssetReplacement(
@@ -665,6 +907,8 @@ function applyAssetReplacement(
 }
 
 type LocalScriptExportResult = { status: "saved" } | { status: "cancelled" };
+const INLINE_MEDIA_REGENERATE_GUARD_DELAY_MS =
+  import.meta.env.MODE === "test" ? 0 : 3000;
 
 function isMissingSaveBinaryHandler(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -688,6 +932,128 @@ function sanitizeExportFileName(value: string, fallback: string): string {
     .replace(/\s+/g, " ")
     .replace(/[. ]+$/g, "");
   return normalized || fallback;
+}
+
+const CHARACTER_AUDIO_REFERENCE_EXTENSIONS = new Set([
+  "mp3",
+  "wav",
+  "m4a",
+  "aac",
+  "ogg",
+  "flac",
+  "opus",
+]);
+
+function isSupportedCharacterAudioFile(file: Pick<File, "name" | "type">): boolean {
+  const mimeType = String(file.type || "").trim().toLowerCase();
+  if (mimeType.startsWith("audio/")) return true;
+  const extension = file.name.split(".").pop()?.trim().toLowerCase();
+  return Boolean(extension && CHARACTER_AUDIO_REFERENCE_EXTENSIONS.has(extension));
+}
+
+export function collectSupportedCharacterAudioFiles<T extends Pick<File, "name" | "type">>(
+  files: T[],
+): T[] {
+  return files.filter(isSupportedCharacterAudioFile);
+}
+
+function resolveCharacterAudioReferenceUrl(
+  attachment: Pick<ChatAttachment, "localPath" | "mimeType" | "base64">,
+): string | undefined {
+  const localPath = typeof attachment.localPath === "string" ? attachment.localPath.trim() : "";
+  if (localPath) return localPath;
+  const base64 = typeof attachment.base64 === "string" ? attachment.base64.trim() : "";
+  if (!base64) return undefined;
+  const mimeType = attachment.mimeType?.trim() || "application/octet-stream";
+  return `data:${mimeType};base64,${base64}`;
+}
+
+const PENDING_CHARACTER_AUDIO_RETURN_MENU_VALUE =
+  "home:pending-character-audio:return-menu";
+const PENDING_CHARACTER_AUDIO_CANCEL_VALUE =
+  "home:pending-character-audio:cancel-upload";
+const PENDING_CHARACTER_AUDIO_QUESTION_KEY = "pending-character-audio-upload";
+
+function parsePendingCharacterAudioUploadQuestion(
+  question: Pick<ComposerQuestion, "id" | "title" | "answerKey"> | null | undefined,
+): {
+  characterId: string;
+  characterName?: string;
+  canReturnToMenu: boolean;
+} | null {
+  if (question?.answerKey !== PENDING_CHARACTER_AUDIO_QUESTION_KEY) {
+    return null;
+  }
+
+  const parts = question.id.split(":");
+  const characterId = parts.at(-2)?.trim();
+  const mode = parts.at(-1)?.trim();
+  if (!characterId) {
+    return null;
+  }
+
+  const titleMatch = question.title.match(/《(.+?)》/u);
+  const characterName = titleMatch?.[1]?.trim() || undefined;
+
+  return {
+    characterId,
+    characterName,
+    canReturnToMenu: mode === "restore",
+  };
+}
+
+function markQuestionForExactRestore(
+  question: ComposerQuestion | null | undefined,
+): ComposerQuestion | null {
+  if (!question) return null;
+  if (question.preserveExactOnRestore) return question;
+  return {
+    ...question,
+    preserveExactOnRestore: true,
+  };
+}
+
+function buildPendingCharacterAudioUploadQuestion(params: {
+  projectId?: string | null;
+  characterId: string;
+  characterName?: string;
+  canReturnToMenu: boolean;
+}): ComposerQuestion {
+  const { projectId, characterId, characterName, canReturnToMenu } = params;
+  const resolvedCharacterName = characterName?.trim();
+  const optionLabel = canReturnToMenu ? "返回菜单" : "取消上传";
+  const optionValue = canReturnToMenu
+    ? PENDING_CHARACTER_AUDIO_RETURN_MENU_VALUE
+    : PENDING_CHARACTER_AUDIO_CANCEL_VALUE;
+
+  return {
+    id: `${PENDING_CHARACTER_AUDIO_QUESTION_KEY}:${projectId ?? "video"}:${characterId}:${
+      canReturnToMenu ? "restore" : "cancel"
+    }`,
+    title: resolvedCharacterName
+      ? `正在等待上传《${resolvedCharacterName}》的音频参考`
+      : "正在等待上传角色音频参考",
+    description: canReturnToMenu
+      ? "上传 1 个音频文件并发送即可绑定。若不继续上传，可点“返回菜单”取消当前操作并回到刚才的菜单。"
+      : "上传 1 个音频文件并发送即可绑定。若不继续上传，可点“取消上传”退出当前等待状态。",
+    options: [
+      {
+        id: `${characterId}-${canReturnToMenu ? "return-menu" : "cancel-upload"}`,
+        label: optionLabel,
+        value: optionValue,
+        rationale: canReturnToMenu
+          ? "取消当前音频上传，并回到刚才打开的素材菜单。"
+          : "取消当前音频上传，关闭本次等待状态。",
+      },
+    ],
+    presentation: "card",
+    allowCustomInput: true,
+    submissionMode: "immediate",
+    multiSelect: false,
+    stepIndex: 0,
+    totalSteps: 1,
+    answerKey: PENDING_CHARACTER_AUDIO_QUESTION_KEY,
+  };
 }
 
 function triggerBrowserTextDownload(fileName: string, content: string) {
@@ -774,13 +1140,21 @@ interface Props {
 
 type QState = StudioQuestionState;
 
+export const HOMEPAGE_IDENTITY_GUIDANCE =
+  "当用户问“你是谁”“你能做什么”或“这个产品是干什么的”时，先按项目定位介绍自己：你是 InFinio 首页里的主控创作 Agent，这是一站式 AI 创作与视频生产工作台，负责把原创剧本、参考改编、视频工作流、素材沉淀、审阅返工和导出交付留在同一会话里持续推进。除非用户明确追问底层模型、供应商或接口实现，否则不要主动先报 Claude、Anthropic、模型 ID 等底层信息。";
+
 const PROMPT = [
   "你是 InFinio 首页里的主控创作 Agent。",
-  "所有推进都优先留在当前首页会话里完成，不要把用户推回模块页、步骤页或手动表单。",
-  "当需要用户做选择、补参数或确认分支时，必须在同一轮调用 AskUserQuestion，给出可点击的结构化选项。",
-  "当需要执行项目动作时调用 HomeStudioWorkflow；当适合并行研究或后台长任务时可以启动 Agent，但结果必须收口回当前会话。",
-  "默认使用简体中文，回复简洁、专业，不暴露内部推理。",
-  "每次回复都要明确引导下一步；如果用户输入含糊，不要猜测，改为继续追问。",
+  "整个产品只有这一张首页工作台。所有推进都优先留在当前会话里完成，不要把用户推回模块页、步骤页、工作台或手动表单。",
+  "你的默认工作顺序是：先分析，再追问，再执行。",
+  "当需要结构化选择时，优先调用 AskUserQuestion。每一步都要给出足够清晰、可点击的选项，必要时支持多步追问和自定义输入。",
+  "不要只把下一步选项写成 Markdown 列表让用户自己读；需要用户决策时，要真正调用 AskUserQuestion 并等待用户选择。",
+  "当需要推进项目动作时调用 HomeStudioWorkflow；当适合并行研究或后台长任务时可以启动 Agent，但最终结果必须收口回当前首页会话。",
+  "默认使用简体中文，保持简洁、克制、专业，不暴露内部推理。",
+  "一次只推进一个关键决策；如果信息不够，不要猜，继续追问。",
+  "如果用户只是打招呼或闲聊，先简短回应，不要主动汇报项目状态；等用户提出明确需求后再推进。",
+  HOMEPAGE_IDENTITY_GUIDANCE,
+  "当用户处于剧本或视频工作流中时，不要跳步。先完成当前阶段，再进入下一阶段。",
 ].join("\\n");
 const ASSET_CREATION_PROMPT_OVERRIDE = [
   "[Asset Creation Override]",
@@ -795,50 +1169,24 @@ const ASSET_CREATION_PROMPT_OVERRIDE = [
 const LLM_CONTROL_MODE_APPENDIX = [
   "[Normal LLM Mode Rules]",
   "In normal llm mode, you own the decision layer.",
-  "MANDATORY: Every reply must end with forward guidance 鈥?either call AskUserQuestion to show a decision popup, or append a short '涓嬩竴姝ワ細XXX' hint. Never leave the user without a clear next action.",
-  "MANDATORY: Never expose internal reasoning, chain-of-thought, or self-check steps in the reply. Output conclusions and actions only. Never write '鎵ц鍔ㄤ綔:', '鎵ц鎿嶄綔:', tool names like 'AskUserQuestion' or 'HomeStudioWorkflow' as plain text, and never list option values (snake_case identifiers) as bullet points. Call tools directly 鈥?the UI renders them automatically.",
-  "MANDATORY: NEVER output raw XML tool-call markup in your reply text. Do NOT write <function_calls>, <invoke>, <parameter>, or any similar XML tags as visible text. When you need to call a tool, call it as a structured tool call 鈥?never as inline XML text in the message.",
-  "MANDATORY: Output must be complete and untruncated. Never cut off mid-sentence or use placeholders like '锛堢暐锛? or '锛堜互涓嬬渷鐣ワ級'. If content is long, split into complete readable paragraphs.",
-  "MANDATORY: When the user's input is vague, ambiguous, or says things like '闅忎究'/'閮借'/'浣犲喅瀹?, do NOT guess 鈥?immediately call AskUserQuestion with 2-4 concrete options to help the user clarify.",
-  "When information is missing, the workflow reaches a turning point, or a workflow action finishes, reply with a brief status summary and then use AskUserQuestion for the next choice.",
-  "At every major decision or explicit tradeoff, do both in the same turn: explain the choices briefly in text and call AskUserQuestion so the popup appears.",
+  "Natural-language discussion is allowed. Answer the user's question normally when that helps the current step, then guide them back into the workflow.",
+  "For identity or product-introduction questions, introduce yourself from the InFinio product role first: the homepage creative/workflow agent for script, adaptation, video production, asset accumulation, review, and export. Only mention the underlying model as secondary context when the user explicitly asks for it.",
+  "If the user asks you to compare, explain, or clarify the options of an existing standard popup, answer in text first and then restore that same popup. Do not replace it with a new generic AskUserQuestion unless the current popup is truly no longer valid.",
+  "When information is missing, the workflow reaches a turning point, or a workflow action finishes, usually reply with a brief status summary and then use AskUserQuestion for the next choice.",
+  "At major decisions or explicit tradeoffs, briefly explain the choices in text and use AskUserQuestion when a structured popup will genuinely help.",
   "Do not assume the UI will auto-open a scripted next-step panel for you.",
   "Do not silently execute the next workflow action. Offer choices first.",
-  "Proactively gather missing structured details through AskUserQuestion, following the same level of specificity as the dev-mode step popups such as duration, batch scope, export choices, and bridge decisions.",
-  "MANDATORY: Do NOT front-load all required parameters at the start of a step. Use a progressive guidance approach: briefly introduce the current step's goal first, then collect key information one question at a time via AskUserQuestion. Never dump a list of required fields on the user before they understand what the step is about.",
-  "MANDATORY: Even when the conversation goes severely off-track (topic drift, unrelated questions, tangents), do NOT abandon the workflow. First respond briefly to the user's current topic, then gently guide back to the paused workflow step 鈥?append a soft prompt like '椤轰究璇翠竴涓嬶紝鎴戜滑涔嬪墠鍦ㄥ仛 XXX锛岃缁х画鍚楋紵' and call AskUserQuestion to resume. Never give up on the workflow no matter how far the conversation drifts.",
-  "If the user goes off-topic during a workflow or question flow, answer the user's current request first, then restore the paused step with AskUserQuestion at the end of the same reply.",
+  "Proactively gather missing structured details through AskUserQuestion, following the same level of specificity as the dev-mode step popups such as duration, batch scope, export choices, and bridge decisions, but do not force every turn into a popup if a short natural-language reply is more helpful.",
+  "If the user goes off-topic during a workflow or question flow, answer the user's current request first.",
   "Do not treat free-text input or uploaded files as the answer to a paused workflow question unless the user explicitly confirms that intent.",
+  "After answering the off-topic request, gently restore the paused step through AskUserQuestion instead of forcing the flow.",
   "When a script is ready to move into video, keep the same conversation alive and guide the user step by step through the video workflow instead of treating it as a disconnected module.",
+  "In the video workflow, code only controls the big stages and whether the current stage is ready. You must self-loop inside the current stage, keep collecting missing details with AskUserQuestion, and only ask the user to enter the next stage after the current one is complete.",
+  "If a video stage requires a file, explicitly ask the user to upload it with the paperclip and continue the same stage after the upload arrives.",
+  "In 视频工作流 / 剧本拆解, required configuration such as script source, single-episode duration, and video pace should be collected through AskUserQuestion popup options instead of broad free-text questions.",
+  "If the user does not know which option to choose in 视频工作流 / 剧本拆解, recommend the best-fit option based on the existing script and explain the recommendation briefly.",
+  "In 视频工作流 / 剧本拆解, all decomposition and extension must stay strictly within the existing script content. Do not invent new key characters, key scenes, or major plot turns.",
   "Every uploaded file must still receive an LLM response, even when you can only reason from extracted text, metadata, or a fallback digest.",
-  "[Video Workflow LLM Rules]",
-  "Video workflow is fully LLM-driven. You decide when to show popups and what options to offer based on what the user needs.",
-  "Collect user config step by step through AskUserQuestion: platform goal, shot style, storyboard scope, prompt batch size, generation batch, refresh scope, and review decisions.",
-  "When the user uploads a script document, analyze it strictly 鈥?do NOT add plot, characters, or scenes that are not in the uploaded content.",
-  "At each video workflow stage transition (analyze 鈫?entities 鈫?storyboard 鈫?prompts 鈫?generate 鈫?review 鈫?export), use AskUserQuestion to confirm the user is ready and collect any missing parameters before calling HomeStudioWorkflow.",
-  "Do not collapse multiple video workflow steps into a single broad question. Use one focused AskUserQuestion per decision point.",
-  "If the user selects 'use-current-project', read the current drama project content, automatically write targetPlatform, shotStyle, and outputGoal, then continue into the video workflow without asking the user to run a separate prefix panel.",
-  "[Image Generation Direct Call Rules]",
-  "MANDATORY: When the user explicitly asks to generate character reference images, scene reference images, or any reference assets (e.g. '鐢熸垚瑙掕壊鍙傝€冨浘', '鐢熸垚鍦烘櫙鍙傝€冨浘', '鐢熸垚鍙傝€冭祫浜?, 'generate reference images', 'generate character images'), you MUST immediately call HomeStudioWorkflow with action='generate_video_reference_assets'. Do NOT use advance_video_workflow for this.",
-  "MANDATORY: When the user explicitly asks to generate storyboard frames or storyboard images (e.g. '鐢熸垚鍒嗛暅鍥?, '鐢熸垚鍒嗛暅', 'generate storyboard', 'generate storyboard frames'), you MUST immediately call HomeStudioWorkflow with action='generate_storyboard_frames'. Do NOT use advance_video_workflow for this.",
-  "These two actions are direct image generation calls 鈥?they call the image generation API immediately. Use them whenever the user's intent is clearly to generate images, without waiting for advance_video_workflow to decide.",
-  "If the user says '甯垜鐢熷浘', '鐢熸垚鍥剧墖', or any similar phrasing in a video project context, determine from context whether they mean reference assets or storyboard frames, then call the appropriate action directly.",
-  "MANDATORY: When the user asks to generate a single image from a text description (e.g. '甯垜鐢讳竴寮犲浘', '鐢熸垚涓€寮犲浘鐗?, '鏍规嵁杩欐鎻忚堪鐢熸垚鍥?, 'generate an image of ...'), call HomeStudioWorkflow with action='generate_project_image' and pass the visual description as imagePrompt. IMPORTANT: if the image is of a character, person, or portrait, also pass imageKind='character'; if it is a scene, environment, or background, pass imageKind='scene' (or omit it). The generated image will automatically appear in the chat 鈥?do NOT describe the image in text after calling the tool.",
-  "OVERRIDE: generate_video_reference_assets, generate_storyboard_frames, and generate_project_image are asset-creation actions. They must go straight to the generation tool call. Do NOT call query_asset_status before these actions.",
-  "[Script Breakdown Pre-collection Rules]",
-  "MANDATORY: When the user's intent is to do script breakdown (鎷嗚В鍓ф湰 / analyze script / start breakdown), you MUST immediately call AskUserQuestion 鈥?do NOT output text saying 'I need to collect parameters first' without actually calling the tool. Outputting text instead of calling the tool is a violation.",
-  "MANDATORY: Before executing the script breakdown (鎷嗚В鍓ф湰) action, collect two parameters via AskUserQuestion in sequence: (1) Episode duration (鍗曢泦鏃堕暱) 鈥?options: 60s / 90s / 120s / 鑷畾涔? If the user selects 鑷畾涔? immediately call AskUserQuestion again to prompt the user to type a custom duration value; wait for that input before proceeding. (2) Video pace (瑙嗛鑺傚) 鈥?options: 鎱㈤€?(2~4 shots/segment) / 涓瓑 (3~5 shots/segment) / 蹇€?(4~6 shots/segment). Only after BOTH parameters are confirmed, call HomeStudioWorkflow with action='analyze_script_for_video', videoPace, and episodeDuration. If either parameter is missing or skipped, re-ask before executing.",
-  "NOTE: The system panel's '瀹屾垚鍓ф湰鎷嗚В'/'鎷嗚В鑴氭湰' button is handled by the UI layer with its own parameter collection popups 鈥?the LLM does NOT need to handle that path. The LLM only needs to handle cases where the user triggers breakdown intent via text input or AskUserQuestion option selection.",
-  "MANDATORY: When exporting storyboard (瀵煎嚭鍒嗛暅), the format is always xlsx. Pass xlsx as the format parameter directly 鈥?do not offer other format options.",
-  "[Material Package Check Rules]",
-  "MANDATORY: The ONLY valid source of truth for asset existence is the asset library (assetManifest). Assets generated inside the current video workflow are automatically synchronized into assetManifest, and manually added library assets are valid too. Raw project fields like imageUrl, storyboardUrl, and videoUrl are NOT valid indicators on their own.",
-  "IMPORTANT: For the current video workflow, newly generated reference images, storyboard frames, and generated videos are automatically synchronized into assetManifest. Manual '鍔犲叆绱犳潗搴? is still allowed, but not required for assets that were just generated inside the project workflow.",
-  "MANDATORY: NEVER infer or assume asset existence from memory, context, or project fields. Before any step that depends on assets, call HomeStudioWorkflow with action='query_asset_status' to get the real asset library status.",
-  "OVERRIDE: query_asset_status only applies when a step needs to consume assets that should already exist in the asset library, such as generate_video_assets, review, export, or explicit asset-library inspection. It does NOT apply to generate_video_reference_assets, generate_storyboard_frames, or generate_project_image.",
-  "If the library HAS the required assets: show the returned table to the user, then call AskUserQuestion to ask what to do next.",
-  "If the library is EMPTY or MISSING required assets: clearly tell the user which assets still need to be generated or synchronized first. Newly generated workflow assets will automatically appear in the library 鈥?call AskUserQuestion to guide this step.",
-  "NEVER advance to a downstream step when the asset library does not have the required assets.",
-  "MANDATORY: When the user explicitly asks to generate video and storyboard/material assets are ready, call HomeStudioWorkflow with action='generate_video_assets'. The tool will show '正在生成视频，请稍等…' in the chat, and completed video cards will display automatically in the assistant bubble; do not tell the user to leave the homepage or open another module.",
 ].join("\n");
 
 const MOBILE_NAV_SHEET =
@@ -849,6 +1197,7 @@ const ACTIVE =
   "继续补充目标、修改意见、素材条件或你想推进的下一步，整个生产都会在这一页完成。";
 const CUSTOM = "也可以跳过上方建议，直接输入你的自定义回答。";
 const TITLE = "InFinio-一站式智能体自动化平台";
+const HOME_RECENT_PROJECTS_LIMIT = 160;
 const SIDEBAR_BRAND = "InFinio";
 const DESKTOP_SIDEBAR_WIDTH = 272;
 const DESKTOP_SIDEBAR_COLLAPSED_WIDTH = 80;
@@ -857,16 +1206,31 @@ const DESKTOP_SIDEBAR_COLLAPSED_OFFSET = 108;
 const DESKTOP_SETTINGS_WIDTH = 456;
 const DESKTOP_SIDEBAR_COLLAPSE_KEY = "storyforge-home-agent-desktop-sidebar-collapsed-v1";
 const DESKTOP_SIDEBAR_WIDTH_KEY = "infinio-sidebar-width-v1";
+const VIDEO_PROJECT_SAVED_EVENT = "home-agent:video-project-saved";
 const DESKTOP_SIDEBAR_MIN_WIDTH = 200;
 const DESKTOP_SIDEBAR_MAX_WIDTH = 480;
 const ACTIVE_TRACK_CLASS = "max-w-[820px]";
 const IDLE_TRACK_CLASS = "max-w-[800px]";
 type RuntimeTask = Task;
-type DreaminaCapabilityState = {
-  ready: boolean;
-  available: boolean;
-  message?: string;
-};
+
+function isMessageTailSubset(
+  currentMessages: HomeAgentMessage[],
+  candidateMessages: HomeAgentMessage[],
+): boolean {
+  if (currentMessages.length === 0) return candidateMessages.length > 0;
+  if (candidateMessages.length < currentMessages.length) return false;
+  const offset = candidateMessages.length - currentMessages.length;
+  for (let index = 0; index < currentMessages.length; index += 1) {
+    const current = currentMessages[index];
+    const candidate = candidateMessages[offset + index];
+    if (!candidate) return false;
+    if (current.id && candidate.id && current.id !== candidate.id) return false;
+    if (current.role !== candidate.role) return false;
+    if (current.content !== candidate.content) return false;
+    if (current.createdAt !== candidate.createdAt) return false;
+  }
+  return true;
+}
 
 function scheduleBackgroundTask(task: () => void, timeout = 500): () => void {
   if (typeof window === "undefined") return () => {};
@@ -1012,6 +1376,7 @@ const mk = (
   artifactIds?: string[],
   attachments?: ChatAttachment[],
   artifactSnapshots?: import("@/lib/home-agent/types").ConversationArtifact[],
+  messageExtras?: Partial<Pick<HomeAgentMessage, "automationOrigin" | "workflowRefresh">>,
 ): HomeAgentMessage => ({
   id: crypto.randomUUID(),
   role,
@@ -1021,6 +1386,7 @@ const mk = (
   ...(artifactIds?.length ? { artifactIds } : {}),
   ...(artifactSnapshots?.length ? { artifactSnapshots } : {}),
   ...(attachments?.length ? { attachments } : {}),
+  ...messageExtras,
 });
 
 function formatMediaDetailLine(parts: Array<string | null | undefined>): string {
@@ -1231,6 +1597,157 @@ function resolveImageFailureReason(reason?: string): string {
   return "\u751f\u6210\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5";
 }
 
+function resolveVideoFailureReason(reason?: string): string {
+  if (!reason) return "\u89c6\u9891\u751f\u6210\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5";
+  const normalized = reason.trim();
+  if (!normalized) return "\u89c6\u9891\u751f\u6210\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5";
+  const lower = normalized.toLowerCase();
+  if (lower.includes("timeouterror") || lower.includes("timeout") || lower.includes("timed out")) {
+    return "\u89c6\u9891\u751f\u6210\u8d85\u65f6\uff0c\u8bf7\u91cd\u8bd5";
+  }
+  if (lower.includes("abort") || lower.includes("cancel")) {
+    return "\u89c6\u9891\u751f\u6210\u5df2\u53d6\u6d88";
+  }
+  return normalized.length > 220 ? `${normalized.slice(0, 217)}...` : normalized;
+}
+
+function buildMediaFailureCompletionContent(params: {
+  kind: "image" | "video";
+  label?: string;
+  failureReason?: string;
+}): string {
+  const subject = params.label?.trim() || (params.kind === "image" ? "\u56fe\u7247" : "\u89c6\u9891");
+  const detail = params.failureReason?.trim();
+  return detail ? `${subject} \u751f\u6210\u5931\u8d25\uff1a${detail}` : `${subject} \u751f\u6210\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5`;
+}
+
+export function finalizeMediaMessageIfSettled(
+  message: HomeAgentMessage,
+  kind: ChatAttachment["kind"],
+  nextAttachments: ChatAttachment[],
+  completionContent?: string,
+): HomeAgentMessage {
+  const nextMessage: HomeAgentMessage = {
+    ...message,
+    attachments: nextAttachments,
+  };
+  const hasPendingAttachments = nextAttachments.some((attachment) => attachment.kind === kind && attachment.pending);
+  if (hasPendingAttachments) {
+    return nextMessage;
+  }
+  return {
+    ...nextMessage,
+    status: "complete",
+    streamLabel: undefined,
+    ...(completionContent ? { content: completionContent } : {}),
+  };
+}
+
+export function markFailedMediaAttachmentsInMessage(
+  message: HomeAgentMessage,
+  params: {
+    kind: "image" | "video";
+    failureReason: string;
+    index?: number;
+    label?: string;
+    settleAll?: boolean;
+    completionContent?: string;
+    attachmentOverrides?: Partial<ChatAttachment>;
+  },
+): HomeAgentMessage {
+  if (!message.attachments?.length) return message;
+  const mediaAttachments = message.attachments.filter((attachment) => attachment.kind === params.kind);
+  const targetIds = params.settleAll
+    ? new Set(
+        mediaAttachments
+          .filter((attachment) => attachment.pending)
+          .map((attachment) => attachment.id),
+      )
+    : (() => {
+        const targetAttachment =
+          typeof params.index === "number"
+            ? mediaAttachments[params.index]
+            : mediaAttachments.find((attachment) => attachment.pending);
+        return targetAttachment ? new Set([targetAttachment.id]) : new Set<string>();
+      })();
+  if (!targetIds.size) return message;
+
+  const nextAttachments = message.attachments.map((attachment) =>
+    targetIds.has(attachment.id)
+      ? {
+          ...attachment,
+          ...params.attachmentOverrides,
+          pending: false,
+          cancelled: false,
+          failed: true,
+          failureReason: params.failureReason,
+          label: params.label || attachment.label,
+        }
+      : attachment,
+  );
+  return finalizeMediaMessageIfSettled(
+    message,
+    params.kind,
+    nextAttachments,
+    params.completionContent,
+  );
+}
+
+async function buildGeneratedVideoAttachmentFromEvent(detail: {
+  url: string;
+  label?: string;
+  sceneId?: string;
+  projectId?: string;
+  segmentLabel?: string;
+  fallbackProjectId?: string | null;
+}): Promise<ChatAttachment> {
+  const currentProjectId = detail.projectId ?? detail.fallbackProjectId ?? undefined;
+  const rawFileName =
+    detail.url.split(/[\\/]/).pop()?.split("?")[0] || buildGeneratedMediaFallbackName("video", 1, 0);
+  let urlFileName = rawFileName;
+  try {
+    urlFileName = decodeURIComponent(rawFileName);
+  } catch {
+    urlFileName = rawFileName;
+  }
+  const contentStem = detail.label ? detail.label.replace(/\s*·\s*版本\d+$/, "") : urlFileName.replace(/\.[^.]+$/, "");
+  const fileName = contentStem ? `${contentStem}.mp4` : urlFileName;
+  const cachedVideo = currentProjectId
+    ? await cacheProjectVideoSource(detail.url, fileName, currentProjectId)
+    : null;
+  const fallbackVideo = resolveVideoAttachmentSource(detail.url);
+
+  return {
+    id: crypto.randomUUID(),
+    fileName,
+    label: contentStem || undefined,
+    mimeType: cachedVideo?.mimeType ?? "video/mp4",
+    size: cachedVideo?.size ?? 0,
+    kind: "video",
+    localPath: cachedVideo?.localPath ?? fallbackVideo.localPath,
+    previewUrl: cachedVideo?.previewUrl ?? fallbackVideo.previewUrl,
+    ...(detail.segmentLabel && currentProjectId
+      ? {
+          generationContext: {
+            action: "generate_segment_video" as const,
+            projectId: currentProjectId,
+            targetId: detail.segmentLabel,
+            regenerateMode: "redo-and-generate" as const,
+          },
+        }
+      : detail.sceneId && currentProjectId
+        ? {
+            generationContext: {
+              action: "generate_video_assets" as const,
+              projectId: currentProjectId,
+              targetId: detail.sceneId,
+              regenerateMode: "redo-and-generate" as const,
+            },
+          }
+        : {}),
+  };
+}
+
 function buildImageMediaMessageV2(detail: {
   count?: number;
   action?: string;
@@ -1299,19 +1816,21 @@ function buildImageMediaMessageV2(detail: {
   };
 }
 
-function buildVideoMediaMessageV2(detail: {
+export function buildVideoMediaMessageV2(detail: {
   count?: number;
   model?: string;
   resolution?: string;
+  aspectRatio?: string;
   provider?: string;
   mode?: string;
   contentSummary?: string;
   videoLabels?: string[];
+  routeHint?: string;
 }) {
   const count = Math.max(1, detail.count ?? 1);
   const isMultiple = count > 1;
   const modeLabel = localizeMediaSettingValue(detail.mode, "mode") || "\u89c6\u9891\u751f\u6210";
-  const detailLine =
+  const defaultDetailLine =
     isMultiple && detail.videoLabels?.length
       ? detail.videoLabels.length <= 3
         ? formatMediaDetailLine([`${count} \u6761\u89c6\u9891`, ...detail.videoLabels])
@@ -1320,8 +1839,13 @@ function buildVideoMediaMessageV2(detail: {
           `${count} \u6761\u89c6\u9891`,
           detail.contentSummary ? `\u5185\u5bb9 ${detail.contentSummary}` : "",
           `\u6a21\u5f0f ${modeLabel}`,
+          detail.resolution ? `\u5206\u8fa8\u7387 ${localizeMediaSettingValue(detail.resolution, "resolution")}` : "",
+          detail.aspectRatio ? `\u6bd4\u4f8b ${detail.aspectRatio}` : "",
+          detail.model ? `\u6a21\u578b ${detail.model}` : "",
           detail.provider ? `\u901a\u9053 ${localizeMediaSettingValue(detail.provider, "provider")}` : "",
         ]);
+  const routeHint = String(detail.routeHint || "").trim();
+  const startDetailLine = routeHint || defaultDetailLine;
 
   // \u590d\u6570\u65f6\u6807\u9898\u4e0d\u8ffd\u52a0\u8d44\u4ea7\u540d\u79f0\uff0c\u5355\u6761\u65f6\u663e\u793a
   const headingContentSummary = isMultiple ? undefined : detail.contentSummary;
@@ -1333,7 +1857,7 @@ function buildVideoMediaMessageV2(detail: {
         fallbackLabel: "\u89c6\u9891",
         contentSummary: headingContentSummary,
       }),
-      detailLine,
+      startDetailLine,
     ]
       .filter(Boolean)
       .join("\n"),
@@ -1343,7 +1867,7 @@ function buildVideoMediaMessageV2(detail: {
         fallbackLabel: "\u89c6\u9891",
         contentSummary: headingContentSummary,
       }),
-      detailLine,
+      defaultDetailLine,
     ]
       .filter(Boolean)
       .join("\n"),
@@ -1388,12 +1912,50 @@ function buildCompletedMediaAttachmentSignature(
   attachment: Pick<ChatAttachment, "kind" | "pending" | "cancelled" | "localPath" | "previewUrl" | "fileName">,
 ): string | null {
   if (attachment.pending || attachment.cancelled) return null;
+  const primarySource =
+    String(attachment.localPath || "").trim() ||
+    String(attachment.previewUrl || "").trim();
   return JSON.stringify([
     attachment.kind,
-    attachment.localPath || "",
-    attachment.previewUrl || "",
-    attachment.fileName || "",
+    primarySource,
+    primarySource ? "" : String(attachment.fileName || "").trim(),
   ]);
+}
+
+function buildRecentlyProcessedVideoMarker(url: string, mediaEventId?: string): string {
+  return mediaEventId ? `${mediaEventId}::${url}` : url;
+}
+
+function wasVideoRecentlyProcessed(
+  processed: ReadonlySet<string>,
+  url: string,
+  mediaEventId?: string,
+): boolean {
+  const normalizedUrl = String(url || "").trim();
+  if (!normalizedUrl) return false;
+  if (mediaEventId) {
+    return processed.has(buildRecentlyProcessedVideoMarker(normalizedUrl, mediaEventId));
+  }
+  return processed.has(normalizedUrl);
+}
+
+function markVideoAsRecentlyProcessed(
+  processed: Set<string>,
+  url: string,
+  mediaEventId?: string,
+): void {
+  const normalizedUrl = String(url || "").trim();
+  if (!normalizedUrl) return;
+
+  const markers = new Set<string>([normalizedUrl]);
+  if (mediaEventId) {
+    markers.add(buildRecentlyProcessedVideoMarker(normalizedUrl, mediaEventId));
+  }
+
+  markers.forEach((marker) => processed.add(marker));
+  setTimeout(() => {
+    markers.forEach((marker) => processed.delete(marker));
+  }, 30_000);
 }
 
 function hasMatchingCompletedMediaMessage(
@@ -1421,6 +1983,120 @@ function hasMatchingCompletedMediaMessage(
   });
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
+export function findPendingMediaMessageIndex(
+  messages: HomeAgentMessage[],
+  kind: ChatAttachment["kind"],
+  mediaEventId?: string,
+): number {
+  if (mediaEventId) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (
+        message?.role === "assistant" &&
+        message.status === "pending" &&
+        message.mediaEventId === mediaEventId &&
+        message.attachments?.some((attachment) => attachment.kind === kind)
+      ) {
+        return index;
+      }
+    }
+  }
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (
+      message?.role === "assistant" &&
+      message.status === "pending" &&
+      message.attachments?.some((attachment) => attachment.kind === kind)
+    ) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function isSettledVideoAttachment(attachment: ChatAttachment): boolean {
+  return attachment.kind === "video" && !attachment.pending && !attachment.cancelled;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function mergeCompletedVideoAttachments(
+  currentAttachments: ChatAttachment[] | undefined,
+  incomingAttachments: ChatAttachment[],
+): ChatAttachment[] {
+  const settledVideos = (currentAttachments ?? []).filter(isSettledVideoAttachment);
+  if (!settledVideos.length) return incomingAttachments;
+
+  const existingBySignature = new Map<string, ChatAttachment>();
+  for (const attachment of settledVideos) {
+    const signature = buildCompletedMediaAttachmentSignature(attachment);
+    if (!signature || existingBySignature.has(signature)) continue;
+    existingBySignature.set(signature, attachment);
+  }
+
+  const incomingSignatures = new Set<string>();
+  const merged = incomingAttachments.map((attachment) => {
+    const signature = buildCompletedMediaAttachmentSignature(attachment);
+    if (!signature) return attachment;
+    incomingSignatures.add(signature);
+    return existingBySignature.get(signature) ?? attachment;
+  });
+
+  for (const attachment of settledVideos) {
+    const signature = buildCompletedMediaAttachmentSignature(attachment);
+    if (!signature || incomingSignatures.has(signature)) continue;
+    merged.push(attachment);
+  }
+
+  return merged;
+}
+
+function mergeCompletedImageAttachments(
+  existingAttachments: ChatAttachment[] | undefined,
+  finalAttachments: ChatAttachment[],
+): ChatAttachment[] {
+  if (!existingAttachments?.length) return finalAttachments;
+  if (!finalAttachments.length) return existingAttachments;
+
+  const merged = [...existingAttachments];
+
+  for (const finalAttachment of finalAttachments) {
+    let targetIndex = merged.findIndex(
+      (attachment) =>
+        attachment.kind === "image" &&
+        ((attachment.localPath && finalAttachment.localPath && attachment.localPath === finalAttachment.localPath) ||
+          (attachment.label && finalAttachment.label && attachment.label === finalAttachment.label)),
+    );
+
+    if (targetIndex === -1) {
+      targetIndex = merged.findIndex(
+        (attachment) =>
+          attachment.kind === "image" &&
+          (attachment.pending || attachment.failed || attachment.cancelled) &&
+          (!finalAttachment.label || !attachment.label || attachment.label === finalAttachment.label),
+      );
+    }
+
+    if (targetIndex === -1) {
+      targetIndex = merged.findIndex(
+        (attachment) =>
+          attachment.kind === "image" && (attachment.pending || attachment.failed || attachment.cancelled),
+      );
+    }
+
+    if (targetIndex === -1) {
+      merged.push(finalAttachment);
+      continue;
+    }
+
+    merged[targetIndex] = finalAttachment;
+  }
+
+  return merged;
+}
+
 function buildPendingMediaStreamLabel(params: {
   fallbackLabel: string;
   contentSummary?: string;
@@ -1430,6 +2106,9 @@ function buildPendingMediaStreamLabel(params: {
 }
 
 export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Props) {
+  const isMobile = useIsMobile();
+  const shouldUseMobileLayout =
+    isMobile || (typeof window !== "undefined" && window.innerWidth < 768);
   const seedRef = useRef<{
     session: StudioSessionState | null;
     runtime: StudioRuntimeState;
@@ -1458,7 +2137,27 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   const [automationMode, setAutomationMode] = useState<AutomationMode>(() =>
     normalizeAutomationMode(session?.automationMode ?? session?.currentProjectSnapshot?.automationMode ?? readStoredAutomationMode()),
   );
+  const [historyAutomationMode, setHistoryAutomationMode] = useState<AutomationMode>(() => readStoredAutomationMode());
+  const [homepageIsolationRequestEpoch, setHomepageIsolationRequestEpoch] = useState(0);
   const [devMode, setDevMode] = useState<boolean>(session?.devMode ?? readStoredDevMode());
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const warmHomeAgentChunks = () => {
+      void import("./home-agent-sidebar");
+      void import("./AssistantCreationGuideBody");
+    };
+
+    if (typeof window.requestIdleCallback === "function") {
+      const idleId = window.requestIdleCallback(warmHomeAgentChunks, { timeout: 1_500 });
+      return () => window.cancelIdleCallback?.(idleId);
+    }
+
+    const timeoutId = window.setTimeout(warmHomeAgentChunks, 300);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
+
   const [mode, setMode] = useState<AgentConversationMode>(
     session?.mode === "recovering" || session?.mode === "maintenance-review"
       ? session.mode
@@ -1473,9 +2172,21 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     session?.deferredQuestionState ?? null,
   );
   const [suggested, setSuggested] = useState<ComposerQuestion | null>(null);
+  const [
+    pendingWorkflowPopoverAfterAssistantReply,
+    setPendingWorkflowPopoverAfterAssistantReply,
+  ] = useState<PendingWorkflowPopoverAfterAssistantReply | null>(null);
+  const [
+    pendingDeferredQuestionRestoreAfterAssistantReply,
+    setPendingDeferredQuestionRestoreAfterAssistantReply,
+  ] = useState<PendingDeferredQuestionRestoreAfterAssistantReply | null>(null);
   const lastSuggestedRef = useRef<ComposerQuestion | null>(null);
+  const [pendingWorkflowUploadKind, setPendingWorkflowUploadKind] = useState<PendingWorkflowUploadKind | null>(
+    () => resolvePendingWorkflowUploadKind(session),
+  );
   const [popoverOverride, setPopoverOverride] = useState<ComposerQuestion | null>(() => {
-    const stored = session?.pendingChoiceQuestion ?? null;
+    if (resolvePendingWorkflowUploadKind(session)) return null;
+    const stored = session?.pendingChoiceQuestion ?? session?.interruptedChoiceQuestion ?? null;
     if (!stored || stored.answerKey !== "video-bridge-panel") return stored;
     const currentMode =
       seedRef.current?.runtime.currentVideoProject?.videoGenerationPrefs?.mode ??
@@ -1484,6 +2195,9 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     const compatible = currentMode === "text-to-video" ? isT2V : !isT2V;
     return compatible ? stored : null;
   });
+  const [interruptedChoiceQuestion, setInterruptedChoiceQuestion] = useState<ComposerQuestion | null>(
+    resolvePendingWorkflowUploadKind(session) ? null : (session?.interruptedChoiceQuestion ?? null),
+  );
   const [selectedValues, setSelectedValues] = useState<string[]>(session?.selectedValues ?? []);
   const [deferredSelectedValues, setDeferredSelectedValues] = useState<string[]>(
     session?.deferredSelectedValues ?? [],
@@ -1493,6 +2207,9 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   const [draftPresence, setDraftPresence] = useState(Boolean(session?.draft?.trim()));
   const [persistedDraft, setPersistedDraft] = useState(session?.draft ?? "");
   const [deferredDraft, setDeferredDraft] = useState(session?.deferredDraft ?? "");
+  const [fullAutoChecklistCollapsed, setFullAutoChecklistCollapsed] = useState(
+    session?.fullAutoChecklistCollapsed ?? true,
+  );
   const [recentProjectsReady, setRecentProjectsReady] = useState(false);
   const [isRefreshingProjects, setIsRefreshingProjects] = useState(false);
   const [metaReady, setMetaReady] = useState(false);
@@ -1523,7 +2240,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     session?.projectId ?? session?.currentProjectSnapshot?.projectId,
   );
   const [compactedMessageCount, setCompactedMessageCount] = useState(session?.compactedMessageCount ?? 0);
-  const [maintenanceHint, setMaintenanceHint] = useState<string | null>(null);
+  const [maintenanceHints, setMaintenanceHints] = useState<HomeAgentMaintenanceHintNotice[]>([]);
   const [sidebarAssetFocus, setSidebarAssetFocus] = useState<{ assetId: string; message: string } | null>(null);
   const [renameTarget, setRenameTarget] = useState<{ projectId: string; title: string } | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
@@ -1552,12 +2269,9 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       session?.selectedVideoModelKey ?? initialVideoGenerationPrefs.modelKey,
     ),
   );
-  const [dreaminaCapability, setDreaminaCapability] = useState<DreaminaCapabilityState>({
-    ready: false,
-    available: false,
-  });
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [awaitingVideoKickoffStyleReferenceUpload, setAwaitingVideoKickoffStyleReferenceUpload] = useState(false);
+  const [awaitingCharacterAudioReferenceUpload, setAwaitingCharacterAudioReferenceUpload] = useState(false);
 
   useEffect(() => {
     writeStoredCreationMode(creationMode);
@@ -1569,7 +2283,10 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   useEffect(() => {
     if (runtime.currentProjectSnapshot?.projectKind === "video") return;
     pendingVideoKickoffStyleReferenceUploadRef.current = null;
+    pendingCharacterAudioReferenceUploadRef.current = null;
+    characterAudioPresetPickerRef.current = null;
     setAwaitingVideoKickoffStyleReferenceUpload(false);
+    setAwaitingCharacterAudioReferenceUpload(false);
   }, [runtime.currentProjectSnapshot?.projectId, runtime.currentProjectSnapshot?.projectKind]);
 
   // 鍚屾 activeProjectId 鍒?localStorage锛屼緵 uploadImageToStorage 绛夊伐鍏峰嚱鏁拌鍙?
@@ -1581,6 +2298,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
 
   const runtimeRef = useRef(runtime);
   const messagesRef = useRef(messages);
+  const inlineAttachmentGuardAbortControllersRef = useRef<Map<string, AbortController>>(new Map());
   const compactedMessageCountRef = useRef(compactedMessageCount);
   const draftRef = useRef(session?.draft ?? "");
   const draftPersistTimerRef = useRef<number | null>(null);
@@ -1600,20 +2318,110 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   const dismissedProjectSuggestionKeysRef = useRef<Set<string>>(new Set());
   const dismissedDeferredQuestionStepRef = useRef<string | null>(null);
   const pendingVideoKickoffStyleReferenceUploadRef = useRef<{ label: string } | null>(null);
+  const pendingCharacterAudioReferenceUploadRef = useRef<PendingCharacterAudioUploadRequest | null>(
+    null,
+  );
+  const characterAudioPresetPickerRef = useRef<CharacterAudioPresetPickerRequest | null>(null);
+  const preferredVideoWorkflowSourceSnapshotRef = useRef<ConversationProjectSnapshot | null>(
+    isBridgeableVideoWorkflowSourceSnapshot(runtime.currentProjectSnapshot)
+      ? runtime.currentProjectSnapshot
+      : null,
+  );
   // 璁板綍鐢ㄦ埛涓诲姩鏀惧純鐨勯」鐩?ID锛岄槻姝㈠叾鍚庡彴 delta 浜嬩欢姹℃煋鏂伴」鐩潰鏉?
   const staleProjectIdsRef = useRef<Set<string>>(new Set());
+  const filterRecentlyDeletedProjectSnapshots = useCallback(
+    (items: ConversationProjectSnapshot[]) =>
+      items.filter((item) => {
+        const projectId = item.projectId?.trim();
+        if (!projectId) return false;
+        if (staleProjectIdsRef.current.has(projectId)) return false;
+        if (hasSessionResetMarkerForProject(projectId)) return false;
+        return true;
+      }),
+    [],
+  );
   // 防止 workflow shortcut 和后台轮询同时 dispatch agent:video-generated 导致重复消息
   const recentlyProcessedVideoUrlsRef = useRef<Set<string>>(new Set());
-  const surfacedDreaminaHintRef = useRef(false);
-  const maintenanceHintTimerRef = useRef<number | null>(null);
+  const pendingHomepageIsolationModeRef = useRef<AutomationMode | null>(null);
+  const previousHistoryAutomationModeRef = useRef(historyAutomationMode);
+  const hasSkippedInitialRecentProjectRefreshRef = useRef(false);
+  const lastIsolationHistoryRefreshKeyRef = useRef<string | null>(null);
+  const rememberedProjectIdsByModeRef = useRef(
+    createAutomationModeProjectMemory(session?.currentProjectSnapshot ?? null),
+  );
+  const maintenanceHintTimerRef = useRef<Map<string, number>>(new Map());
+  const lastVideoGenerationModeNoticeKeyRef = useRef<string | null>(null);
   const compactionJobVersionRef = useRef(0);
+  const projectHydrationInFlightRef = useRef<string | null>(null);
+  const segmentContinuityBackfillSeenRef = useRef<Set<string>>(new Set());
+  const segmentContinuityBackfillInFlightRef = useRef<Set<string>>(new Set());
+  const previousComposerProjectIdRef = useRef(activeProjectId);
+  const hasObservedComposerProjectSelectionRef = useRef(false);
   const selectedTextModelKeyRef = useRef(selectedTextModelKey);
   // 鍒囨崲椤圭洰鍓嶅悓姝?flush 褰撳墠浼氳瘽锛岄槻姝㈤槻鎶栦繚瀛樿鍙栨秷瀵艰嚧鐘舵€佷涪澶?
   const flushSessionRef = useRef<() => void>(() => {});
   const previousQuestionStepRef = useRef<string | null>(
     session?.qState ? `${session.qState.request.id}:${session.qState.currentIndex}` : null,
   );
-  const interruptRestoreQuestionRef = useRef<ComposerQuestion | null>(null);
+  const handleRequestOlderHistory = useCallback(async (): Promise<boolean> => {
+    const projectId = activeProjectId ?? runtimeRef.current.currentProjectSnapshot?.projectId;
+    if (!projectId) return false;
+
+    const persistedSession =
+      (await readProjectSessionFromFile(projectId)) ??
+      readStudioProjectSession(projectId);
+    if (!persistedSession?.messages?.length) return false;
+
+    const currentMessages = messagesRef.current;
+    if (persistedSession.messages.length <= currentMessages.length) return false;
+    if (!isMessageTailSubset(currentMessages, persistedSession.messages)) return false;
+
+    startTransition(() => {
+      setMessages(persistedSession.messages);
+      setCompactedMessageCount((previous) =>
+        Math.max(previous, persistedSession.compactedMessageCount ?? previous),
+      );
+      setRuntime((prev) => ({
+        ...prev,
+        recentMessageSummary: persistedSession.recentMessageSummary ?? prev.recentMessageSummary,
+        recentProjectSessions: upsertRecentProjectSession(prev.recentProjectSessions, persistedSession),
+      }));
+    });
+    return true;
+  }, [activeProjectId, setRuntime]);
+  const interruptRestoreQuestionRef = useRef<ComposerQuestion | null>(session?.interruptedChoiceQuestion ?? null);
+  const workflowRefreshShortcutRunnerRef = useRef<
+    | ((
+        action: string,
+        input: Record<string, unknown>,
+        label: string,
+        options?: {
+          restoreQuestionOnInterrupt?: ComposerQuestion | null;
+          restoreQuestionOnCancel?: ComposerQuestion | null;
+          restoreQuestionOnError?: ComposerQuestion | null;
+          restoreQuestionAfterRun?: ComposerQuestion | null;
+          skipUserBubble?: boolean;
+        },
+      ) => void)
+    | null
+  >(null);
+  const workflowRefreshShortcutChainRunnerRef = useRef<
+    | ((
+        steps: Array<{ action: string; input: Record<string, unknown> }>,
+        label: string,
+        options?: {
+          restoreQuestionOnInterrupt?: ComposerQuestion | null;
+          restoreQuestionOnError?: ComposerQuestion | null;
+          restoreQuestionAfterRun?: ComposerQuestion | null;
+          skipUserBubble?: boolean;
+        },
+      ) => void)
+    | null
+  >(null);
+  useEffect(() => {
+    if (!isBridgeableVideoWorkflowSourceSnapshot(runtime.currentProjectSnapshot)) return;
+    preferredVideoWorkflowSourceSnapshotRef.current = runtime.currentProjectSnapshot;
+  }, [runtime.currentProjectSnapshot]);
   if (surfacedTaskIdsRef.current.size === 0 && session?.surfacedTaskIds?.length) {
     surfacedTaskIdsRef.current = new Set(session.surfacedTaskIds);
   }
@@ -1629,6 +2437,30 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   useEffect(() => {
     dismissedProjectSuggestionKeysRef.current.clear();
     dismissedDeferredQuestionStepRef.current = null;
+    setPendingDeferredQuestionRestoreAfterAssistantReply(null);
+  }, [activeProjectId]);
+  useEffect(() => {
+    if (!runtime.currentProjectSnapshot?.projectId) return;
+    rememberedProjectIdsByModeRef.current = rememberProjectForAutomationMode(
+      rememberedProjectIdsByModeRef.current,
+      runtime.currentProjectSnapshot,
+    );
+  }, [runtime.currentProjectSnapshot]);
+  useEffect(() => {
+    const previousProjectId = previousComposerProjectIdRef.current;
+    if (
+      didSessionScopedProjectSwitch(
+        hasObservedComposerProjectSelectionRef.current,
+        previousProjectId,
+        activeProjectId,
+      )
+    ) {
+      setAttachedFiles([]);
+      pendingVideoKickoffStyleReferenceUploadRef.current = null;
+      setAwaitingVideoKickoffStyleReferenceUpload(false);
+    }
+    previousComposerProjectIdRef.current = activeProjectId;
+    hasObservedComposerProjectSelectionRef.current = true;
   }, [activeProjectId]);
   const {
     loadEngineDeps,
@@ -1638,20 +2470,35 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     loadStructuredQuestionParser,
     loadWorkflowActionsModule,
     loadSemanticSummaryModule,
-    loadConversationMemoryModule,
-    loadDreaminaCliModule,
-  } = useHomeAgentModuleLoaders();
+    loadConversationMemoryModule,  } = useHomeAgentModuleLoaders();
 
   const { currentProject, question } = useHomeAgentQuestionView({
     runtime,
     qState,
     popoverOverride,
+    interruptedChoiceQuestion:
+      activeWorkflowAction || streaming ? null : interruptedChoiceQuestion,
     suggested,
     selectedValues,
     dismissedProjectSuggestionKeys: dismissedProjectSuggestionKeysRef.current,
     dismissedQuestionStepKey: dismissedDeferredQuestionStepRef.current,
     devMode,
   });
+  useEffect(() => {
+    interruptRestoreQuestionRef.current = interruptedChoiceQuestion;
+  }, [interruptedChoiceQuestion]);
+
+  useEffect(() => {
+    if (!question || !interruptedChoiceQuestion) return;
+    if (question.id === interruptedChoiceQuestion.id) return;
+    setInterruptedChoiceQuestion(null);
+  }, [interruptedChoiceQuestion, question]);
+  const maintenanceHint = maintenanceHints.length ? maintenanceHints[maintenanceHints.length - 1]?.message ?? null : null;
+  const persistedVisibleChoiceQuestion =
+    pendingWorkflowUploadKind || qState || deferredQuestionState
+      ? null
+      : (question ?? popoverOverride ?? suggested ?? interruptedChoiceQuestion ?? null);
+
   const {
     idle,
     activeTheme,
@@ -1664,6 +2511,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     desktopSidebarOffset,
     recentSessionSummary,
     flashMaintenanceHint,
+    dismissMaintenanceHint,
     syncComposerDraft,
     resetComposerDraft,
     composerShellClass,
@@ -1684,7 +2532,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     maintenanceHintTimerRef,
     draftPersistTimerRef,
     draftRef,
-    setMaintenanceHint,
+    setMaintenanceHints,
     setDraftPresence,
     setPersistedDraft,
     setDraftInitialValue,
@@ -1697,6 +2545,31 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     desktopSidebarOffsetExpanded: sidebarWidth + (DESKTOP_SIDEBAR_OFFSET - DESKTOP_SIDEBAR_WIDTH),
     desktopSidebarOffsetCollapsed: DESKTOP_SIDEBAR_COLLAPSED_OFFSET,
   });
+
+  useEffect(() => {
+    const notice = runtime.currentVideoProject?.videoGenerationModeNotice;
+    if (!notice?.message) return;
+    const noticeKey = [
+      runtime.currentVideoProject?.id ?? "",
+      notice.activeMode,
+      notice.updatedAt,
+      notice.message,
+    ].join(":");
+    if (lastVideoGenerationModeNoticeKeyRef.current === noticeKey) return;
+    lastVideoGenerationModeNoticeKeyRef.current = noticeKey;
+    flashMaintenanceHint(notice.message, 9000);
+  }, [
+    flashMaintenanceHint,
+    runtime.currentVideoProject?.id,
+    runtime.currentVideoProject?.videoGenerationModeNotice?.activeMode,
+    runtime.currentVideoProject?.videoGenerationModeNotice?.message,
+    runtime.currentVideoProject?.videoGenerationModeNotice?.updatedAt,
+  ]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.dispatchEvent(new CustomEvent(HOME_AGENT_DESKTOP_LAYOUT_INVALIDATE_EVENT));
+  }, [desktopSidebarOffset]);
 
   const lastMessageForScroll = messages[messages.length - 1];
   const lastMessageHasMedia = Boolean(
@@ -1713,21 +2586,80 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         ].join(":"),
       )
       .join("|") ?? "";
-  const { hasUnreadMessage } = useSmartScroll({
+  const preferPhysicalBottomWhileStreaming =
+    Boolean(streaming) && lastMessageForScroll?.role === "assistant";
+  const { hasUnreadMessage, scrollToPhysicalBottom } = useSmartScroll({
     containerRef: scrollContainerRef,
     endRef,
     active: !idle,
     forceBottomDependency:
       lastMessageForScroll?.role === "user" ||
-      (lastMessageForScroll?.role === "assistant" && lastMessageHasMedia)
+      (lastMessageForScroll?.role === "assistant" && lastMessageHasMedia) ||
+      qState?.source === "restored"
         ? `${lastMessageForScroll.id}:${lastMessageForScroll.content.length}:${lastAttachmentScrollKey}`
         : null,
     followTargetSelector: "[data-home-agent-message-row]",
     followTargetOffsetRatio: 0.36,
     resetKey: activeProjectId ?? runtime.currentProjectSnapshot?.projectId ?? null,
     showUnreadOnBlocked: lastMessageForScroll?.role === "assistant",
+    preferPhysicalBottomWhenLocked: preferPhysicalBottomWhileStreaming,
     dependency: `${messages.length}:${lastMessageForScroll?.id ?? ""}:${lastMessageForScroll?.content.length ?? 0}:${lastAttachmentScrollKey}:${streaming ? "streaming" : "idle"}`,
   });
+  const previousStreamingForScrollRef = useRef(streaming);
+  useEffect(() => {
+    const wasStreaming = previousStreamingForScrollRef.current;
+    previousStreamingForScrollRef.current = streaming;
+    if (!wasStreaming || streaming) return;
+    if (lastMessageForScroll?.role !== "assistant") return;
+
+    const snapToBottom = () => {
+      scrollToPhysicalBottom(true);
+    };
+
+    snapToBottom();
+    const rafId = window.requestAnimationFrame(snapToBottom);
+    const timeoutId = window.setTimeout(snapToBottom, 80);
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      window.clearTimeout(timeoutId);
+    };
+  }, [lastMessageForScroll?.id, lastMessageForScroll?.role, scrollToPhysicalBottom, streaming]);
+  const requestScrollToBottomAfterQuickLaunch = useCallback(() => {
+    if (typeof window === "undefined") return;
+    const requestPhysicalBottom = () => {
+      scrollToPhysicalBottom(true);
+    };
+    requestPhysicalBottom();
+    window.requestAnimationFrame(() => {
+      requestPhysicalBottom();
+      window.requestAnimationFrame(() => {
+        requestPhysicalBottom();
+      });
+    });
+    window.setTimeout(requestPhysicalBottom, 80);
+    window.setTimeout(requestPhysicalBottom, 220);
+  }, [scrollToPhysicalBottom]);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (qState?.source !== "restored") return;
+
+    const forcePhysicalBottom = () => {
+      const element = scrollContainerRef.current;
+      if (!element) return;
+      element.scrollTop = element.scrollHeight;
+      scrollToPhysicalBottom(true);
+    };
+
+    forcePhysicalBottom();
+    const rafId = window.requestAnimationFrame(() => {
+      forcePhysicalBottom();
+    });
+    const timeoutIds = [80, 220].map((delay) => window.setTimeout(forcePhysicalBottom, delay));
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      timeoutIds.forEach((id) => window.clearTimeout(id));
+    };
+  }, [qState?.request.id, qState?.source, scrollToPhysicalBottom]);
   useEffect(() => {
     if (!sidebarAssetFocus) return;
     const timer = window.setTimeout(() => {
@@ -1763,12 +2695,23 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
             description: "一次确认参数后自动推进原创剧本到视频导出。",
           };
         }
-        return {
-          ...template,
-          badge: "待定",
-          disabled: true,
-          description: "全自动入口待开放，第一版先支持原创剧本。",
-        };
+        if (template.id === "adaptation") {
+          return {
+            ...template,
+            badge: "全自动",
+            disabled: false,
+            description: "上传或粘贴参考文本后，自动完成改编、视频生成和导出。",
+          };
+        }
+        if (template.id === "video") {
+          return {
+            ...template,
+            badge: "全自动",
+            disabled: false,
+            description: "接入当前剧本或上传正文后，自动完成拆解、分镜、生成和导出。",
+          };
+        }
+        return template;
       }),
     [automationMode],
   );
@@ -1814,6 +2757,176 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     runtimeRef.current = runtime;
   }, [runtime]);
 
+  const refreshSegmentContinuityArtifactsInProject = useCallback(
+    async (params: {
+      project: ActiveVideoProject;
+      segmentLabel: string;
+      videoUrl?: string;
+      progressPreset?: "default" | "history-backfill";
+    }) => {
+      const { refreshSegmentContinuityArtifactsFromSegmentVideoSource } = await loadVideoWorkflowService();
+      return synchronizeVideoProductionState(
+        await refreshSegmentContinuityArtifactsFromSegmentVideoSource({
+          project: params.project,
+          segmentLabel: params.segmentLabel,
+          videoUrl: params.videoUrl,
+          progressPreset: params.progressPreset,
+        }),
+      );
+    },
+    [],
+  );
+
+  const refreshAndPersistSegmentContinuityArtifacts = useCallback(
+    async (params: {
+      project: ActiveVideoProject;
+      segmentLabel: string;
+      videoUrl?: string;
+      progressPreset?: "default" | "history-backfill";
+    }) => {
+      const refreshedProject = await refreshSegmentContinuityArtifactsInProject({
+        project: params.project,
+        segmentLabel: params.segmentLabel,
+        videoUrl: params.videoUrl,
+        progressPreset: params.progressPreset,
+      });
+      const savedProject = await upsertStoredVideoProject(refreshedProject);
+
+      startTransition(() => {
+        setRuntime((prev) => {
+          if (prev.currentVideoProject?.id !== savedProject.id) return prev;
+          return {
+            ...prev,
+            currentVideoProject: savedProject,
+            currentProjectSnapshot:
+              prev.currentProjectSnapshot?.projectId === savedProject.id
+                ? {
+                    ...prev.currentProjectSnapshot,
+                    memory: {
+                      ...prev.currentProjectSnapshot.memory,
+                      assetManifest: savedProject.assetManifest,
+                    },
+                  }
+                : prev.currentProjectSnapshot,
+          };
+        });
+      });
+
+      return savedProject;
+    },
+    [refreshSegmentContinuityArtifactsInProject, setRuntime],
+  );
+
+  useEffect(() => {
+    const snapshot = runtime.currentProjectSnapshot;
+    const project = runtime.currentVideoProject;
+    if (!snapshot || !project || snapshot.projectId !== project.id) return;
+
+    const candidate = Object.keys(project.segmentVideos ?? {})
+      .map((segmentLabel) => {
+        const localVideoUrl = resolveLocalSegmentContinuityBackfillVideoUrl(project, segmentLabel);
+        const hasContinuityGrid = hasSegmentContinuityGridForProject(project, segmentLabel);
+        const key = `${project.id}:${segmentLabel}:${localVideoUrl || ""}`;
+        return {
+          segmentLabel,
+          localVideoUrl,
+          hasContinuityGrid,
+          key,
+        };
+      })
+      .find(({ localVideoUrl, hasContinuityGrid, key }) =>
+        Boolean(localVideoUrl) &&
+        !hasContinuityGrid &&
+        !segmentContinuityBackfillSeenRef.current.has(key) &&
+        !segmentContinuityBackfillInFlightRef.current.has(key),
+      );
+
+    if (!candidate?.localVideoUrl) return;
+
+    let cancelled = false;
+    segmentContinuityBackfillInFlightRef.current.add(candidate.key);
+    void (async () => {
+      try {
+        await refreshAndPersistSegmentContinuityArtifacts({
+          project,
+          segmentLabel: candidate.segmentLabel,
+          videoUrl: candidate.localVideoUrl,
+          progressPreset: "history-backfill",
+        });
+        if (cancelled) return;
+      } catch {
+        /* ignore backfill failures; the sidebar progress event already reflects them when available */
+      } finally {
+        segmentContinuityBackfillInFlightRef.current.delete(candidate.key);
+        segmentContinuityBackfillSeenRef.current.add(candidate.key);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [runtime.currentProjectSnapshot, runtime.currentVideoProject, setRuntime]);
+
+  const handleRefreshSegmentContinuityAsset = useCallback(
+    async (asset: SidebarAssetItem) => {
+      if (asset.kind !== "video" || asset.subKind !== "segment") return;
+
+      const segmentLabel = String(asset.segmentLabel || "").trim();
+      const snapshot = runtimeRef.current.currentProjectSnapshot;
+      const project = runtimeRef.current.currentVideoProject;
+      if (!segmentLabel || !snapshot || !project || snapshot.projectId !== project.id) {
+        flashMaintenanceHint("仅正式片段支持更新六格。", 2400);
+        return;
+      }
+
+      const localVideoUrl =
+        resolveLocalSegmentContinuityBackfillVideoUrl(project, segmentLabel) ||
+        (isLocalSidebarAssetUrl(asset.url) ? asset.url : undefined);
+      if (!localVideoUrl) {
+        flashMaintenanceHint("当前片段暂无本地正式视频，无法更新六格。", 2600);
+        return;
+      }
+
+      const refreshKey = `${project.id}:${segmentLabel}:${localVideoUrl}`;
+      if (segmentContinuityBackfillInFlightRef.current.has(refreshKey)) {
+        flashMaintenanceHint("这个片段的六宫格正在更新中。", 2000);
+        return;
+      }
+
+      const alreadyReady = Boolean(project.segmentContinuityGridImages?.[segmentLabel]?.imageUrl?.trim());
+      segmentContinuityBackfillInFlightRef.current.add(refreshKey);
+      const extractingMessage = alreadyReady
+        ? `正在更新片段 ${segmentLabel} 六格…`
+        : `正在为片段 ${segmentLabel} 组六格…`;
+      flashMaintenanceHint(
+        extractingMessage,
+        2200,
+      );
+
+      try {
+        await refreshAndPersistSegmentContinuityArtifacts({
+          project,
+          segmentLabel,
+          videoUrl: localVideoUrl,
+        });
+        segmentContinuityBackfillSeenRef.current.add(refreshKey);
+        setSidebarAssetFocus({
+          assetId: asset.id,
+          message: alreadyReady ? "六格已更新" : "已组六格",
+        });
+        flashMaintenanceHint(
+          alreadyReady ? `片段 ${segmentLabel} 六格已更新。` : `片段 ${segmentLabel} 已组六格。`,
+          2200,
+        );
+      } catch (error) {
+        flashMaintenanceHint(error instanceof Error ? error.message : "更新六格失败。", 2600);
+      } finally {
+        segmentContinuityBackfillInFlightRef.current.delete(refreshKey);
+      }
+    },
+    [flashMaintenanceHint, refreshAndPersistSegmentContinuityArtifacts],
+  );
+
   useEffect(() => {
     if (!needsBootstrapSessionHydration || !session?.sessionId) return;
 
@@ -1847,7 +2960,8 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         setCompactedMessageCount((prev) =>
           prev === seedCompactedMessageCount ? (hydratedSession.compactedMessageCount ?? prev) : prev,
         );
-        if ((draftRef.current || persistedDraft) === seedDraft) {
+        setFullAutoChecklistCollapsed(hydratedSession.fullAutoChecklistCollapsed ?? true);
+        if (resolveComposerDraftSnapshot(draftRef.current, persistedDraft) === seedDraft) {
           resetComposerDraft(hydratedSession.draft ?? "");
         }
       });
@@ -1891,18 +3005,232 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       setSelectedValues([]);
       resetComposerDraft("");
       setSuggested(null);
+      setInterruptedChoiceQuestion(resolvedQuestion);
       setPopoverOverride(resolvedQuestion);
       return true;
     },
     [
       resetComposerDraft,
       setMode,
+      setInterruptedChoiceQuestion,
       setPopoverOverride,
       setQState,
       setSelectedValues,
       setSuggested,
     ],
   );
+
+  const openWorkflowPopoverQuestion = useCallback(
+    (nextQuestion: ComposerQuestion | null) => {
+      if (!nextQuestion) return false;
+
+      const snapshot = runtimeRef.current.currentProjectSnapshot;
+      const suggestionKey = buildProjectSuggestionKey(snapshot, nextQuestion);
+      if (suggestionKey) {
+        dismissedProjectSuggestionKeysRef.current.delete(suggestionKey);
+        surfacedProjectSuggestionKeysRef.current.add(suggestionKey);
+      }
+
+      setMode("active");
+      setQState(null);
+      setSelectedValues([]);
+      resetComposerDraft("");
+      setSuggested(null);
+      setInterruptedChoiceQuestion(null);
+      setPopoverOverride(nextQuestion);
+      return true;
+    },
+    [
+      resetComposerDraft,
+      setMode,
+      setInterruptedChoiceQuestion,
+      setPopoverOverride,
+      setQState,
+      setSelectedValues,
+      setSuggested,
+    ],
+  );
+
+  const queueWorkflowPopoverAfterAssistantReply = useCallback(
+    (nextQuestion: ComposerQuestion | null) => {
+      if (!nextQuestion) {
+        setPendingWorkflowPopoverAfterAssistantReply(null);
+        return;
+      }
+
+      const lastAssistantMessage =
+        [...messages].reverse().find((message) => message.role === "assistant") ?? null;
+      setPendingWorkflowPopoverAfterAssistantReply({
+        question: nextQuestion,
+        lastAssistantMessageId: lastAssistantMessage?.id ?? null,
+        projectId: runtimeRef.current.currentProjectSnapshot?.projectId ?? null,
+      });
+    },
+    [messages, runtimeRef],
+  );
+
+  const restorePendingCharacterAudioUploadContext = useCallback(
+    (restoreContext: PendingCharacterAudioUploadRestoreContext | null) => {
+      if (!restoreContext) return false;
+
+      const {
+        question: questionToRestore,
+        qState: questionStateToRestore,
+        selectedValues: selectedValuesToRestore,
+        draft: draftToRestore,
+      } = restoreContext;
+
+      if (questionStateToRestore) {
+        const suggestionKey = buildProjectSuggestionKey(
+          runtimeRef.current.currentProjectSnapshot,
+          questionToRestore,
+        );
+        if (suggestionKey) {
+          dismissedProjectSuggestionKeysRef.current.delete(suggestionKey);
+          restoredProjectSuggestionKeysRef.current.add(suggestionKey);
+          surfacedProjectSuggestionKeysRef.current.add(suggestionKey);
+        }
+
+        dismissedDeferredQuestionStepRef.current = null;
+        setPendingDeferredQuestionRestoreAfterAssistantReply(null);
+        setDeferredQuestionState(null);
+        setDeferredSelectedValues([]);
+        setDeferredDraft("");
+        setMode("active");
+        setPopoverOverride(null);
+        setInterruptedChoiceQuestion(null);
+        setSuggested(null);
+        setQState({ ...questionStateToRestore });
+        setSelectedValues([...selectedValuesToRestore]);
+        resetComposerDraft(draftToRestore);
+        return true;
+      }
+
+      if (!questionToRestore) return false;
+
+      setPendingDeferredQuestionRestoreAfterAssistantReply(null);
+      setDeferredQuestionState(null);
+      setDeferredSelectedValues([]);
+      setDeferredDraft("");
+      const restored = restoreInterruptedChoiceQuestion(questionToRestore);
+      if (!restored) return false;
+      setSelectedValues([...selectedValuesToRestore]);
+      resetComposerDraft(draftToRestore);
+      return true;
+    },
+    [
+      resetComposerDraft,
+      restoreInterruptedChoiceQuestion,
+      runtimeRef,
+      setMode,
+      setPopoverOverride,
+      setInterruptedChoiceQuestion,
+      setQState,
+      setSelectedValues,
+      setSuggested,
+    ],
+  );
+
+  const queuePendingCharacterAudioRestoreAfterAssistantReply = useCallback(
+    (restoreContext: PendingCharacterAudioUploadRestoreContext | null) => {
+      if (!restoreContext) return false;
+
+      if (restoreContext.qState) {
+        const currentProjectId = resolveSessionProjectIdForSnapshot({
+          currentSessionProjectId: activeProjectId,
+          snapshot: runtimeRef.current.currentProjectSnapshot,
+          fallbackProjectId:
+            runtimeRef.current.currentProjectSnapshot?.projectId ?? activeProjectId,
+        });
+        const stepKey = `${restoreContext.qState.request.id}:${restoreContext.qState.currentIndex}`;
+        const lastAssistantMessage =
+          [...messages].reverse().find((message) => message.role === "assistant") ??
+          null;
+
+        dismissedDeferredQuestionStepRef.current = stepKey;
+        setDeferredQuestionState({
+          ...restoreContext.qState,
+          source: "deferred",
+        });
+        setDeferredSelectedValues([...restoreContext.selectedValues]);
+        setDeferredDraft(restoreContext.draft);
+        setPendingDeferredQuestionRestoreAfterAssistantReply({
+          stepKey,
+          lastAssistantMessageId: lastAssistantMessage?.id ?? null,
+          projectId: currentProjectId ?? null,
+        });
+        return true;
+      }
+
+      if (restoreContext.question) {
+        queueWorkflowPopoverAfterAssistantReply(restoreContext.question);
+        return true;
+      }
+
+      return false;
+    },
+    [
+      activeProjectId,
+      messages,
+      queueWorkflowPopoverAfterAssistantReply,
+      runtimeRef,
+    ],
+  );
+
+  const resolvePendingCharacterAudioUploadRequest = useCallback(
+    (
+      currentQuestion: ComposerQuestion | null = question,
+      options?: {
+        preferredRestoreQuestion?: ComposerQuestion | null;
+      },
+    ): PendingCharacterAudioUploadRequest | null => {
+      const existingRequest = pendingCharacterAudioReferenceUploadRef.current;
+      if (existingRequest) {
+        return existingRequest;
+      }
+
+      const parsedQuestion = parsePendingCharacterAudioUploadQuestion(currentQuestion);
+      if (!parsedQuestion) {
+        return null;
+      }
+
+      const fallbackRestoreQuestion = markQuestionForExactRestore(
+        options?.preferredRestoreQuestion ??
+          (interruptedChoiceQuestion?.answerKey === PENDING_CHARACTER_AUDIO_QUESTION_KEY
+            ? null
+            : interruptedChoiceQuestion),
+      );
+      const fallbackRequest: PendingCharacterAudioUploadRequest = {
+        label:
+          currentQuestion?.options[0]?.label?.trim() ||
+          (parsedQuestion.canReturnToMenu ? "返回菜单" : "取消上传"),
+        characterId: parsedQuestion.characterId,
+        characterName: parsedQuestion.characterName,
+        restoreQuestion: fallbackRestoreQuestion ?? null,
+        restoreContext: {
+          question: fallbackRestoreQuestion ?? null,
+          qState,
+          selectedValues: [...selectedValues],
+          draft: resolveComposerDraftSnapshot(draftRef.current, persistedDraft) || "",
+        },
+      };
+      pendingCharacterAudioReferenceUploadRef.current = fallbackRequest;
+      return fallbackRequest;
+    },
+    [draftRef, interruptedChoiceQuestion, persistedDraft, qState, question, selectedValues],
+  );
+
+  useEffect(() => {
+    const pendingRequest = resolvePendingCharacterAudioUploadRequest(question);
+    if (!pendingRequest) return;
+    if (!awaitingCharacterAudioReferenceUpload) {
+      setAwaitingCharacterAudioReferenceUpload(true);
+    }
+  }, [
+    awaitingCharacterAudioReferenceUpload,
+    question,
+    resolvePendingCharacterAudioUploadRequest,
+  ]);
 
   const reopenWorkflowPopupAfterMediaCompletion = useCallback(() => {
     if (qState || draftPresence) return false;
@@ -1928,10 +3256,12 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     setSelectedValues([]);
     resetComposerDraft("");
     setSuggested(null);
+    setInterruptedChoiceQuestion(nextQuestion);
     setPopoverOverride(nextQuestion);
     return true;
   }, [
     draftPresence,
+    setInterruptedChoiceQuestion,
     popoverOverride,
     qState,
     resetComposerDraft,
@@ -1945,9 +3275,31 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     writeStoredHomeAgentTextModelKey(selectedTextModelKey);
   }, [selectedTextModelKey]);
 
+  const haveImageStylePrefsChanged = useCallback(
+    (
+      currentPrefs: Partial<VideoImageGenerationPrefs> | null | undefined,
+      nextPrefs: VideoImageGenerationPrefs,
+    ) => {
+      const normalizedCurrent = normalizeVideoImageGenerationPrefs(currentPrefs);
+      return (
+        normalizedCurrent.styleCategory !== nextPrefs.styleCategory ||
+        normalizedCurrent.stylePreset !== nextPrefs.stylePreset ||
+        String(normalizedCurrent.customStylePrompt || "").trim() !==
+          String(nextPrefs.customStylePrompt || "").trim()
+      );
+    },
+    [],
+  );
+
   const commitEffectiveImagePrefs = useCallback(
-    async (nextPrefsInput: Partial<VideoImageGenerationPrefs>) => {
-      const nextPrefs = normalizeVideoImageGenerationPrefs(nextPrefsInput);
+    async (
+      nextPrefsInput: Partial<VideoImageGenerationPrefs>,
+      options?: {
+        referenceStyleSummary?: string | null;
+        projectPatch?: Partial<PersistedVideoProject>;
+      },
+    ) => {
+      const nextPrefs = applyVideoImageViewModeConstraints(nextPrefsInput);
       setSelectedImageModelFamily(nextPrefs.familyKey);
       setImageGenerationPrefs(nextPrefs);
       writeStoredHomeAgentImageGenerationPrefs(nextPrefs);
@@ -1957,6 +3309,15 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         return;
       }
 
+      const styleChanged = haveImageStylePrefsChanged(currentVideoProject.imageGenerationPrefs, nextPrefs);
+      const hasExplicitReferenceStyleSummary =
+        options && Object.prototype.hasOwnProperty.call(options, "referenceStyleSummary");
+      const nextReferenceStyleSummary = hasExplicitReferenceStyleSummary
+        ? String(options?.referenceStyleSummary || "").trim() || undefined
+        : styleChanged
+          ? undefined
+          : currentVideoProject.referenceStyleSummary;
+
       const nextProject = await upsertStoredVideoProject({
         ...currentVideoProject,
         artStyle: resolveVideoImageProjectArtStyle(
@@ -1964,7 +3325,9 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           currentVideoProject.artStyle || "live-action",
         ),
         imageGenerationPrefs: nextPrefs,
+        referenceStyleSummary: nextReferenceStyleSummary,
         styleLock: null,
+        ...(options?.projectPatch ?? {}),
       });
 
       startTransition(() => {
@@ -1974,8 +3337,10 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
             previous.currentVideoProject?.id === nextProject.id ? nextProject : previous.currentVideoProject,
         }));
       });
+
+      return nextProject;
     },
-    [runtimeRef, setRuntime],
+    [haveImageStylePrefsChanged, runtimeRef, setRuntime],
   );
 
   const handleSelectImageModel = useCallback(
@@ -2013,6 +3378,29 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       const nextProject = await upsertStoredVideoProject({
         ...currentVideoProject,
         videoGenerationPrefs: nextPrefs,
+      });
+
+      startTransition(() => {
+        setRuntime((previous) => ({
+          ...previous,
+          currentVideoProject:
+            previous.currentVideoProject?.id === nextProject.id ? nextProject : previous.currentVideoProject,
+        }));
+      });
+    },
+    [runtimeRef, setRuntime],
+  );
+
+  const commitCurrentVideoProjectPatch = useCallback(
+    async (patch: Partial<PersistedVideoProject>) => {
+      const currentVideoProject = runtimeRef.current.currentVideoProject;
+      if (!currentVideoProject) {
+        return;
+      }
+
+      const nextProject = await upsertStoredVideoProject({
+        ...currentVideoProject,
+        ...patch,
       });
 
       startTransition(() => {
@@ -2069,15 +3457,68 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     [commitEffectiveImagePrefs, imageGenerationPrefs, selectedImageModelFamily],
   );
 
+  const analyzeImageStyleWithFallback = useCallback(
+    async (
+      imageFiles: File[],
+      userPrompt: string,
+    ): Promise<HomeAgentImageStyleRecognitionResult> => {
+      const controller = typeof AbortController === "function" ? new AbortController() : null;
+      const timeoutId =
+        typeof window !== "undefined"
+          ? window.setTimeout(() => controller?.abort(), STYLE_REFERENCE_RECOGNITION_TIMEOUT_MS)
+          : null;
+
+      try {
+        return await analyzeHomeAgentImageStyleFiles(imageFiles, {
+          userPrompt,
+          signal: controller?.signal,
+        });
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message === "No supported image files were provided for style recognition."
+        ) {
+          throw error;
+        }
+
+        const normalizedPrefs = normalizeVideoImageGenerationPrefs(imageGenerationPrefs);
+        const degradedReason =
+          error instanceof Error && error.name === "AbortError"
+            ? "自动识别超时，先按参考图继续。"
+            : "自动识别暂时不可用，先按参考图继续。";
+        return {
+          styleCategory: normalizedPrefs.styleCategory,
+          stylePreset: normalizedPrefs.stylePreset,
+          customStylePrompt: normalizedPrefs.customStylePrompt,
+          summary: `已收到参考图，${degradedReason}后续会沿用参考图的整体氛围、色彩与构图作为画面风格参考。`,
+          confidence: 0.28,
+          reasons: [degradedReason],
+          imageSummaries: imageFiles.slice(0, 4).map((file) => ({
+            fileName: file.name,
+            summary: "已收录这张参考图，将作为后续画面风格参考。",
+            stylePreset: normalizedPrefs.stylePreset,
+            confidence: 0.28,
+          })),
+        };
+      } finally {
+        if (timeoutId !== null) {
+          window.clearTimeout(timeoutId);
+        }
+      }
+    },
+    [imageGenerationPrefs],
+  );
+
   const handleRecognizeImageStyle = useCallback(async () => {
     const imageFiles = attachedFiles.filter(isSupportedImageFile);
     if (!imageFiles.length) {
       throw new Error("请先上传至少一张图片参考图。");
     }
-    return analyzeHomeAgentImageStyleFiles(imageFiles, {
-      userPrompt: draftRef.current || persistedDraft || "识别当前上传参考图的画面风格。",
-    });
-  }, [attachedFiles, persistedDraft]);
+    return analyzeImageStyleWithFallback(
+      imageFiles,
+      resolveComposerDraftSnapshot(draftRef.current, persistedDraft) || "识别当前上传参考图的画面风格。",
+    );
+  }, [analyzeImageStyleWithFallback, attachedFiles, persistedDraft]);
 
   useEffect(() => {
     if (selectedTextModelKeyRef.current === selectedTextModelKey) return;
@@ -2105,17 +3546,115 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     return () => window.removeEventListener(API_CONFIG_UPDATED_EVENT, handleConfigUpdated);
   }, [refreshLaunchReadiness]);
 
+  const handleSettingsSaved = useCallback(() => {
+    void refreshLaunchReadiness();
+  }, [refreshLaunchReadiness]);
+
   useEffect(() => {
     const handleAutomationModeUpdated = (event: Event) => {
       const mode = normalizeAutomationMode(
         (event as CustomEvent<{ mode?: AutomationMode }>).detail?.mode ?? readStoredAutomationMode(),
       );
-      setAutomationMode(mode);
+      setHistoryAutomationMode(mode);
     };
     window.addEventListener(HOME_AGENT_AUTOMATION_MODE_EVENT, handleAutomationModeUpdated as EventListener);
     return () =>
       window.removeEventListener(HOME_AGENT_AUTOMATION_MODE_EVENT, handleAutomationModeUpdated as EventListener);
   }, []);
+
+  useEffect(() => {
+    const handleVideoProjectSaved = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{
+          projectId?: string;
+          videoProject?: StudioRuntimeState["currentVideoProject"];
+          projectSnapshot?: ConversationProjectSnapshot | null;
+        }>
+      ).detail;
+      const nextProjectId = typeof detail?.projectId === "string" ? detail.projectId.trim() : "";
+      if (!nextProjectId || !detail?.videoProject || !detail.projectSnapshot) return;
+      if (!activeProjectId || activeProjectId === nextProjectId) {
+        setActiveProjectId(nextProjectId);
+      }
+
+      setRuntime((prev) => {
+        const currentProjectId =
+          prev.currentVideoProject?.id ||
+          prev.currentProjectSnapshot?.projectId ||
+          activeProjectId ||
+          "";
+        if (currentProjectId && currentProjectId !== nextProjectId) {
+          return prev;
+        }
+
+        const nextSnapshot: ConversationProjectSnapshot = {
+          ...detail.projectSnapshot,
+          memory: {
+            ...(detail.projectSnapshot.memory ?? {}),
+            assetManifest:
+              detail.videoProject?.assetManifest ??
+              detail.projectSnapshot.memory?.assetManifest,
+          },
+        };
+
+        return {
+          ...prev,
+          currentVideoProject: detail.videoProject,
+          currentProjectSnapshot: nextSnapshot,
+          recentProjects: mergeRecentProjects(prev.recentProjects, nextSnapshot),
+        };
+      });
+    };
+
+    window.addEventListener(VIDEO_PROJECT_SAVED_EVENT, handleVideoProjectSaved as EventListener);
+    return () =>
+      window.removeEventListener(VIDEO_PROJECT_SAVED_EVENT, handleVideoProjectSaved as EventListener);
+  }, [activeProjectId, setRuntime]);
+
+  useEffect(() => {
+    if (previousHistoryAutomationModeRef.current === historyAutomationMode) return;
+    previousHistoryAutomationModeRef.current = historyAutomationMode;
+    pendingHomepageIsolationModeRef.current = historyAutomationMode;
+    setHomepageIsolationRequestEpoch((value) => value + 1);
+  }, [historyAutomationMode]);
+
+  useEffect(() => {
+    if (!hasSkippedInitialRecentProjectRefreshRef.current) {
+      hasSkippedInitialRecentProjectRefreshRef.current = true;
+      return;
+    }
+
+    let cancelled = false;
+
+    void loadProjectStore()
+      .then((store) => store.listRecentConversationSnapshots(HOME_RECENT_PROJECTS_LIMIT, { fast: true }))
+      .then((items) => {
+        if (cancelled) return;
+        const filteredItems = filterRecentlyDeletedProjectSnapshots(items);
+        React.startTransition(() => {
+          setRuntime((prev) => {
+            const shouldPreserveRicherList =
+              filteredItems.length > 0 &&
+              prev.recentProjects.length > filteredItems.length &&
+              filteredItems.every((item) => prev.recentProjects.some((project) => project.projectId === item.projectId));
+            const nextRecentProjects = reconcileRecentProjectsWithStableOrder(
+              prev.recentProjects,
+              filteredItems,
+            );
+            if (shouldPreserveRicherList || areProjectSnapshotsEquivalent(nextRecentProjects, prev.recentProjects)) {
+              return prev;
+            }
+            return { ...prev, recentProjects: nextRecentProjects };
+          });
+          setRecentProjectsReady(true);
+        });
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [filterRecentlyDeletedProjectSnapshots, historyAutomationMode, loadProjectStore, setRecentProjectsReady, setRuntime]);
 
   const push = useCallback((
     role: HomeAgentMessage["role"],
@@ -2123,6 +3662,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     artifactIds?: string[],
     attachments?: ChatAttachment[],
     artifactSnapshots?: import("@/lib/home-agent/types").ConversationArtifact[],
+    messageExtras?: Partial<Pick<HomeAgentMessage, "automationOrigin" | "workflowRefresh">>,
   ) => {
     if (!content.trim()) return null;
     const resolvedArtifactSnapshots =
@@ -2130,18 +3670,636 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         ? artifactSnapshots
         : resolveArtifactSnapshots(runtimeRef.current.currentProjectSnapshot, artifactIds);
     const trimmedContent = content.trim();
-    const message = {
-      ...mk(role, trimmedContent, artifactIds, attachments, resolvedArtifactSnapshots),
+    const derivedMessageExtras = {
       ...(role === "user" && (trimmedContent.startsWith("全自动：") || trimmedContent.startsWith("AI代理："))
         ? { automationOrigin: "full-auto" as const }
         : {}),
+      ...messageExtras,
     };
-    setMessages((prev) => [
-      ...prev,
-      message,
-    ]);
+    const message = {
+      ...mk(role, trimmedContent, artifactIds, attachments, resolvedArtifactSnapshots, derivedMessageExtras),
+    };
+    setMessages((prev) => {
+      const next = [...prev, message];
+      messagesRef.current = next;
+      return next;
+    });
     return message.id;
-  }, []);
+  }, [messagesRef]);
+
+  const appendAttachmentOnlyUserMessage = useCallback(
+    (preparedAttachments: ChatAttachment[]) => {
+      const historyAttachments = preparedAttachments.map((attachment) =>
+        stripAttachmentPayloadForHistory(attachment),
+      );
+      const submittedMessage: HomeAgentMessage = {
+        ...mk("user", "", undefined, historyAttachments),
+      };
+      setMessages((prev) => {
+        const next = [...prev, submittedMessage];
+        messagesRef.current = next;
+        return next;
+      });
+    },
+    [messagesRef, setMessages],
+  );
+
+  const appendSubmittedStyleReferenceUserMessage = useCallback(
+    async (files: File[]) => {
+      const preparedAttachments = await prepareChatAttachments(files);
+      appendAttachmentOnlyUserMessage(preparedAttachments);
+    },
+    [appendAttachmentOnlyUserMessage],
+  );
+
+  const appendPendingStyleReferenceAssistantMessage = useCallback(
+    async () => {
+      const pendingMessage: HomeAgentMessage = {
+        ...mk("assistant", "正在识别参考图风格，请稍候。"),
+        status: "pending",
+        streamLabel: "正在识别参考图风格",
+      };
+      setMessages((prev) => {
+        const next = [...prev, pendingMessage];
+        messagesRef.current = next;
+        return next;
+      });
+      return pendingMessage.id;
+    },
+    [messagesRef, setMessages],
+  );
+
+  const finalizeStyleReferenceAssistantMessage = useCallback(
+    (messageId: string, content: string) => {
+      const applyFinalState = () => {
+        setMessages((prev) => {
+          const index = prev.findIndex((message) => message.id === messageId);
+          if (index === -1) return prev;
+          const currentMessage = prev[index];
+          if (
+            currentMessage.status === "complete" &&
+            currentMessage.streamLabel === undefined &&
+            currentMessage.content === content
+          ) {
+            return prev;
+          }
+          const next = [...prev];
+          next[index] = {
+            ...currentMessage,
+            content,
+            status: "complete",
+            streamLabel: undefined,
+          };
+          messagesRef.current = next;
+          return next;
+        });
+      };
+
+      applyFinalState();
+
+      if (typeof window !== "undefined") {
+        [80, 320, 1200].forEach((delay) => {
+          window.setTimeout(() => applyFinalState(), delay);
+        });
+      }
+    },
+    [messagesRef, setMessages],
+  );
+
+  const runVideoKickoffStyleReferenceRecognition = useCallback(
+    async (
+      currentFiles: File[],
+      rawText: string,
+    ): Promise<HomeAgentImageStyleRecognitionResult> => {
+      const imageFiles = currentFiles.filter(isSupportedImageFile);
+      if (!imageFiles.length) {
+        throw new Error("请先上传至少一张图片参考图。");
+      }
+
+      pendingVideoKickoffStyleReferenceUploadRef.current = null;
+      flushSync(() => {
+        setAwaitingVideoKickoffStyleReferenceUpload(true);
+        setAttachedFiles([]);
+        setMode("active");
+        setQState(null);
+        setPopoverOverride(null);
+        setSuggested(null);
+        setSelectedValues([]);
+        resetComposerDraft("");
+      });
+
+      await appendSubmittedStyleReferenceUserMessage(imageFiles);
+      const pendingAssistantMessageId =
+        await appendPendingStyleReferenceAssistantMessage();
+
+      try {
+        const recognition = await analyzeImageStyleWithFallback(
+          imageFiles,
+          rawText.trim() ||
+            resolveComposerDraftSnapshot(draftRef.current, persistedDraft) ||
+            "识别当前上传参考图的画面风格。",
+        );
+        const nextImagePrefs = normalizeVideoImageGenerationPrefs({
+          ...imageGenerationPrefs,
+          ...buildImagePrefsPatchFromRecognition(recognition),
+        });
+        const nextProject = await commitEffectiveImagePrefs(nextImagePrefs, {
+          referenceStyleSummary: recognition.summary,
+          projectPatch: {
+            kickoffModeConfirmed: true,
+            kickoffStyleConfirmed: true,
+          },
+        });
+        const currentSnapshot = runtimeRef.current.currentProjectSnapshot;
+        const nextQuestion =
+          currentSnapshot?.projectKind === "video"
+            ? (
+                buildVideoBridgePrefixQuestion(
+                  currentSnapshot,
+                  nextProject ?? runtimeRef.current.currentVideoProject,
+                ) ??
+                recQuestion(
+                  currentSnapshot,
+                  nextProject ?? runtimeRef.current.currentVideoProject,
+                )
+              )
+            : null;
+
+        queueWorkflowPopoverAfterAssistantReply(nextQuestion);
+        finalizeStyleReferenceAssistantMessage(
+          pendingAssistantMessageId,
+          [
+            "已识别参考图风格，摘要如下：",
+            `画面风格：${buildVideoImageStyleSummary(nextImagePrefs)}`,
+            `参考图摘要：${recognition.summary}`,
+            nextQuestion?.answerKey === "video-bridge-prefix"
+              ? "前置参数已写入。下一步请先点“补齐平台与镜头偏好”。"
+              : "前置参数已写入，继续后续视频工作流。",
+          ].join("\n"),
+        );
+        return recognition;
+      } catch (error) {
+        finalizeStyleReferenceAssistantMessage(
+          pendingAssistantMessageId,
+          `${
+            error instanceof Error ? error.message : "参考图风格识别失败。"
+          }请重新上传参考图，或改用自定义风格说明。`,
+        );
+        throw error;
+      } finally {
+        setAwaitingVideoKickoffStyleReferenceUpload(false);
+      }
+    },
+    [
+      appendSubmittedStyleReferenceUserMessage,
+      appendPendingStyleReferenceAssistantMessage,
+      analyzeImageStyleWithFallback,
+      commitEffectiveImagePrefs,
+      finalizeStyleReferenceAssistantMessage,
+      imageGenerationPrefs,
+      persistedDraft,
+      queueWorkflowPopoverAfterAssistantReply,
+      resetComposerDraft,
+      runtimeRef,
+      setMode,
+      setQState,
+      setAttachedFiles,
+      setPopoverOverride,
+      setSelectedValues,
+      setSuggested,
+    ],
+  );
+
+  const handleSubmitAttachedStyleReference = useCallback(
+    async (_label: string): Promise<SubmittedStyleReferenceRecognitionResult | null> => {
+      const currentFiles = [...attachedFiles];
+      const recognition = await runVideoKickoffStyleReferenceRecognition(
+        currentFiles,
+        resolveComposerDraftSnapshot(draftRef.current, persistedDraft) ||
+          "识别当前上传参考图的画面风格。",
+      );
+      return {
+        ...recognition,
+        handledLocally: true,
+      };
+    },
+    [attachedFiles, persistedDraft, runVideoKickoffStyleReferenceRecognition],
+  );
+
+  const bindPendingCharacterAudioReferenceUpload = useCallback(
+    async (currentFiles: File[]) => {
+      const pendingRequest = resolvePendingCharacterAudioUploadRequest();
+      if (!pendingRequest) return false;
+
+      const audioFiles = collectSupportedCharacterAudioFiles(currentFiles);
+      if (!audioFiles.length) {
+        push(
+          "assistant",
+          pendingRequest.characterName
+            ? `我正在等你上传角色《${pendingRequest.characterName}》的音频参考。请至少上传 1 个音频文件，并且一次只能绑定 1 个音色；发送后我会自动绑定到该角色。`
+            : "我正在等你上传角色音频参考。请至少上传 1 个音频文件，并且一次只能绑定 1 个音色；发送后我会自动绑定到当前角色。",
+        );
+        return true;
+      }
+
+      if (audioFiles.length > 1) {
+        const limitMessage = pendingRequest.characterName
+          ? `角色《${pendingRequest.characterName}》一次只能绑定 1 个音色。当前输入框里有 ${audioFiles.length} 个音频文件，请只保留 1 个后再发送。`
+          : `当前角色一次只能绑定 1 个音色。当前输入框里有 ${audioFiles.length} 个音频文件，请只保留 1 个后再发送。`;
+        flashMaintenanceHint(limitMessage, 3200);
+        push("assistant", limitMessage);
+        return true;
+      }
+
+      let currentVideoProject = runtimeRef.current.currentVideoProject;
+      if (!currentVideoProject) {
+        const fallbackProjectId = runtimeRef.current.currentProjectSnapshot?.projectId;
+        if (fallbackProjectId) {
+          currentVideoProject =
+            (await loadStoredVideoProjectById(fallbackProjectId, { fast: true })) ??
+            (await loadStoredVideoProjectById(fallbackProjectId));
+        }
+      }
+      if (!currentVideoProject) {
+        pendingCharacterAudioReferenceUploadRef.current = null;
+        setAwaitingCharacterAudioReferenceUpload(false);
+        setPopoverOverride(null);
+        setInterruptedChoiceQuestion(null);
+        interruptRestoreQuestionRef.current = null;
+        push("assistant", "当前没有可绑定的角色项目，请先回到视频项目后再上传音频参考。");
+        return true;
+      }
+
+      const targetCharacter = currentVideoProject.characters.find(
+        (character) => character.id === pendingRequest.characterId,
+      );
+      if (!targetCharacter) {
+        pendingCharacterAudioReferenceUploadRef.current = null;
+        setAwaitingCharacterAudioReferenceUpload(false);
+        setPopoverOverride(null);
+        setInterruptedChoiceQuestion(null);
+        interruptRestoreQuestionRef.current = null;
+        push("assistant", "没有找到要绑定音频参考的角色，请重新选择该角色后再上传。");
+        return true;
+      }
+
+      try {
+        const restoreContextOnSuccess = pendingRequest.restoreContext ?? null;
+        const preparedAttachments = await prepareChatAttachments(audioFiles);
+        const contextualizedAttachments = preparedAttachments.map((attachment, index) =>
+          index === 0
+            ? {
+                ...attachment,
+                label: targetCharacter.name?.trim()
+                  ? `角色《${targetCharacter.name.trim()}》音频参考`
+                  : attachment.label,
+              }
+            : attachment,
+        );
+        const audioAttachment = contextualizedAttachments[0];
+        const audioUrl = resolveCharacterAudioReferenceUrl(audioAttachment);
+        if (!audioUrl) {
+          throw new Error("当前音频文件缺少可用的本地路径或内联数据，暂时无法绑定到角色。");
+        }
+        const hadExistingAudioReference = Boolean(
+          targetCharacter.audioUrl?.trim() || targetCharacter.audioFileName?.trim(),
+        );
+
+        pendingCharacterAudioReferenceUploadRef.current = null;
+        setAwaitingCharacterAudioReferenceUpload(false);
+        setAttachedFiles([]);
+        setPopoverOverride(null);
+        setInterruptedChoiceQuestion(null);
+        interruptRestoreQuestionRef.current = null;
+        appendAttachmentOnlyUserMessage(contextualizedAttachments);
+
+        const nextCharacters = currentVideoProject.characters.map((character) =>
+          character.id === targetCharacter.id
+            ? {
+                ...character,
+                audioUrl,
+                audioFileName: audioAttachment.fileName || character.audioFileName,
+              }
+            : character,
+        );
+        const nextProject = await upsertStoredVideoProject(
+          synchronizeVideoProductionState({
+            ...currentVideoProject,
+            characters: nextCharacters,
+          }),
+        );
+
+        startTransition(() => {
+          setRuntime((previous) => ({
+            ...previous,
+            currentVideoProject:
+              previous.currentVideoProject?.id === nextProject.id ||
+              previous.currentProjectSnapshot?.projectId === nextProject.id
+                ? nextProject
+                : previous.currentVideoProject,
+          }));
+        });
+
+        push(
+          "assistant",
+          hadExistingAudioReference
+            ? `已把角色《${targetCharacter.name}》的音频参考更新为《${audioAttachment.fileName}》。每个角色当前只保留 1 个音色，后续出片会使用最新这条参考。`
+            : `已把音频参考《${audioAttachment.fileName}》绑定到角色《${targetCharacter.name}》。后续出片会把它作为角色声音参考传给视频模型。`,
+        );
+        queuePendingCharacterAudioRestoreAfterAssistantReply(
+          restoreContextOnSuccess ?? {
+            question: pendingRequest.restoreQuestion ?? null,
+            qState: null,
+            selectedValues: [],
+            draft: "",
+          },
+        );
+      } catch (error) {
+        push(
+          "assistant",
+          error instanceof Error ? error.message : "角色音频参考绑定失败，请稍后重试。",
+        );
+      }
+
+      return true;
+    },
+    [
+      appendAttachmentOnlyUserMessage,
+      flashMaintenanceHint,
+      push,
+      queuePendingCharacterAudioRestoreAfterAssistantReply,
+      resolvePendingCharacterAudioUploadRequest,
+      runtimeRef,
+      setRuntime,
+    ],
+  );
+
+  const cancelPendingCharacterAudioReferenceUpload = useCallback(
+    (options?: { restoreMenu?: boolean }) => {
+      const pendingRequest = resolvePendingCharacterAudioUploadRequest(
+        question,
+        options?.restoreMenu
+          ? {
+              preferredRestoreQuestion:
+                interruptedChoiceQuestion?.answerKey ===
+                PENDING_CHARACTER_AUDIO_QUESTION_KEY
+                  ? null
+                  : interruptedChoiceQuestion,
+            }
+          : undefined,
+      );
+      if (!pendingRequest) return false;
+
+      pendingCharacterAudioReferenceUploadRef.current = null;
+      setAwaitingCharacterAudioReferenceUpload(false);
+      setAttachedFiles([]);
+      setPopoverOverride(null);
+      setInterruptedChoiceQuestion(null);
+      interruptRestoreQuestionRef.current = null;
+
+      const restoreQuestion = options?.restoreMenu
+        ? pendingRequest.restoreQuestion ?? null
+        : null;
+      const restored = options?.restoreMenu
+        ? restorePendingCharacterAudioUploadContext(
+            pendingRequest.restoreContext ?? {
+              question: restoreQuestion,
+              qState: null,
+              selectedValues: [],
+              draft: "",
+            },
+          )
+        : false;
+      const resolvedCharacterName = pendingRequest.characterName?.trim();
+
+      if (restored && options?.restoreMenu) {
+        return true;
+      }
+
+      push(
+        "assistant",
+        restored
+          ? resolvedCharacterName
+            ? `已取消角色《${resolvedCharacterName}》的音频上传，已返回刚才的菜单。`
+            : "已取消当前角色音频上传，已返回刚才的菜单。"
+          : resolvedCharacterName
+            ? `已取消角色《${resolvedCharacterName}》的音频上传。`
+            : "已取消当前角色音频上传。",
+      );
+
+      return true;
+    },
+    [
+      interruptedChoiceQuestion,
+      push,
+      question,
+      resolvePendingCharacterAudioUploadRequest,
+      restorePendingCharacterAudioUploadContext,
+    ],
+  );
+
+  const openCharacterAudioReferencePresetPicker = useCallback(
+    async (
+      _label: string,
+      characterId: string,
+      characterName?: string,
+      restoreQuestion?: ComposerQuestion | null,
+    ) => {
+      const snapshot = runtimeRef.current.currentProjectSnapshot;
+      if (!snapshot || snapshot.projectKind !== "video") {
+        push("assistant", "当前没有可用的视频项目，请先进入角色与场景资产面板后再选择预设参考音频。");
+        return;
+      }
+
+      let presetLibrary;
+      try {
+        presetLibrary = await loadCharacterAudioPresetLibrary();
+      } catch (error) {
+        push(
+          "assistant",
+          error instanceof Error
+            ? error.message
+            : "读取预设参考音频库失败，请稍后再试。",
+        );
+        return;
+      }
+
+      if (!presetLibrary.groups.length) {
+        push(
+          "assistant",
+          "当前预设参考音频库还是空的，暂时没有可直接绑定的音色样本。",
+        );
+        return;
+      }
+
+      const exactRestoreQuestion = (() => {
+        const currentVideoProject = runtimeRef.current.currentVideoProject;
+        const canonicalWorkflowQuestion = buildVideoBridgeQuestion(
+          snapshot,
+          currentVideoProject,
+        );
+        return markQuestionForExactRestore(
+          canonicalWorkflowQuestion ?? restoreQuestion ?? question ?? null,
+        );
+      })();
+      characterAudioPresetPickerRef.current = {
+        characterId,
+        characterName,
+        restoreQuestion: exactRestoreQuestion,
+      };
+
+      openWorkflowPopoverQuestion(
+        buildCharacterAudioPresetPickerQuestion({
+          characterId,
+          characterName,
+          library: presetLibrary,
+          projectId: snapshot.projectId,
+          stepIndex: exactRestoreQuestion?.stepIndex ?? 0,
+          totalSteps: exactRestoreQuestion?.totalSteps ?? 1,
+        }),
+      );
+    },
+    [openWorkflowPopoverQuestion, push, question, runtimeRef],
+  );
+
+  const exitCharacterAudioReferencePresetPicker = useCallback(() => {
+    const snapshot = runtimeRef.current.currentProjectSnapshot;
+    const restoreQuestion = markQuestionForExactRestore(
+      snapshot?.projectKind === "video"
+        ? buildVideoBridgeQuestion(snapshot, runtimeRef.current.currentVideoProject) ??
+            characterAudioPresetPickerRef.current?.restoreQuestion ??
+            null
+        : characterAudioPresetPickerRef.current?.restoreQuestion ?? null,
+    );
+    characterAudioPresetPickerRef.current = null;
+
+    if (restoreQuestion) {
+      flushSync(() => {
+        openWorkflowPopoverQuestion(restoreQuestion);
+      });
+      return true;
+    }
+
+    setMode("active");
+    setSelectedValues([]);
+    resetComposerDraft("");
+    setSuggested(null);
+    setPopoverOverride(null);
+    return true;
+  }, [
+    openWorkflowPopoverQuestion,
+    resetComposerDraft,
+    setMode,
+    setPopoverOverride,
+    setSelectedValues,
+    setSuggested,
+  ]);
+
+  const bindCharacterAudioReferencePreset = useCallback(
+    async (
+      selection: CharacterAudioPresetBindSelection & {
+        label: string;
+        characterName?: string;
+        restoreQuestion?: ComposerQuestion | null;
+      },
+    ) => {
+      let currentVideoProject = runtimeRef.current.currentVideoProject;
+      if (!currentVideoProject) {
+        const fallbackProjectId = runtimeRef.current.currentProjectSnapshot?.projectId;
+        if (fallbackProjectId) {
+          currentVideoProject =
+            (await loadStoredVideoProjectById(fallbackProjectId, { fast: true })) ??
+            (await loadStoredVideoProjectById(fallbackProjectId));
+        }
+      }
+
+      if (!currentVideoProject) {
+        push("assistant", "当前没有可用的视频项目，请先进入角色与场景资产面板后再绑定预设参考音频。");
+        return;
+      }
+
+      const targetCharacter = currentVideoProject.characters.find(
+        (character) => character.id === selection.characterId,
+      );
+      if (!targetCharacter) {
+        push("assistant", "没有找到要绑定预设参考音频的角色，请重新打开角色菜单后再试一次。");
+        return;
+      }
+
+      const resolvedCharacterName =
+        targetCharacter.name?.trim() || selection.characterName?.trim() || "当前角色";
+      const resolvedFileName =
+        selection.fileName?.trim() ||
+        selection.audioPath.split(/[\\/]/u).pop()?.trim() ||
+        targetCharacter.audioFileName?.trim() ||
+        "预设参考音频.wav";
+      const hadExistingAudioReference = Boolean(
+        targetCharacter.audioUrl?.trim() || targetCharacter.audioFileName?.trim(),
+      );
+
+      const nextCharacters = currentVideoProject.characters.map((character) =>
+        character.id === targetCharacter.id
+          ? {
+              ...character,
+              audioUrl: selection.audioPath,
+              audioFileName: resolvedFileName,
+            }
+          : character,
+      );
+      const nextProject = await upsertStoredVideoProject(
+        synchronizeVideoProductionState({
+          ...currentVideoProject,
+          characters: nextCharacters,
+        }),
+      );
+
+      startTransition(() => {
+        setRuntime((previous) => ({
+          ...previous,
+          currentVideoProject:
+            previous.currentVideoProject?.id === nextProject.id ||
+            previous.currentProjectSnapshot?.projectId === nextProject.id
+              ? nextProject
+              : previous.currentVideoProject,
+        }));
+      });
+
+      push("user", selection.label);
+      push(
+        "assistant",
+        hadExistingAudioReference
+          ? `已把角色《${resolvedCharacterName}》的音频参考切换为预设《${resolvedFileName}》。后续出片会优先使用这条最新参考。`
+          : `已把预设参考音频《${resolvedFileName}》绑定到角色《${resolvedCharacterName}》。后续出片会把它作为角色声音参考传给视频模型。`,
+      );
+
+      const snapshot = runtimeRef.current.currentProjectSnapshot;
+      const restoreQuestion = markQuestionForExactRestore(
+        snapshot?.projectKind === "video"
+          ? buildVideoBridgeQuestion(snapshot, nextProject) ??
+              selection.restoreQuestion ??
+              characterAudioPresetPickerRef.current?.restoreQuestion ??
+              null
+          : selection.restoreQuestion ??
+              characterAudioPresetPickerRef.current?.restoreQuestion ??
+              null,
+      );
+      characterAudioPresetPickerRef.current = null;
+      if (restoreQuestion) {
+        flushSync(() => {
+          openWorkflowPopoverQuestion(restoreQuestion);
+        });
+      } else {
+        setPopoverOverride(null);
+      }
+    },
+    [
+      openWorkflowPopoverQuestion,
+      push,
+      runtimeRef,
+      setPopoverOverride,
+      setRuntime,
+    ],
+  );
 
   useEffect(() => {
     const handleWorkflowRuntimeDelta = (event: Event) => {
@@ -2155,10 +4313,19 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       // 鎷︽埅宸茶鐢ㄦ埛涓诲姩鏀惧純鐨勬棫椤圭洰 delta
       if (staleProjectIdsRef.current.has(nextSnapshot.projectId)) return;
       if (currentProjectId && nextSnapshot.projectId !== currentProjectId) return;
+      const nextSessionProjectId = resolveSessionProjectIdForSnapshot({
+        currentSessionProjectId: activeProjectId,
+        snapshot: nextSnapshot,
+        fallbackProjectId: nextSnapshot.projectId,
+      });
 
       startTransition(() => {
-        setRuntime((previous) => mergeRuntimeWithWorkflowDelta(previous, delta));
-        setActiveProjectId(nextSnapshot.projectId);
+        setRuntime((previous) =>
+          mergeRuntimeWithWorkflowDelta(previous, delta, { deferRecentProjectUpsert: streaming }),
+        );
+        if (nextSessionProjectId) {
+          setActiveProjectId(nextSessionProjectId);
+        }
       });
     };
 
@@ -2171,7 +4338,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         HOME_AGENT_WORKFLOW_RUNTIME_DELTA_EVENT,
         handleWorkflowRuntimeDelta as EventListener,
       );
-  }, [activeProjectId, setActiveProjectId, setRuntime]);
+  }, [activeProjectId, setActiveProjectId, setRuntime, streaming]);
 
   // 鐩戝惉鍥剧墖鐢熸垚寮€濮嬩簨浠讹紝娉ㄥ叆甯﹀崰浣嶇鐨?pending 娑堟伅
   useEffect(() => {
@@ -2179,6 +4346,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       const detail = ((event as CustomEvent<{
         count: number;
         action: string;
+        mediaEventId?: string;
         modelFamily?: string;
         resolution?: string;
         aspectRatio?: string;
@@ -2187,13 +4355,14 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       }>).detail ?? {}) as Partial<{
         count: number;
         action: string;
+        mediaEventId?: string;
         modelFamily?: string;
         resolution?: string;
         aspectRatio?: string;
         contentSummary?: string;
         targetLabels?: string[];
       }>;
-      const { count = 1, action = "" } = detail;
+      const { count = 1, action = "", mediaEventId } = detail;
       const targetLabels = detail.targetLabels?.slice(0, count);
       const placeholderAttachments: ChatAttachment[] = Array.from({ length: count }, (_, index) => {
         const targetLabel = targetLabels?.[index]?.trim();
@@ -2222,6 +4391,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         {
           ...mk("assistant", mediaCopy.start, undefined, placeholderAttachments),
           status: "pending" as const,
+          ...(mediaEventId ? { mediaEventId } : {}),
           streamLabel: buildPendingMediaStreamLabelV2({
             fallbackLabel:
               action === "generate_storyboard_frames"
@@ -2244,6 +4414,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       const detail = ((event as CustomEvent<{
         imageUrls: string[];
         imageLabels?: string[];
+        mediaEventId?: string;
         actionLabel?: string;
         action?: string;
         count?: number;
@@ -2254,6 +4425,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       }>).detail ?? {}) as Partial<{
         imageUrls: string[];
         imageLabels?: string[];
+        mediaEventId?: string;
         actionLabel?: string;
         action?: string;
         count?: number;
@@ -2262,7 +4434,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         aspectRatio?: string;
         contentSummary?: string;
       }>;
-      const { imageUrls, imageLabels, actionLabel } = detail;
+      const { imageUrls, imageLabels, mediaEventId, actionLabel } = detail;
       const successUrls = imageUrls ?? [];
 
       const attachments: ChatAttachment[] = await Promise.all(
@@ -2273,11 +4445,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           } else if (url.startsWith("http://") || url.startsWith("https://")) {
             previewUrl = url;
           } else if (isLocalSidebarAssetUrl(url)) {
-            const normalizedPath = normalizeSidebarAssetPath(url);
-            const result = await window.electronAPI?.storage?.readBase64?.(normalizedPath);
-            if (result?.ok && result?.base64) {
-              previewUrl = `data:${result.mimeType || "image/jpeg"};base64,${result.base64}`;
-            }
+            previewUrl = (await resolveLocalMediaPreviewDataUrl(url)) || undefined;
           }
           const perImageLabel = imageLabels?.[index];
           const baseName = perImageLabel
@@ -2286,7 +4454,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
               ? successUrls.length > 1
                 ? `${actionLabel}_${index + 1}`
                 : actionLabel
-              : (url.split(/[\/]/).pop()?.replace(/\.[^.]+$/, "") ??
+              : (url.split(/[/]/).pop()?.replace(/\.[^.]+$/, "") ??
                 buildGeneratedMediaFallbackName("image", successUrls.length, index).replace(/\.jpg$/, ""));
           const fileName = `${baseName}.jpg`;
           return {
@@ -2304,22 +4472,11 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
 
       setMessages((prev) => {
         // 找到最后一条 pending 图片消息（允许占位符已被逐张替换完毕）
-        const lastPendingIdx = [...prev].reverse().findIndex(
-          (m) =>
-            m.role === "assistant" &&
-            m.status === "pending" &&
-            m.attachments?.some((a) => a.kind === "image"),
-        );
+        const idx = findPendingMediaMessageIndex(prev, "image", mediaEventId);
 
-        if (lastPendingIdx !== -1) {
-          const idx = prev.length - 1 - lastPendingIdx;
+        if (idx !== -1) {
           const target = prev[idx];
-          // 保留已成功（real）和已失败（failed）的 attachment，丢弃仍 pending 的
-          const existingSettled = (target?.attachments ?? []).filter(
-            (a) => a.kind === "image" && !a.pending && !a.cancelled,
-          );
-          // 如果有逐张写入的结果（成功或失败），优先用它们；否则用最终批量 attachments
-          const rawAttachments = existingSettled.length > 0 ? existingSettled : attachments;
+          const rawAttachments = mergeCompletedImageAttachments(target?.attachments, attachments);
           // 去掉版本后缀
           const finalAttachments = rawAttachments.map((a) => ({
             ...a,
@@ -2368,7 +4525,10 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           contentSummary: detail.contentSummary,
           imageLabels: detail.imageLabels,
         });
-        const realMsg = mk("assistant", mediaCopy.done, undefined, attachments);
+        const realMsg = {
+          ...mk("assistant", mediaCopy.done, undefined, attachments),
+          ...(mediaEventId ? { mediaEventId } : {}),
+        };
         if (hasMatchingCompletedMediaMessage(prev, attachments)) {
           return prev;
         }
@@ -2384,8 +4544,26 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   // 监听单张图片生成完成事件，逐张替换占位符
   useEffect(() => {
     const handleImageGeneratedOne = async (event: Event) => {
-      const detail = ((event as CustomEvent<{ url: string; label?: string; index: number }>).detail ?? {}) as Partial<{ url: string; label?: string; index: number }>;
-      const { url, label, index } = detail;
+      const detail = ((event as CustomEvent<{
+        url: string;
+        label?: string;
+        index: number;
+        mediaEventId?: string;
+        action?: AssetLibraryTarget["action"];
+        projectId?: string;
+        targetId?: string;
+        regenerateMode?: AssetLibraryTarget["regenerateMode"];
+      }>).detail ?? {}) as Partial<{
+        url: string;
+        label?: string;
+        index: number;
+        mediaEventId?: string;
+        action?: AssetLibraryTarget["action"];
+        projectId?: string;
+        targetId?: string;
+        regenerateMode?: AssetLibraryTarget["regenerateMode"];
+      }>;
+      const { url, label, index, mediaEventId } = detail;
       if (!url) return;
 
       let previewUrl: string | undefined;
@@ -2394,11 +4572,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       } else if (url.startsWith("http://") || url.startsWith("https://")) {
         previewUrl = url;
       } else if (isLocalSidebarAssetUrl(url)) {
-        const normalizedPath = normalizeSidebarAssetPath(url);
-        const result = await window.electronAPI?.storage?.readBase64?.(normalizedPath);
-        if (result?.ok && result?.base64) {
-          previewUrl = `data:${result.mimeType || "image/jpeg"};base64,${result.base64}`;
-        }
+        previewUrl = (await resolveLocalMediaPreviewDataUrl(url)) || undefined;
       }
 
       const cleanLabel = label ? label.replace(/\s*·\s*版本\d+$/, "") : undefined;
@@ -2411,18 +4585,21 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         kind: "image" as const,
         localPath: url,
         previewUrl,
+        ...(detail.action && detail.projectId && detail.targetId
+          ? {
+              generationContext: {
+                action: detail.action,
+                projectId: detail.projectId,
+                targetId: detail.targetId,
+                regenerateMode: detail.regenerateMode ?? "generate",
+              },
+            }
+          : {}),
       };
 
       setMessages((prev) => {
-        const lastPendingIdx = [...prev].reverse().findIndex(
-          (m) =>
-            m.role === "assistant" &&
-            m.status === "pending" &&
-            m.attachments?.some((a) => a.kind === "image"),
-        );
-        if (lastPendingIdx === -1) return prev;
-
-        const msgIdx = prev.length - 1 - lastPendingIdx;
+        const msgIdx = findPendingMediaMessageIndex(prev, "image", mediaEventId);
+        if (msgIdx === -1) return prev;
         const target = prev[msgIdx];
         if (!target?.attachments) return prev;
 
@@ -2453,36 +4630,27 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   // 监听单张图片生成失败事件，保留占位符并标记失败原因
   useEffect(() => {
     const handleImageGeneratedOneFailed = (event: Event) => {
-      const detail = ((event as CustomEvent<{ index: number; label?: string; reason?: string }>).detail ?? {}) as Partial<{ index: number; label?: string; reason?: string }>;
-      const { index, label, reason } = detail;
+      const detail = ((event as CustomEvent<{ index: number; label?: string; reason?: string; mediaEventId?: string }>).detail ?? {}) as Partial<{ index: number; label?: string; reason?: string; mediaEventId?: string }>;
+      const { index, label, reason, mediaEventId } = detail;
       const failureReason = resolveImageFailureReason(reason);
 
       setMessages((prev) => {
-        const lastPendingIdx = [...prev].reverse().findIndex(
-          (m) =>
-            m.role === "assistant" &&
-            m.status === "pending" &&
-            m.attachments?.some((a) => a.kind === "image"),
-        );
-        if (lastPendingIdx === -1) return prev;
-
-        const msgIdx = prev.length - 1 - lastPendingIdx;
+        const msgIdx = findPendingMediaMessageIndex(prev, "image", mediaEventId);
+        if (msgIdx === -1) return prev;
         const target = prev[msgIdx];
         if (!target?.attachments) return prev;
-
-        const imageAttachments = target.attachments.filter((a) => a.kind === "image");
-        const targetPlaceholder = imageAttachments[index];
-        if (!targetPlaceholder) return prev;
-
         const next = [...prev];
-        next[msgIdx] = {
-          ...target,
-          attachments: target.attachments.map((a) =>
-            a.id === targetPlaceholder.id
-              ? { ...a, pending: false, failed: true, failureReason, label: label || a.label }
-              : a,
-          ),
-        };
+        next[msgIdx] = markFailedMediaAttachmentsInMessage(target, {
+          kind: "image",
+          index,
+          label,
+          failureReason,
+          completionContent: buildMediaFailureCompletionContent({
+            kind: "image",
+            label,
+            failureReason,
+          }),
+        });
         return next;
       });
     };
@@ -2491,17 +4659,44 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   }, []);
 
   useEffect(() => {
-    const handleImageGeneratingCancelled = () => {
-      setMessages((prev) => {
-        const lastPendingIdx = [...prev].reverse().findIndex(
-          (m) =>
-            m.role === "assistant" &&
-            m.status === "pending" &&
-            m.attachments?.some((a) => a.kind === "image" && a.pending),
-        );
-        if (lastPendingIdx === -1) return prev;
+    const handleImageGeneratingFailed = (event: Event) => {
+      const detail = ((event as CustomEvent<{ reason?: string; mediaEventId?: string }>).detail ?? {}) as Partial<{
+        reason?: string;
+        mediaEventId?: string;
+      }>;
+      const failureReason = resolveImageFailureReason(detail.reason);
 
-        const idx = prev.length - 1 - lastPendingIdx;
+      setMessages((prev) => {
+        const msgIdx = findPendingMediaMessageIndex(prev, "image", detail.mediaEventId);
+        if (msgIdx === -1) return prev;
+        const target = prev[msgIdx];
+        if (!target?.attachments?.length) return prev;
+
+        const next = [...prev];
+        next[msgIdx] = markFailedMediaAttachmentsInMessage(target, {
+          kind: "image",
+          settleAll: true,
+          failureReason,
+          completionContent: buildMediaFailureCompletionContent({
+            kind: "image",
+            failureReason,
+          }),
+        });
+        return next;
+      });
+    };
+    window.addEventListener("agent:image-generating-failed", handleImageGeneratingFailed as EventListener);
+    return () => window.removeEventListener("agent:image-generating-failed", handleImageGeneratingFailed as EventListener);
+  }, []);
+
+  useEffect(() => {
+    const handleImageGeneratingCancelled = (event: Event) => {
+      const detail = ((event as CustomEvent<{ mediaEventId?: string }>).detail ?? {}) as Partial<{
+        mediaEventId?: string;
+      }>;
+      setMessages((prev) => {
+        const idx = findPendingMediaMessageIndex(prev, "image", detail.mediaEventId);
+        if (idx === -1) return prev;
         const target = prev[idx];
         if (!target?.attachments?.length) return prev;
 
@@ -2535,6 +4730,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           count?: number;
           sceneCount?: number;
           action?: string;
+          mediaEventId?: string;
           model?: string;
           resolution?: string;
           provider?: string;
@@ -2542,10 +4738,12 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           aspectRatio?: string;
           contentSummary?: string;
           targetLabels?: string[];
+          routeHint?: string;
         }>).detail ?? {}) as Partial<{
           count?: number;
           sceneCount?: number;
           action?: string;
+          mediaEventId?: string;
           model?: string;
           resolution?: string;
           provider?: string;
@@ -2553,8 +4751,13 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           aspectRatio?: string;
           contentSummary?: string;
           targetLabels?: string[];
+          routeHint?: string;
         }>;
-      const count = Math.max(1, Math.min(6, detail.sceneCount ?? detail.count ?? 1));
+      const count = Math.max(1, detail.sceneCount ?? detail.count ?? 1);
+      const mediaEventId =
+        typeof detail.mediaEventId === "string" && detail.mediaEventId.trim()
+          ? detail.mediaEventId.trim()
+          : undefined;
       const targetLabels = detail.targetLabels?.slice(0, count);
       const placeholderAttachments: ChatAttachment[] = Array.from({ length: count }, (_, index) => {
         const targetLabel = targetLabels?.[index]?.trim();
@@ -2573,16 +4776,19 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         count,
         model: detail.model,
         resolution: detail.resolution,
+        aspectRatio: detail.aspectRatio,
         provider: detail.provider,
         mode: detail.mode,
         contentSummary: detail.contentSummary,
         videoLabels: targetLabels,
+        routeHint: detail.routeHint,
       });
       setMessages((prev) => [
         ...prev,
         {
           ...mk("assistant", mediaCopy.start, undefined, placeholderAttachments),
           status: "pending" as const,
+          ...(mediaEventId ? { mediaEventId } : {}),
           streamLabel: buildPendingMediaStreamLabelV2({
             fallbackLabel: "\u89c6\u9891",
             contentSummary: detail.contentSummary,
@@ -2599,43 +4805,56 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       const detail =
         ((event as CustomEvent<{
           videoUrls: string[];
+          mediaEventId?: string;
           count?: number;
           model?: string;
           resolution?: string;
+          aspectRatio?: string;
           provider?: string;
           mode?: string;
           contentSummary?: string;
         }>).detail ?? {}) as Partial<{
           videoUrls: string[];
+          mediaEventId?: string;
           count?: number;
           model?: string;
           resolution?: string;
+          aspectRatio?: string;
           provider?: string;
           mode?: string;
           contentSummary?: string;
         }>;
-      const { videoUrls: rawVideoUrls } = detail;
+      const { videoUrls: rawVideoUrls, mediaEventId } = detail;
       if (!rawVideoUrls?.length) return;
 
-      // 去重：过滤掉近期已处理过的 URL，防止 workflow shortcut 和后台轮询双重 dispatch 导致重复消息
-      const videoUrls = rawVideoUrls.filter(url => !recentlyProcessedVideoUrlsRef.current.has(url));
-      // 若所有 URL 均已被 agent:video-generated-one 逐条处理，只需将 pending 消息标记为完成
+      const hasPendingBatch =
+        findPendingMediaMessageIndex(messagesRef.current, "video", mediaEventId) !== -1;
+      const videoUrls = rawVideoUrls.filter(
+        (url) => !wasVideoRecentlyProcessed(recentlyProcessedVideoUrlsRef.current, url, mediaEventId),
+      );
+
+      // 若最终汇总里所有 URL 都是近期已处理结果，只需将 pending 消息标记为完成
       if (!videoUrls.length) {
         setMessages((prev) => {
-          const lastPendingIdx = [...prev].reverse().findIndex(
-            (m) => m.role === "assistant" && m.status === "pending" && m.attachments?.some((a) => a.kind === "video"),
-          );
-          if (lastPendingIdx === -1) return prev;
-          const idx = prev.length - 1 - lastPendingIdx;
+          const idx = findPendingMediaMessageIndex(prev, "video", mediaEventId);
+          if (idx === -1) return prev;
           const next = [...prev];
-          next[idx] = { ...next[idx], status: "complete", streamLabel: undefined };
+          next[idx] = {
+            ...next[idx],
+            status: "complete",
+            streamLabel: undefined,
+            ...(
+              mediaEventId || next[idx]?.mediaEventId
+                ? { mediaEventId: mediaEventId ?? next[idx]?.mediaEventId }
+                : {}
+            ),
+          };
           return next;
         });
         reopenWorkflowPopupAfterMediaCompletion();
         return;
       }
-      videoUrls.forEach(url => recentlyProcessedVideoUrlsRef.current.add(url));
-      setTimeout(() => videoUrls.forEach(url => recentlyProcessedVideoUrlsRef.current.delete(url)), 30_000);
+      videoUrls.forEach((url) => markVideoAsRecentlyProcessed(recentlyProcessedVideoUrlsRef.current, url, mediaEventId));
 
       const currentProjectId =
         runtimeRef.current.currentProjectSnapshot?.projectId ?? activeProjectId;
@@ -2673,23 +4892,19 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       }));
 
       setMessages((prev) => {
-        const lastPendingIdx = [...prev].reverse().findIndex(
-          (m) =>
-            m.role === "assistant" &&
-            m.status === "pending" &&
-            m.attachments?.some((a) => a.kind === "video" && a.pending),
-        );
+        const idx = findPendingMediaMessageIndex(prev, "video", mediaEventId);
         const mediaCopy = buildVideoMediaMessageV2({
-          count: detail.count ?? videoUrls.length,
+          count: detail.count ?? rawVideoUrls.length,
           model: detail.model,
           resolution: detail.resolution,
+          aspectRatio: detail.aspectRatio,
           provider: detail.provider,
           mode: detail.mode,
           contentSummary: detail.contentSummary,
         });
-        if (lastPendingIdx !== -1) {
-          const idx = prev.length - 1 - lastPendingIdx;
+        if (idx !== -1) {
           const target = prev[idx];
+          const finalAttachments = mergeCompletedVideoAttachments(target?.attachments, attachments);
           const realMsg = mk(
             "assistant",
             preserveExistingMediaDetailLines({
@@ -2698,10 +4913,17 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
               preserveExistingDetails: !detail.contentSummary,
             }),
             undefined,
-            attachments,
+            finalAttachments,
           );
           const next = [...prev];
-          next[idx] = realMsg;
+          next[idx] = {
+            ...realMsg,
+            ...(
+              mediaEventId || target?.mediaEventId
+                ? { mediaEventId: mediaEventId ?? target?.mediaEventId }
+                : {}
+            ),
+          };
           return next;
         }
         const realMsg = mk("assistant", mediaCopy.done, undefined, attachments);
@@ -2720,60 +4942,24 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   // 监听单条视频生成完成事件，逐条替换占位符（不等全部完成）
   useEffect(() => {
     const handleVideoGeneratedOne = async (event: Event) => {
-      const detail = ((event as CustomEvent<{ url: string; label?: string; index: number; sceneId?: string; projectId?: string; segmentLabel?: string }>).detail ?? {}) as Partial<{ url: string; label?: string; index: number; sceneId?: string; projectId?: string; segmentLabel?: string }>;
-      const { url, label, index, sceneId, projectId: eventProjectId, segmentLabel } = detail;
+      const detail = ((event as CustomEvent<{ url: string; label?: string; index: number; mediaEventId?: string; sceneId?: string; projectId?: string; segmentLabel?: string }>).detail ?? {}) as Partial<{ url: string; label?: string; index: number; mediaEventId?: string; sceneId?: string; projectId?: string; segmentLabel?: string }>;
+      const { url, label, index, mediaEventId, sceneId, projectId: eventProjectId, segmentLabel } = detail;
       if (!url) return;
 
       // 标记为已处理，防止 agent:video-generated 最终事件重复创建消息
-      recentlyProcessedVideoUrlsRef.current.add(url);
-      setTimeout(() => recentlyProcessedVideoUrlsRef.current.delete(url), 30_000);
-
-      const currentProjectId = eventProjectId ?? runtimeRef.current.currentProjectSnapshot?.projectId ?? activeProjectId;
-      const rawFileName = url.split(/[\\/]/).pop()?.split("?")[0] || buildGeneratedMediaFallbackName("video", 1, 0);
-      let urlFileName = rawFileName;
-      try { urlFileName = decodeURIComponent(rawFileName); } catch { urlFileName = rawFileName; }
-      const contentStem = label ? label.replace(/\s*·\s*版本\d+$/, "") : urlFileName.replace(/\.[^.]+$/, "");
-      const fileName = contentStem ? `${contentStem}.mp4` : urlFileName;
-      const cachedVideo = await cacheProjectVideoSource(url, fileName, currentProjectId);
-      const fallbackVideo = resolveVideoAttachmentSource(url);
-
-      const attachment: ChatAttachment = {
-        id: crypto.randomUUID(),
-        fileName,
-        label: contentStem || undefined,
-        mimeType: cachedVideo?.mimeType ?? "video/mp4",
-        size: cachedVideo?.size ?? 0,
-        kind: "video" as const,
-        localPath: cachedVideo?.localPath ?? fallbackVideo.localPath,
-        previewUrl: cachedVideo?.previewUrl ?? fallbackVideo.previewUrl,
-        ...(segmentLabel && currentProjectId
-          ? {
-              generationContext: {
-                action: "generate_segment_video" as const,
-                projectId: currentProjectId,
-                targetId: segmentLabel,
-                regenerateMode: "redo-and-generate" as const,
-              },
-            }
-          : sceneId && currentProjectId
-          ? {
-              generationContext: {
-                action: "generate_video_assets" as const,
-                projectId: currentProjectId,
-                targetId: sceneId,
-                regenerateMode: "redo-and-generate" as const,
-              },
-            }
-          : {}),
-      };
+      markVideoAsRecentlyProcessed(recentlyProcessedVideoUrlsRef.current, url, mediaEventId);
+      const attachment = await buildGeneratedVideoAttachmentFromEvent({
+        url,
+        label,
+        sceneId,
+        projectId: eventProjectId,
+        segmentLabel,
+        fallbackProjectId: runtimeRef.current.currentProjectSnapshot?.projectId ?? activeProjectId,
+      });
 
       setMessages((prev) => {
-        const lastPendingIdx = [...prev].reverse().findIndex(
-          (m) => m.role === "assistant" && m.status === "pending" && m.attachments?.some((a) => a.kind === "video"),
-        );
-        if (lastPendingIdx === -1) return prev;
-
-        const msgIdx = prev.length - 1 - lastPendingIdx;
+        const msgIdx = findPendingMediaMessageIndex(prev, "video", mediaEventId);
+        if (msgIdx === -1) return prev;
         const target = prev[msgIdx];
         if (!target?.attachments) return prev;
 
@@ -2796,17 +4982,15 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   }, [activeProjectId]);
 
   useEffect(() => {
-    const handleVideoGeneratingCancelled = () => {
+    const handleVideoGeneratingCancelled = (event: Event) => {
+      const detail =
+        ((event as CustomEvent<{ mediaEventId?: string }>).detail ?? {}) as Partial<{
+          mediaEventId?: string;
+        }>;
+      const { mediaEventId } = detail;
       setMessages((prev) => {
-        const lastPendingIdx = [...prev].reverse().findIndex(
-          (m) =>
-            m.role === "assistant" &&
-            m.status === "pending" &&
-            m.attachments?.some((a) => a.kind === "video" && a.pending),
-        );
-        if (lastPendingIdx === -1) return prev;
-
-        const idx = prev.length - 1 - lastPendingIdx;
+        const idx = findPendingMediaMessageIndex(prev, "video", mediaEventId);
+        if (idx === -1) return prev;
         const target = prev[idx];
         if (!target?.attachments?.length) return prev;
 
@@ -2832,6 +5016,97 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
 
     window.addEventListener("agent:video-generating-cancelled", handleVideoGeneratingCancelled);
     return () => window.removeEventListener("agent:video-generating-cancelled", handleVideoGeneratingCancelled);
+  }, []);
+
+  useEffect(() => {
+    const handleVideoGeneratedOneFailed = async (event: Event) => {
+      const detail = ((event as CustomEvent<{
+        index: number;
+        label?: string;
+        reason?: string;
+        url?: string;
+        projectId?: string;
+        sceneId?: string;
+        segmentLabel?: string;
+        mediaEventId?: string;
+      }>).detail ?? {}) as Partial<{
+        index: number;
+        label?: string;
+        reason?: string;
+        url?: string;
+        projectId?: string;
+        sceneId?: string;
+        segmentLabel?: string;
+        mediaEventId?: string;
+      }>;
+      const failureReason = resolveVideoFailureReason(detail.reason);
+      const attachmentOverrides =
+        detail.url
+          ? await buildGeneratedVideoAttachmentFromEvent({
+              url: detail.url,
+              label: detail.label,
+              sceneId: detail.sceneId,
+              projectId: detail.projectId,
+              segmentLabel: detail.segmentLabel,
+              fallbackProjectId: runtimeRef.current.currentProjectSnapshot?.projectId ?? activeProjectId,
+            })
+          : undefined;
+
+      setMessages((prev) => {
+        const msgIdx = findPendingMediaMessageIndex(prev, "video", detail.mediaEventId);
+        if (msgIdx === -1) return prev;
+        const target = prev[msgIdx];
+        if (!target?.attachments?.length) return prev;
+
+        const next = [...prev];
+        next[msgIdx] = markFailedMediaAttachmentsInMessage(target, {
+          kind: "video",
+          index: detail.index,
+          label: detail.label,
+          failureReason,
+          attachmentOverrides,
+          completionContent: buildMediaFailureCompletionContent({
+            kind: "video",
+            label: detail.label,
+            failureReason,
+          }),
+        });
+        return next;
+      });
+    };
+    window.addEventListener("agent:video-generated-one-failed", handleVideoGeneratedOneFailed as EventListener);
+    return () => window.removeEventListener("agent:video-generated-one-failed", handleVideoGeneratedOneFailed as EventListener);
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    const handleVideoGeneratingFailed = (event: Event) => {
+      const detail = ((event as CustomEvent<{ reason?: string; mediaEventId?: string }>).detail ?? {}) as Partial<{
+        reason?: string;
+        mediaEventId?: string;
+      }>;
+      const failureReason = resolveVideoFailureReason(detail.reason);
+
+      setMessages((prev) => {
+        const msgIdx = findPendingMediaMessageIndex(prev, "video", detail.mediaEventId);
+        if (msgIdx === -1) return prev;
+        const target = prev[msgIdx];
+        if (!target?.attachments?.length) return prev;
+
+        const next = [...prev];
+        next[msgIdx] = markFailedMediaAttachmentsInMessage(target, {
+          kind: "video",
+          settleAll: true,
+          failureReason,
+          completionContent: buildMediaFailureCompletionContent({
+            kind: "video",
+            failureReason,
+          }),
+        });
+        return next;
+      });
+    };
+    window.addEventListener("agent:video-generating-failed", handleVideoGeneratingFailed as EventListener);
+    return () => window.removeEventListener("agent:video-generating-failed", handleVideoGeneratingFailed as EventListener);
   }, []);
 
   const resolveAssetTargetFromLookup = useCallback((lookup: Set<string>) => {
@@ -2939,6 +5214,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
             preferredTab: detail.preferredTab,
             preferredImageSubTab: detail.preferredImageSubTab,
             isHistoricalVersion: detail.isHistoricalVersion,
+            historyEntryId: detail.historyEntryId,
           }]
         : [];
       const droppedFiles = Array.isArray(detail.files) ? detail.files : [];
@@ -2960,7 +5236,8 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         (asset) =>
           asset.url &&
           !asset.url.startsWith("blob:") &&
-          !isExpiredRemoteSignedMediaUrl(asset.url),
+          !isExpiredRemoteSignedMediaUrl(asset.url) &&
+          !isKnownPlaceholderMediaUrl(asset.url),
       );
       if (!incomingAssets.length) return;
 
@@ -2976,6 +5253,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       let focusAssetId: string | null = null;
       let focusMessage = "";
       const existingUrls = new Set((workingProject.assetManifest?.items ?? []).map((item) => item.url));
+      const replacedSegmentVideoLabels = new Set<string>();
 
       for (const incoming of incomingAssets) {
         if (
@@ -2998,9 +5276,29 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         ) ?? resolveAssetTargetFromLookup(lookup);
 
         if (resolvedTarget?.targetId) {
-          workingProject = applyAssetReplacement(workingProject, resolvedTarget, incoming);
+          const isSegmentVideoReplacement =
+            incoming.kind === "video" &&
+            (resolvedTarget.action === "generate_segment_video" || resolvedTarget.action === "replace_segment_video");
+          if (isSegmentVideoReplacement && incoming.historyEntryId) {
+            const { promoteArchivedSegmentVideoCandidateToOfficialAsset } = await loadVideoWorkflowService();
+            workingProject = await promoteArchivedSegmentVideoCandidateToOfficialAsset({
+              project: workingProject,
+              segmentLabel: resolvedTarget.targetId,
+              historyEntryId: incoming.historyEntryId,
+            });
+          } else {
+            workingProject = applyAssetReplacement(workingProject, resolvedTarget, incoming);
+          }
+          if (isSegmentVideoReplacement && !incoming.historyEntryId) {
+            replacedSegmentVideoLabels.add(resolvedTarget.targetId);
+          }
           focusAssetId = deriveAssetIdFromTarget(resolvedTarget);
-          focusMessage = incoming.kind === "video" ? "已替换当前视频素材" : "已替换当前图片素材";
+          focusMessage =
+            isSegmentVideoReplacement && incoming.historyEntryId
+              ? "已传递到正式视频栏，并开始同步六宫格抽帧"
+              : incoming.kind === "video"
+                ? "已替换当前视频素材"
+                : "已替换当前图片素材";
           continue;
         }
 
@@ -3035,6 +5333,17 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         focusMessage = incoming.kind === "video" ? "已加入视频素材库" : "已归档到“其他”图片栏";
       }
 
+      if (replacedSegmentVideoLabels.size) {
+        workingProject = synchronizeVideoProductionState(workingProject);
+        for (const segmentLabel of replacedSegmentVideoLabels) {
+          workingProject = await refreshSegmentContinuityArtifactsInProject({
+            project: workingProject,
+            segmentLabel,
+            videoUrl: workingProject.segmentVideos?.[segmentLabel],
+          });
+        }
+      }
+
       const saved = await upsertStoredVideoProject(synchronizeVideoProductionState(workingProject));
       const savedManifest = saved.assetManifest ?? workingProject.assetManifest ?? null;
       const nextFocusId =
@@ -3058,6 +5367,10 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
                   memory: {
                     ...prev.currentProjectSnapshot.memory,
                     assetManifest: saved.assetManifest,
+                    automationState: saved.automationState ?? null,
+                    videoAuditPackets: saved.videoAuditPackets ?? [],
+                    videoRepairTasks: saved.videoRepairTasks ?? [],
+                    reviewQueue: saved.reviewQueue ?? [],
                   },
                 }
               : prev.currentProjectSnapshot,
@@ -3066,12 +5379,12 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
 
       if (nextFocusId && focusMessage) {
         setSidebarAssetFocus({ assetId: nextFocusId, message: focusMessage });
-        flashMaintenanceHint(focusMessage, 2400);
+        flashMaintenanceHint(focusMessage, 2200);
       }
     };
     window.addEventListener("agent:add-to-assets", handleAddToAssets);
     return () => window.removeEventListener("agent:add-to-assets", handleAddToAssets);
-  }, [flashMaintenanceHint, resolveAssetTargetFromLookup, setRuntime]);
+  }, [flashMaintenanceHint, refreshSegmentContinuityArtifactsInProject, resolveAssetTargetFromLookup, setRuntime]);
 
   // 浠庣礌鏉愬簱鍒犻櫎绱犳潗
   const handleDeleteAsset = useCallback((asset: import("@/components/home-agent/home-agent-sidebar-utils").SidebarAssetItem) => {
@@ -3110,16 +5423,17 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     void (async () => {
       const invalidIds: string[] = [];
       for (const item of manifest.items) {
+        if (!shouldAutoCleanupInvalidAsset(item)) {
+          continue;
+        }
         const url = item.url?.trim();
-        if (!url || isExpiredRemoteSignedMediaUrl(url)) {
+        if (!url || isExpiredRemoteSignedMediaUrl(url) || isKnownPlaceholderMediaUrl(url)) {
           invalidIds.push(item.id);
           continue;
         }
-        if (isLocalSidebarAssetUrl(url) && window.electronAPI?.storage?.readBase64) {
-          const result = await window.electronAPI.storage.readBase64(normalizeSidebarAssetPath(url));
-          if (result?.exists === false) {
-            invalidIds.push(item.id);
-          }
+        if (isLocalSidebarAssetUrl(url)) {
+          const missing = await isMediaAssetDefinitelyMissing(url);
+          if (missing) invalidIds.push(item.id);
         }
         if (
           item.kind === "video-segment" &&
@@ -3166,16 +5480,19 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   }, [flashMaintenanceHint, runtime.currentProjectSnapshot, runtime.currentVideoProject, setRuntime]);
 
   const {
-    resolveDreaminaCapability,
     send,
-    reset,
+    reset: runtimeReset,
     answer,
     handleTemplateLaunch,
     autoResearchChoiceHandler,
     handleFullAutoChoiceSelect,
+    handleFullAutoQuestionBack,
+    handleFullAutoQuestionReset,
     stopFullAutoExecution,
+    isAwaitingWorkflowDocumentUpload,
     stopActiveExecution,
   } = useHomeAgentRuntimeActions({
+    runtime,
     systemPrompt:
       creationMode === "creative"
         ? `${PROMPT}\n\n${ASSET_CREATION_PROMPT_OVERRIDE}\n\n${LLM_CONTROL_MODE_APPENDIX}`
@@ -3190,19 +5507,15 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     compactedMessageCountRef,
     surfacedTaskIdsRef,
     surfacedTaskFollowupIdsRef,
-    surfacedDreaminaHintRef,
     loadEngineDeps,
     loadApiConfigModule,
     loadStructuredQuestionParser,
     loadConversationMemoryModule,
     loadProjectStore,
     loadAskUserQuestionModule,
-    loadDreaminaCliModule,
     loadWorkflowActionsModule,
     flashMaintenanceHint,
     resetComposerDraft,
-    dreaminaCapability,
-    setDreaminaCapability,
     buildResearchPromptOverlay,
     createQuestionState,
     toQuery,
@@ -3224,7 +5537,10 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     setMetaReady,
     setActiveProjectId,
     setActiveWorkflowAction,
+    setFullAutoChecklistCollapsed,
     activeProjectId,
+    pendingWorkflowUploadKind,
+    setPendingWorkflowUploadKind,
     setDeferredDraft,
     lastSuggestedRef,
     backgroundResearchGroupsRef,
@@ -3233,6 +5549,9 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     selectedVideoModelKey,
     videoGenerationPrefs,
     restoreInterruptedChoiceQuestion,
+    setInterruptedChoiceQuestion,
+    requestScrollToBottom: requestScrollToBottomAfterQuickLaunch,
+    preferredVideoWorkflowSourceSnapshotRef,
   });
 
   const handleEditUserMessage = useCallback(
@@ -3315,7 +5634,14 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           setRuntime(nextRuntime);
         }
         if (nextSnapshot?.projectId) {
-          setActiveProjectId(nextSnapshot.projectId);
+          const nextSessionProjectId = resolveSessionProjectIdForSnapshot({
+            currentSessionProjectId: activeProjectId,
+            snapshot: nextSnapshot,
+            fallbackProjectId: nextSnapshot.projectId,
+          });
+          if (nextSessionProjectId) {
+            setActiveProjectId(nextSessionProjectId);
+          }
           const nextArtifactIdsForField = new Set(
             nextSnapshot.artifacts
               .filter((artifact) => artifact.editor?.field === field)
@@ -3358,7 +5684,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         throw error;
       }
     },
-    [flashMaintenanceHint, loadWorkflowActionsModule, setActiveProjectId, setRuntime],
+    [activeProjectId, flashMaintenanceHint, loadWorkflowActionsModule, setActiveProjectId, setRuntime],
   );
 
   const handleRelationshipDiagramCollapsedChange = useCallback(
@@ -3376,9 +5702,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         startTransition(() => {
           setRuntime((prev) => {
             const nextSnapshot = updated.projectSnapshot;
-            const nextRecentProjects = sortConversationSnapshots(
-              [nextSnapshot, ...prev.recentProjects.filter((item) => item.projectId !== nextSnapshot.projectId)],
-            );
+            const nextRecentProjects = mergeRecentProjects(prev.recentProjects, nextSnapshot);
 
             return {
               ...prev,
@@ -3470,11 +5794,10 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         if (url.startsWith("data:") || url.startsWith("http://") || url.startsWith("https://")) {
           previewUrl = url;
         } else if (isLocalSidebarAssetUrl(url)) {
-          const normalizedPath = normalizeSidebarAssetPath(url);
-          const result = await window.electronAPI?.storage?.readBase64?.(normalizedPath);
-          if (result?.ok && result?.base64) {
-            previewUrl = `data:${result.mimeType || "image/jpeg"};base64,${result.base64}`;
-            mimeType = result.mimeType || mimeType;
+          previewUrl = (await resolveLocalMediaPreviewDataUrl(url)) || undefined;
+          if (previewUrl?.startsWith("data:")) {
+            const match = previewUrl.match(/^data:([^;]+);base64,/);
+            if (match?.[1]) mimeType = match[1];
           }
         }
         const derivedName = decodeMediaFileName(url.split(/[\\/]/).pop()?.replace(/\?.*$/, "") || "");
@@ -3575,11 +5898,20 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       const list = messagesRef.current;
       const idx = list.findIndex((m) => m.id === assistantMessageId);
       if (idx === -1 || list[idx]?.role !== "assistant") return;
+      const workflowRefresh = list[idx]?.workflowRefresh;
 
       if (attachmentId) {
         const message = list[idx];
         const attachment = message.attachments?.find((item) => item.id === attachmentId);
         if (!attachment) return;
+        const guardKey = `${assistantMessageId}:${attachmentId}`;
+        const existingGuardController = inlineAttachmentGuardAbortControllersRef.current.get(guardKey);
+        if (existingGuardController) {
+          existingGuardController.abort();
+          inlineAttachmentGuardAbortControllersRef.current.delete(guardKey);
+          flashMaintenanceHint("已撤回这次重生成。", 2200);
+          return;
+        }
 
         const target = resolveInlineAttachmentTarget(attachment);
         if (!target) {
@@ -3591,7 +5923,6 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           return;
         }
 
-        const workflow = await loadWorkflowActionsModule();
         const normalizedImagePrefs = normalizeVideoImageGenerationPrefs({
           ...imageGenerationPrefs,
           familyKey: selectedImageModelFamily,
@@ -3602,14 +5933,21 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         });
         const applyWorkflowResult = (
           currentRuntime: StudioRuntimeState,
-          result: Awaited<ReturnType<typeof workflow.runWorkflowAction>>,
+          result: Awaited<
+            ReturnType<(Awaited<ReturnType<typeof loadWorkflowActionsModule>>)["runWorkflowAction"]>
+          >,
         ) => {
           if (!result.data) return currentRuntime;
           const nextRuntime = mergeRuntimeWithWorkflowDelta(currentRuntime, result.data);
           startTransition(() => {
             setRuntime(nextRuntime);
-            if (nextRuntime.currentProjectSnapshot?.projectId) {
-              setActiveProjectId(nextRuntime.currentProjectSnapshot.projectId);
+            const nextSessionProjectId = resolveSessionProjectIdForSnapshot({
+              currentSessionProjectId: activeProjectId,
+              snapshot: nextRuntime.currentProjectSnapshot,
+              fallbackProjectId: nextRuntime.currentProjectSnapshot?.projectId,
+            });
+            if (nextSessionProjectId) {
+              setActiveProjectId(nextSessionProjectId);
             }
           });
           return nextRuntime;
@@ -3654,9 +5992,21 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           }
           return "";
         };
+        const guardController = new AbortController();
+        inlineAttachmentGuardAbortControllersRef.current.set(guardKey, guardController);
+        if (INLINE_MEDIA_REGENERATE_GUARD_DELAY_MS > 0) {
+          const guardSeconds = Math.max(1, Math.ceil(INLINE_MEDIA_REGENERATE_GUARD_DELAY_MS / 1000));
+          flashMaintenanceHint(
+            `已进入 ${guardSeconds} 秒防误触保护，再点一次同一张素材可撤回。`,
+            INLINE_MEDIA_REGENERATE_GUARD_DELAY_MS + 200,
+          );
+        }
 
-        setInlineAttachmentPending(assistantMessageId, attachmentId, true);
         try {
+          await waitForAbortableDelay(INLINE_MEDIA_REGENERATE_GUARD_DELAY_MS, guardController.signal);
+          inlineAttachmentGuardAbortControllersRef.current.delete(guardKey);
+          const workflow = await loadWorkflowActionsModule();
+          setInlineAttachmentPending(assistantMessageId, attachmentId, true);
           let nextRuntime = runtimeRef.current;
           if (target.action === "generate_video_assets") {
             nextRuntime = applyWorkflowResult(
@@ -3670,6 +6020,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
                   selectedVideoModelKey: normalizedVideoPrefs.modelKey,
                   videoModelKey: normalizedVideoPrefs.modelKey,
                   videoGenerationPrefs: normalizedVideoPrefs,
+                  abortSignal: guardController.signal,
                 },
                 nextRuntime,
               ),
@@ -3700,6 +6051,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
                   selectedVideoModelKey: normalizedVideoPrefs.modelKey,
                   videoModelKey: normalizedVideoPrefs.modelKey,
                   videoGenerationPrefs: normalizedVideoPrefs,
+                  abortSignal: guardController.signal,
                 },
                 nextRuntime,
               ),
@@ -3735,6 +6087,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
                 imageGenerationPrefs: normalizedImagePrefs,
                 aspectRatio: normalizedImagePrefs.aspectRatio,
                 resolution: normalizedImagePrefs.resolution,
+                abortSignal: guardController.signal,
               },
               nextRuntime,
             );
@@ -3764,8 +6117,70 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           }
         } catch (error) {
           setInlineAttachmentPending(assistantMessageId, attachmentId, false);
+          if (error instanceof Error && error.name === "AbortError") {
+            return;
+          }
           flashMaintenanceHint(error instanceof Error ? error.message : "鍘熷湴閲嶆柊鐢熸垚澶辫触", 2800);
+        } finally {
+          inlineAttachmentGuardAbortControllersRef.current.delete(guardKey);
         }
+        return;
+      }
+
+      if (workflowRefresh && idx === list.length - 1) {
+        const pendingRequestId = qState?.request.id;
+        if (pendingRequestId) {
+          try {
+            const mod = await loadAskUserQuestionModule();
+            mod.rejectAskUserQuestion(pendingRequestId, "User regenerated workflow response");
+          } catch {
+            /* ignore */
+          }
+        }
+
+        const restoreQuestion = runtimeRef.current.currentProjectSnapshot
+          ? recQuestion(runtimeRef.current.currentProjectSnapshot, runtimeRef.current.currentVideoProject)
+          : null;
+
+        flushSync(() => {
+          setStreaming(false);
+          setMessages((prev) => {
+            const i = prev.findIndex((m) => m.id === assistantMessageId);
+            if (i === -1 || prev[i].role !== "assistant") return prev;
+            const next = prev.slice(0, i);
+            messagesRef.current = next;
+            return next;
+          });
+          compactedMessageCountRef.current = 0;
+          setCompactedMessageCount(0);
+          setQState(null);
+          setPopoverOverride(null);
+          setSuggested(null);
+          setSelectedValues([]);
+        });
+
+        if (workflowRefresh.mode === "shortcut") {
+          workflowRefreshShortcutRunnerRef.current?.(
+            workflowRefresh.action,
+            workflowRefresh.input,
+            workflowRefresh.userBubble,
+            {
+              restoreQuestionOnInterrupt: restoreQuestion,
+              restoreQuestionOnCancel: restoreQuestion,
+              restoreQuestionOnError: restoreQuestion,
+              restoreQuestionAfterRun: restoreQuestion,
+              skipUserBubble: true,
+            },
+          );
+          return;
+        }
+
+        workflowRefreshShortcutChainRunnerRef.current?.(workflowRefresh.steps, workflowRefresh.userBubble, {
+          restoreQuestionOnInterrupt: restoreQuestion,
+          restoreQuestionOnError: restoreQuestion,
+          restoreQuestionAfterRun: restoreQuestion,
+          skipUserBubble: true,
+        });
         return;
       }
 
@@ -3808,6 +6223,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       await send(userContent, userContent, { skipUserBubble: true });
     },
     [
+      activeProjectId,
       loadAskUserQuestionModule,
       loadWorkflowActionsModule,
       imageGenerationPrefs,
@@ -3845,38 +6261,6 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     [send],
   );
 
-  const handleJimengExecutionModeChange = useCallback(
-    async (nextMode: JimengExecutionMode) => {
-      try {
-        const apiConfig = await loadApiConfigModule();
-        apiConfig.saveApiConfig({ jimengExecutionMode: nextMode });
-        setJimengExecutionMode(nextMode);
-        setSuppressedLaunchNoticeKey(null);
-
-        if (nextMode === "cli") {
-          const capability = await resolveDreaminaCapability();
-          await refreshLaunchReadiness();
-          flashMaintenanceHint(
-            capability.available
-              ? "已切到 Dreamina CLI，后续视频默认走本机登录态。"
-              : "已切到 Dreamina CLI，但当前本机还未就绪。",
-            2600,
-          );
-          return;
-        }
-
-        await refreshLaunchReadiness();
-        flashMaintenanceHint("宸插垏鍒?Seedance API锛屽悗缁棰戦粯璁よ蛋 API", 2400);
-      } catch (error) {
-        flashMaintenanceHint(
-          error instanceof Error ? error.message : "鍒囨崲瑙嗛杩愯閫氶亾澶辫触",
-          2600,
-        );
-      }
-    },
-    [flashMaintenanceHint, loadApiConfigModule, refreshLaunchReadiness, resolveDreaminaCapability],
-  );
-
   const launchNoticeKey = useMemo(() => {
     const notice = launchReadiness?.notice;
     if (!notice) return null;
@@ -3902,11 +6286,11 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     }
 
     return {
-      label: jimengExecutionMode === "cli" ? "褰撳墠閫夋嫨 CLI" : "褰撳墠瀹為檯璧?API",
-      detail: jimengExecutionMode === "cli" ? "Dreamina 鐘舵€佹鏌ヤ腑" : "Seedance API",
+      label: "褰撳墠瀹為檯璧?API",
+      detail: "Seedance API",
       tone: "neutral" as const,
     };
-  }, [currentProject, deferredProjectSnapshot, jimengExecutionMode, launchReadiness?.video]);
+  }, [currentProject, deferredProjectSnapshot, launchReadiness?.video]);
 
   useHomeAgentBootstrapEffects({
     runtime,
@@ -3915,21 +6299,19 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     messages,
     compactedMessageCount,
     desktopSidebarCollapsed,
-    dreaminaCapability,
     maintenanceHintTimerRef,
     draftPersistTimerRef,
     messagesRef,
     compactedMessageCountRef,
     surfacedTaskIdsRef,
     surfacedTaskFollowupIdsRef,
-    surfacedDreaminaHintRef,
     setRuntime,
     setRecentProjectsReady,
     setMetaReady,
     setActiveProjectId,
+    activeProjectId,
     setTasks,
     loadProjectStore,
-    resolveDreaminaCapability,
     flashMaintenanceHint,
     scheduleBackgroundTask,
     areProjectSnapshotsEquivalent,
@@ -3954,13 +6336,18 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     setMode,
     qState,
     deferredQuestionState,
+    pendingWorkflowUploadKind,
+    question,
     popoverOverride,
+    interruptedChoiceQuestion,
     suggested,
-    suppressVideoWorkflowSuggestions: awaitingVideoKickoffStyleReferenceUpload,
+    suppressVideoWorkflowSuggestions:
+      awaitingVideoKickoffStyleReferenceUpload || awaitingCharacterAudioReferenceUpload,
     draftPresence,
     persistedDraft,
     deferredDraft,
     recentSessionSummary,
+    fullAutoChecklistCollapsed,
     selectedValues,
     deferredSelectedValues,
     selectedTextModelKey,
@@ -3973,6 +6360,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     visibleTasks,
     engineRef,
     runtimeRef,
+    projectHydrationInFlightRef,
     draftRef,
     previousQuestionStepRef,
     surfacedTaskIdsRef,
@@ -4012,6 +6400,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     if (
       streaming ||
       qState ||
+      pendingWorkflowUploadKind ||
       popoverOverride ||
       !deferredQuestionState ||
       dismissedDeferredQuestionStepRef.current === deferredQuestionStepKey
@@ -4028,10 +6417,12 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     setDeferredQuestionState(null);
     setDeferredSelectedValues([]);
     setDeferredDraft("");
+    setPendingDeferredQuestionRestoreAfterAssistantReply(null);
   }, [
     deferredDraft,
     deferredQuestionState,
     deferredSelectedValues,
+    pendingWorkflowUploadKind,
     popoverOverride,
     qState,
     resetComposerDraft,
@@ -4045,27 +6436,282 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   useEffect(() => {
     const wasStreaming = prevStreamingRef.current;
     prevStreamingRef.current = streaming;
+    const deferredQuestionStepKey = deferredQuestionState
+      ? `${deferredQuestionState.request.id}:${deferredQuestionState.currentIndex}`
+      : null;
+    if (
+      wasStreaming &&
+      !streaming &&
+      !qState &&
+      !pendingWorkflowUploadKind &&
+      !popoverOverride &&
+      deferredQuestionState &&
+      dismissedDeferredQuestionStepRef.current === deferredQuestionStepKey
+    ) {
+      // A deferred structured question was intentionally hidden while the freeform
+      // detour streamed. Once streaming settles, bring that same question back.
+      dismissedDeferredQuestionStepRef.current = null;
+      setQState({
+        ...deferredQuestionState,
+        source: "deferred",
+      });
+      setSelectedValues(deferredSelectedValues);
+      resetComposerDraft(deferredDraft);
+      setDeferredQuestionState(null);
+      setDeferredSelectedValues([]);
+      setDeferredDraft("");
+      setPendingDeferredQuestionRestoreAfterAssistantReply(null);
+    }
     const currentProjectId = runtime.currentProjectSnapshot?.projectId ?? activeProjectId;
-    if (wasStreaming && !streaming && currentProjectId) {
+    if (wasStreaming && !streaming && (currentProjectId || messagesRef.current.length > 0)) {
       flushSessionRef.current();
     }
-  }, [streaming, activeProjectId, runtime.currentProjectSnapshot?.projectId]);
+  }, [
+    activeProjectId,
+    deferredDraft,
+    deferredQuestionState,
+    deferredSelectedValues,
+    pendingWorkflowUploadKind,
+    popoverOverride,
+    qState,
+    resetComposerDraft,
+    runtime.currentProjectSnapshot?.projectId,
+    setQState,
+    setSelectedValues,
+    streaming,
+  ]);
+
+  useEffect(() => {
+    if (streaming) return;
+    const currentSnapshot = runtime.currentProjectSnapshot;
+    if (!currentSnapshot?.projectId) return;
+    if (staleProjectIdsRef.current.has(currentSnapshot.projectId)) return;
+    if (hasSessionResetMarkerForProject(currentSnapshot.projectId)) return;
+
+    startTransition(() => {
+      setRuntime((prev) => {
+        const nextSnapshot = prev.currentProjectSnapshot;
+        if (!nextSnapshot?.projectId) return prev;
+        if (staleProjectIdsRef.current.has(nextSnapshot.projectId)) return prev;
+        if (hasSessionResetMarkerForProject(nextSnapshot.projectId)) return prev;
+        const nextRecentProjects = replacePlaceholderRecentProject({
+          recentProjects: prev.recentProjects,
+          previousSnapshot: null,
+          nextSnapshot,
+          pruneStaleFullAutoPlaceholders: false,
+        });
+        if (nextRecentProjects === prev.recentProjects) return prev;
+        return {
+          ...prev,
+          recentProjects: nextRecentProjects,
+        };
+      });
+    });
+  }, [runtime.currentProjectSnapshot, runtime.recentProjects, setRuntime, streaming]);
+
+  useEffect(() => {
+    if (idle) return;
+    const currentSnapshot = runtime.currentProjectSnapshot;
+    // 当视频项目接管剧本项目时，使用剧本项目 ID 作为会话 projectId，保持单一会话壳
+    const isVideoTakingOverScript =
+      currentSnapshot?.projectKind === "video" &&
+      currentSnapshot.sourceProjectId?.trim() &&
+      currentSnapshot.sourceProjectId.trim() === activeProjectId;
+    const projectId = isVideoTakingOverScript
+      ? activeProjectId
+      : (activeProjectId ?? currentSnapshot?.projectId);
+    if (!projectId || !currentSnapshot) return;
+    if (!isVideoTakingOverScript && currentSnapshot.projectId !== projectId) return;
+    if (staleProjectIdsRef.current.has(projectId)) return;
+
+    const sessionPreview: StudioSessionState = {
+      sessionId: runtime.sessionId,
+      mode,
+      creationMode,
+      automationMode: normalizeAutomationMode(currentSnapshot.automationMode ?? automationMode),
+      devMode,
+      messages: [],
+      currentProjectSnapshot: {
+        ...currentSnapshot,
+        automationMode: normalizeAutomationMode(currentSnapshot.automationMode ?? automationMode),
+      },
+      recentMessageSummary: runtime.recentMessageSummary,
+      projectId,
+      compactedMessageCount,
+      fullAutoRun: runtime.fullAutoRun ?? null,
+      fullAutoChecklistCollapsed,
+    };
+
+    startTransition(() => {
+      setRuntime((prev) => {
+        const nextSessions = upsertRecentProjectSession(prev.recentProjectSessions, sessionPreview);
+        return areRecentSessionsEquivalent(nextSessions, prev.recentProjectSessions)
+          ? prev
+          : {
+              ...prev,
+              recentProjectSessions: nextSessions,
+            };
+      });
+    });
+  }, [
+    activeProjectId,
+    automationMode,
+    compactedMessageCount,
+    creationMode,
+    devMode,
+    idle,
+    mode,
+    runtime.currentProjectSnapshot,
+    runtime.fullAutoRun,
+    fullAutoChecklistCollapsed,
+    runtime.recentMessageSummary,
+    runtime.sessionId,
+    setRuntime,
+  ]);
+
+  useEffect(() => {
+    if (
+      streaming ||
+      qState ||
+      deferredQuestionState ||
+      pendingWorkflowUploadKind ||
+      popoverOverride ||
+      !pendingWorkflowPopoverAfterAssistantReply
+    ) {
+      return;
+    }
+
+    const currentProjectId = runtime.currentProjectSnapshot?.projectId ?? activeProjectId ?? null;
+    if (
+      pendingWorkflowPopoverAfterAssistantReply.projectId &&
+      currentProjectId &&
+      pendingWorkflowPopoverAfterAssistantReply.projectId !== currentProjectId
+    ) {
+      setPendingWorkflowPopoverAfterAssistantReply(null);
+      return;
+    }
+
+    const latestCompletedAssistantMessage =
+      [...messages]
+        .reverse()
+        .find((message) => message.role === "assistant" && message.status === "complete") ?? null;
+    if (
+      !latestCompletedAssistantMessage ||
+      latestCompletedAssistantMessage.id ===
+        pendingWorkflowPopoverAfterAssistantReply.lastAssistantMessageId
+    ) {
+      return;
+    }
+
+    if (openWorkflowPopoverQuestion(pendingWorkflowPopoverAfterAssistantReply.question)) {
+      setPendingWorkflowPopoverAfterAssistantReply(null);
+    }
+  }, [
+    activeProjectId,
+    deferredQuestionState,
+    messages,
+    openWorkflowPopoverQuestion,
+    pendingWorkflowUploadKind,
+    pendingWorkflowPopoverAfterAssistantReply,
+    popoverOverride,
+    qState,
+    runtime.currentProjectSnapshot?.projectId,
+    streaming,
+  ]);
+
+  useEffect(() => {
+    if (
+      streaming ||
+      qState ||
+      pendingWorkflowUploadKind ||
+      popoverOverride ||
+      !deferredQuestionState ||
+      !pendingDeferredQuestionRestoreAfterAssistantReply
+    ) {
+      return;
+    }
+
+    const currentProjectId = runtime.currentProjectSnapshot?.projectId ?? activeProjectId ?? null;
+    if (
+      pendingDeferredQuestionRestoreAfterAssistantReply.projectId &&
+      currentProjectId &&
+      pendingDeferredQuestionRestoreAfterAssistantReply.projectId !== currentProjectId
+    ) {
+      setPendingDeferredQuestionRestoreAfterAssistantReply(null);
+      return;
+    }
+
+    const deferredQuestionStepKey = `${deferredQuestionState.request.id}:${deferredQuestionState.currentIndex}`;
+    if (
+      pendingDeferredQuestionRestoreAfterAssistantReply.stepKey !==
+      deferredQuestionStepKey
+    ) {
+      setPendingDeferredQuestionRestoreAfterAssistantReply(null);
+      return;
+    }
+
+    const latestCompletedAssistantMessage =
+      [...messages]
+        .reverse()
+        .find((message) => message.role === "assistant" && message.status === "complete") ?? null;
+    if (
+      !latestCompletedAssistantMessage ||
+      latestCompletedAssistantMessage.id ===
+        pendingDeferredQuestionRestoreAfterAssistantReply.lastAssistantMessageId
+    ) {
+      return;
+    }
+
+    dismissedDeferredQuestionStepRef.current = null;
+    setQState({
+      ...deferredQuestionState,
+      source: "deferred",
+    });
+    setSelectedValues(deferredSelectedValues);
+    resetComposerDraft(deferredDraft);
+    setDeferredQuestionState(null);
+    setDeferredSelectedValues([]);
+    setDeferredDraft("");
+    setPendingDeferredQuestionRestoreAfterAssistantReply(null);
+  }, [
+    activeProjectId,
+    deferredDraft,
+    deferredQuestionState,
+    deferredSelectedValues,
+    messages,
+    pendingDeferredQuestionRestoreAfterAssistantReply,
+    pendingWorkflowUploadKind,
+    popoverOverride,
+    qState,
+    resetComposerDraft,
+    runtime.currentProjectSnapshot?.projectId,
+    setQState,
+    setSelectedValues,
+    streaming,
+  ]);
 
   // 姣忔娓叉煋鏃舵洿鏂?flush 鍑芥暟锛岀‘淇濆垏鎹㈤」鐩墠鑳戒繚瀛樻渶鏂扮姸鎬?
   flushSessionRef.current = () => {
-    const currentProjectId = runtimeRef.current.currentProjectSnapshot?.projectId ?? activeProjectId;
+    const snapshot = runtimeRef.current.currentProjectSnapshot;
+    // 当视频项目接管剧本项目时（sourceProjectId === activeProjectId），
+    // 保持使用剧本项目 ID 作为保存键，确保消息历史不会分裂到两个会话
+    const isVideoTakingOverScript =
+      snapshot?.projectKind === "video" &&
+      snapshot.sourceProjectId?.trim() &&
+      snapshot.sourceProjectId.trim() === activeProjectId;
+    const currentProjectId =
+      (isVideoTakingOverScript ? activeProjectId : snapshot?.projectId) ??
+      activeProjectId ??
+      // 无项目的自由对话：用 sessionId 作为临时 projectId，确保切换时不丢失历史
+      (messagesRef.current.length > 0 ? runtimeRef.current.sessionId : undefined);
     if (!currentProjectId) return;
-    const pendingChoiceQuestion =
-      qState || deferredQuestionState
-        ? null
-        : (popoverOverride ?? suggested ?? null);
     writeStudioSession({
       sessionId: runtimeRef.current.sessionId,
       mode,
       creationMode,
       automationMode: normalizeAutomationMode(runtime.currentProjectSnapshot?.automationMode ?? automationMode),
       devMode,
-      messages,
+      messages: messagesRef.current,
       currentProjectSnapshot: runtime.currentProjectSnapshot
         ? {
             ...runtime.currentProjectSnapshot,
@@ -4080,10 +6726,12 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       selectedVideoModelKey,
       videoGenerationPrefs,
       compactedMessageCount,
-      draft: draftRef.current || persistedDraft,
+      draft: resolveComposerDraftSnapshot(draftRef.current, persistedDraft),
       qState,
       deferredQuestionState,
-      pendingChoiceQuestion,
+      pendingWorkflowUploadKind,
+      pendingChoiceQuestion: persistedVisibleChoiceQuestion,
+      interruptedChoiceQuestion: pendingWorkflowUploadKind ? null : interruptedChoiceQuestion,
       selectedValues,
       deferredSelectedValues,
       deferredDraft,
@@ -4091,7 +6739,8 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       surfacedTaskFollowupKeys: [...surfacedTaskFollowupIdsRef.current],
       surfacedProjectSuggestionKeys: [...surfacedProjectSuggestionKeysRef.current],
       fullAutoRun: runtime.fullAutoRun ?? null,
-    });
+      fullAutoChecklistCollapsed,
+    }, { persistFullBackup: false });
     // 鍚屾椂鎸佷箙鍖栧綋鍓嶅墽鏈」鐩紝闃叉鍒囨崲/鏂板缓鏃堕」鐩涪澶?
     const dramaProject = runtimeRef.current.currentDramaProject;
     if (dramaProject) {
@@ -4115,23 +6764,36 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
 
   const interruptWorkflowShortcutRef = useRef<() => void>(() => {});
 
-  const handleProjectSwitchInterrupt = useCallback(
-    (nextProjectId: string) => {
-      if (!activeProjectId || activeProjectId === nextProjectId) return;
-      if (!activeWorkflowAction) return;
-
+  const interruptCurrentSurfaceForIsolation = useCallback(
+    (options?: {
+      nextProjectId?: string | null;
+      persistRetryQuestion?: boolean;
+    }) => {
+      const nextProjectId = options?.nextProjectId?.trim() || null;
       const activeSnapshot = runtimeRef.current.currentProjectSnapshot;
       const retryQuestion =
-        activeWorkflowAction === "video:bridge:platform"
-          ? buildVideoBridgeRetryQuestion(activeSnapshot)
+        activeWorkflowAction
+          ? resolveInterruptedWorkflowQuestion({
+              explicitRestoreQuestion: interruptRestoreQuestionRef.current,
+              activeWorkflowAction,
+              snapshot: activeSnapshot,
+              videoProject: runtimeRef.current.currentVideoProject,
+            })
           : null;
 
       interruptRestoreQuestionRef.current = null;
+      setInterruptedChoiceQuestion(null);
       stopActiveExecution();
       interruptWorkflowShortcutRef.current();
       stopRunningTasks();
 
-      if (!retryQuestion) return;
+      if (!options?.persistRetryQuestion || !retryQuestion) return;
+
+      const currentSurfaceProjectId =
+        activeProjectId ??
+        (messagesRef.current.length > 0 ? runtimeRef.current.sessionId : null);
+      if (!currentSurfaceProjectId) return;
+      if (nextProjectId && activeProjectId && activeProjectId === nextProjectId) return;
 
       void writeProjectStudioSession({
         sessionId: runtimeRef.current.sessionId,
@@ -4139,7 +6801,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         creationMode,
         automationMode: normalizeAutomationMode(activeSnapshot?.automationMode ?? automationMode),
         devMode,
-        messages,
+        messages: messagesRef.current,
         currentProjectSnapshot: activeSnapshot
           ? {
               ...activeSnapshot,
@@ -4147,17 +6809,18 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
             }
           : null,
         recentMessageSummary: runtimeRef.current.recentMessageSummary,
-        projectId: activeProjectId,
+        projectId: currentSurfaceProjectId,
         selectedTextModelKey,
         selectedImageModelFamily,
         imageGenerationPrefs,
         selectedVideoModelKey,
         videoGenerationPrefs,
-        compactedMessageCount,
-        draft: draftRef.current || persistedDraft,
+        compactedMessageCount: compactedMessageCountRef.current,
+        draft: resolveComposerDraftSnapshot(draftRef.current, persistedDraft),
         qState: null,
         deferredQuestionState: null,
         pendingChoiceQuestion: retryQuestion,
+        interruptedChoiceQuestion: null,
         selectedValues: [],
         deferredSelectedValues: [],
         deferredDraft: "",
@@ -4165,18 +6828,20 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         surfacedTaskFollowupKeys: [...surfacedTaskFollowupIdsRef.current],
         surfacedProjectSuggestionKeys: [],
         fullAutoRun: runtimeRef.current.fullAutoRun ?? null,
+        fullAutoChecklistCollapsed,
       });
     },
     [
       activeProjectId,
       activeWorkflowAction,
-      compactedMessageCount,
+      automationMode,
       creationMode,
       devMode,
+      fullAutoChecklistCollapsed,
       imageGenerationPrefs,
-      messages,
       mode,
       persistedDraft,
+      qState,
       selectedImageModelFamily,
       selectedTextModelKey,
       selectedVideoModelKey,
@@ -4186,12 +6851,35 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     ],
   );
 
+  const handleProjectSwitchInterrupt = useCallback(
+    (nextProjectId: string) => {
+      interruptCurrentSurfaceForIsolation({
+        nextProjectId,
+        persistRetryQuestion: true,
+      });
+    },
+    [interruptCurrentSurfaceForIsolation],
+  );
+
+  const handleBeforeProjectOpen = useCallback(
+    (projectId: string) => {
+      // "New project" temporarily marks the previously active project as stale so its
+      // background deltas cannot bleed into the idle home surface. Once the user
+      // intentionally re-opens that history item, it is no longer stale.
+      staleProjectIdsRef.current.delete(projectId);
+      handleProjectSwitchInterrupt(projectId);
+    },
+    [handleProjectSwitchInterrupt],
+  );
+
   const { openProject, cancelPendingProjectOpen } = useHomeAgentRecoveryFlow({
     handoffRef,
     engineRef,
+    runtimeRef,
+    projectHydrationInFlightRef,
     loadProjectStore,
     flushSessionRef,
-    beforeProjectOpen: handleProjectSwitchInterrupt,
+    beforeProjectOpen: handleBeforeProjectOpen,
     setCreationMode,
     setAutomationMode,
     setDevMode,
@@ -4203,10 +6891,13 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     setVideoGenerationPrefs,
     setQState,
     setDeferredQuestionState,
+    setPendingWorkflowUploadKind,
     setPopoverOverride,
+    setInterruptedChoiceQuestion,
     setSuggested,
     setSelectedValues,
     setDeferredSelectedValues,
+    setFullAutoChecklistCollapsed,
     setStreaming,
     setMode,
     setMessages,
@@ -4214,6 +6905,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     setRuntime,
     setMetaReady,
     resetComposerDraft,
+    getComposerDraftSnapshot: () => resolveComposerDraftSnapshot(draftRef.current, persistedDraft),
     setDeferredDraft,
     previousQuestionStepRef,
     clearSurfacedTasks: () => {
@@ -4227,14 +6919,29 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     restoredTaskFollowupSuppressionRef,
     surfacedProjectSuggestionKeysRef,
     restoredProjectSuggestionKeysRef,
-    dreaminaCapability,
-    flashMaintenanceHint,
-    surfacedDreaminaHintRef,
     send,
     createQuestionState,
     mk,
     mergeRecentProjects,
   });
+
+  const strongReset = useCallback(
+    (nextMode?: AutomationMode) => {
+      cancelPendingProjectOpen();
+      flushSessionRef.current();
+      interruptCurrentSurfaceForIsolation({ persistRetryQuestion: true });
+      runtimeReset();
+      if (nextMode) {
+        setAutomationMode(nextMode);
+      }
+    },
+    [
+      cancelPendingProjectOpen,
+      interruptCurrentSurfaceForIsolation,
+      runtimeReset,
+      setAutomationMode,
+    ],
+  );
 
   const {
     handleOpenProject,
@@ -4248,7 +6955,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     handleCloseSettings,
   } = useHomeAgentShellHandlers({
     openProject,
-    reset,
+    reset: strongReset,
     utilityPanel,
     setMobileNavOpen,
     setTasks,
@@ -4257,19 +6964,10 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     areTaskListsEquivalent,
   });
 
-  // 鏂囦欢绯荤粺浼氳瘽鎭㈠锛氬綋 localStorage 涓虹┖鏃讹紙濡傞厤棰濊秴鍑哄悗鏁版嵁琚竻闄わ級锛屼粠鏂囦欢绯荤粺鍔犺浇涓婃浼氳瘽
-  useEffect(() => {
-    if (seedRef.current?.session) return; // localStorage 宸叉湁鏁版嵁锛屾棤闇€鎭㈠
-    void import("@/lib/home-agent/session-store").then(async ({ readLastSessionFromFile, writeStudioSession: writeSession, readSessionResetMarker }) => {
-      const fileSession = await readLastSessionFromFile();
-      if (!fileSession?.projectId) return;
-      // 鑻ヨ椤圭洰琚富鍔ㄦ竻闄よ繃锛岃烦杩囨仮澶嶏紝闃叉鍒锋柊鍚庡巻鍙查噸鏂拌烦鍑?
-      if (fileSession.projectId === readSessionResetMarker()) return;
-      // 灏嗘枃浠剁郴缁熶腑鐨勫畬鏁翠細璇濆啓鍥?localStorage锛屽啀閫氳繃 openProject 鎭㈠ UI 鐘舵€?
-      writeSession(fileSession);
-      void openProject(fileSession.projectId);
-    });
-  }, [openProject]);
+  const { suppressAutoRestore } = useHomeAgentLastSessionRecovery({
+    hasSeedSession: Boolean(seedRef.current?.session),
+    openProject,
+  });
 
   const handleRefreshProjects = useCallback(async () => {
     setIsRefreshingProjects(true);
@@ -4277,13 +6975,18 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       const store = await loadProjectStore();
       const { pruneHistoryIfNeeded } = await import("@/lib/home-agent/project-store");
       await pruneHistoryIfNeeded();
-      const items = await store.listRecentConversationSnapshots(50);
-      const { readProjectSessionFromFile } = await import("@/lib/home-agent/session-store");
-      const sessions = (
-        await Promise.all(items.map((snapshot) => readProjectSessionFromFile(snapshot.projectId)))
-      ).filter((s): s is NonNullable<typeof s> => Boolean(s));
+      const items = filterRecentlyDeletedProjectSnapshots(
+        await store.listRecentConversationSnapshots(HOME_RECENT_PROJECTS_LIMIT, { fast: true }),
+      );
+      const projectIdSet = new Set(items.map((snapshot) => snapshot.projectId));
       React.startTransition(() => {
-        setRuntime((prev) => ({ ...prev, recentProjects: items, recentProjectSessions: sessions }));
+        setRuntime((prev) => ({
+          ...prev,
+          recentProjects: reconcileRecentProjectsWithStableOrder(prev.recentProjects, items),
+          recentProjectSessions: (prev.recentProjectSessions ?? []).filter(
+            (session) => session.projectId && projectIdSet.has(session.projectId),
+          ),
+        }));
         setRecentProjectsReady(true);
       });
     } catch {
@@ -4291,7 +6994,97 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     } finally {
       setIsRefreshingProjects(false);
     }
-  }, [loadProjectStore, setRuntime]);
+  }, [filterRecentlyDeletedProjectSnapshots, loadProjectStore, setRuntime]);
+
+  useEffect(() => {
+    const targetMode = pendingHomepageIsolationModeRef.current;
+    if (!targetMode || !recentProjectsReady) return;
+
+    const currentSnapshot = runtimeRef.current.currentProjectSnapshot;
+    const nextProject = selectRecentProjectForAutomationMode({
+      recentProjects: runtimeRef.current.recentProjects,
+      recentProjectSessions: runtimeRef.current.recentProjectSessions,
+      currentProjectSnapshot: runtimeRef.current.currentProjectSnapshot,
+      currentSessionProjectId: activeProjectId,
+      mode: targetMode,
+      preferredProjectId: rememberedProjectIdsByModeRef.current[targetMode],
+    });
+    pendingHomepageIsolationModeRef.current = null;
+
+    if (nextProject?.projectId) {
+      rememberedProjectIdsByModeRef.current = rememberProjectForAutomationMode(
+        rememberedProjectIdsByModeRef.current,
+        nextProject,
+      );
+    }
+    const isolationAction = resolveModeIsolationAction({
+      currentSnapshot,
+      targetMode,
+      nextProjectId: nextProject?.projectId,
+      activeProjectId,
+      hasMessages: messagesRef.current.length > 0,
+      hasDraft: Boolean(draftRef.current.trim()),
+      mode,
+    });
+
+    if (isolationAction.type === "open-project" && isolationAction.projectId) {
+      void openProject(isolationAction.projectId);
+      return;
+    }
+    if (isolationAction.type === "reset-home") {
+      strongReset(targetMode);
+      return;
+    }
+    setAutomationMode(targetMode);
+  }, [
+    activeProjectId,
+    homepageIsolationRequestEpoch,
+    mode,
+    openProject,
+    recentProjectsReady,
+    runtime.recentProjects,
+    setAutomationMode,
+    strongReset,
+  ]);
+
+  useEffect(() => {
+    const currentSnapshot = runtime.currentProjectSnapshot;
+    if (!currentSnapshot?.projectId) return;
+    if (!projectMatchesAutomationMode(currentSnapshot, historyAutomationMode)) return;
+
+    const refreshKey = `${historyAutomationMode}:${currentSnapshot.projectId}`;
+    if (lastIsolationHistoryRefreshKeyRef.current === refreshKey) return;
+    lastIsolationHistoryRefreshKeyRef.current = refreshKey;
+
+    let cancelled = false;
+    void loadProjectStore()
+      .then((store) => store.listRecentConversationSnapshots(HOME_RECENT_PROJECTS_LIMIT, { fast: true }))
+      .then((items) => {
+        if (cancelled) return;
+        const filteredItems = filterRecentlyDeletedProjectSnapshots(items);
+        React.startTransition(() => {
+          setRuntime((prev) => {
+            const shouldPreserveRicherList =
+              filteredItems.length > 0 &&
+              prev.recentProjects.length > filteredItems.length &&
+              filteredItems.every((item) => prev.recentProjects.some((project) => project.projectId === item.projectId));
+            const nextRecentProjects = reconcileRecentProjectsWithStableOrder(
+              prev.recentProjects,
+              filteredItems,
+            );
+            if (shouldPreserveRicherList || areProjectSnapshotsEquivalent(nextRecentProjects, prev.recentProjects)) {
+              return prev;
+            }
+            return { ...prev, recentProjects: nextRecentProjects };
+          });
+        });
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [filterRecentlyDeletedProjectSnapshots, historyAutomationMode, loadProjectStore, runtime.currentProjectSnapshot, setRuntime]);
 
   const buildCurrentProjectSessionForExport = useCallback(
     (snapshot: ConversationProjectSnapshot): StudioSessionState | null => {
@@ -4312,21 +7105,21 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         selectedVideoModelKey,
         videoGenerationPrefs,
         compactedMessageCount,
-        draft: draftRef.current || persistedDraft,
+        draft: resolveComposerDraftSnapshot(draftRef.current, persistedDraft),
         qState,
         deferredQuestionState,
-        pendingChoiceQuestion:
-          qState || deferredQuestionState
-            ? null
-            : (popoverOverride ?? suggested ?? null),
+        pendingWorkflowUploadKind,
+        pendingChoiceQuestion: persistedVisibleChoiceQuestion,
+        interruptedChoiceQuestion: pendingWorkflowUploadKind ? null : interruptedChoiceQuestion,
         selectedValues,
         deferredSelectedValues,
-        deferredDraft,
-        surfacedTaskIds: [...surfacedTaskIdsRef.current],
-        surfacedTaskFollowupKeys: [...surfacedTaskFollowupIdsRef.current],
-        surfacedProjectSuggestionKeys: [...surfacedProjectSuggestionKeysRef.current],
-      };
-    },
+      deferredDraft,
+      surfacedTaskIds: [...surfacedTaskIdsRef.current],
+      surfacedTaskFollowupKeys: [...surfacedTaskFollowupIdsRef.current],
+      surfacedProjectSuggestionKeys: [...surfacedProjectSuggestionKeysRef.current],
+      fullAutoChecklistCollapsed,
+    };
+  },
     [
       activeProjectId,
       creationMode,
@@ -4336,18 +7129,20 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       deferredQuestionState,
       deferredSelectedValues,
       imageGenerationPrefs,
+      interruptedChoiceQuestion,
+      pendingWorkflowUploadKind,
       messages,
       mode,
       persistedDraft,
-      popoverOverride,
+      persistedVisibleChoiceQuestion,
       qState,
       runtime,
       selectedImageModelFamily,
       selectedTextModelKey,
       selectedValues,
       selectedVideoModelKey,
-      suggested,
       videoGenerationPrefs,
+      fullAutoChecklistCollapsed,
     ],
   );
 
@@ -4483,7 +7278,11 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         currentProjectSnapshot: updatedSnapshot,
       };
 
-      writeStudioSession(replacedSession);
+      if (activeProjectId === snapshot.projectId) {
+        writeStudioSession(replacedSession);
+      } else {
+        await writeProjectStudioSession(replacedSession);
+      }
 
       if (imported.dramaProject) {
         const { upsertStoredDramaProject } = await import("@/lib/home-agent/project-store");
@@ -4508,16 +7307,24 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           ...runtimeRef.current,
           currentProjectSnapshot: updatedSnapshot,
           ...(imported.dramaProject ? { currentDramaProject: { ...imported.dramaProject, id: snapshot.projectId } } : {}),
-          recentProjectSessions: [
+          recentProjectSessions: upsertRecentProjectSession(
+            runtimeRef.current.recentProjectSessions,
             replacedSession,
-            ...(runtimeRef.current.recentProjectSessions ?? []).filter((item) => item.projectId !== snapshot.projectId),
-          ],
+          ),
         };
         startTransition(() => {
+          const replacedPendingWorkflowUploadKind = resolvePendingWorkflowUploadKind(replacedSession);
+          setFullAutoChecklistCollapsed(replacedSession.fullAutoChecklistCollapsed ?? true);
           setMessages(replacedSession.messages);
           setMode(replacedSession.mode === "recovering" || replacedSession.mode === "maintenance-review" ? replacedSession.mode : "active");
           setQState(replacedSession.qState ?? null);
           setDeferredQuestionState(replacedSession.deferredQuestionState ?? null);
+          setPendingWorkflowUploadKind(replacedPendingWorkflowUploadKind);
+          setInterruptedChoiceQuestion(
+            replacedPendingWorkflowUploadKind
+              ? null
+              : (replacedSession.interruptedChoiceQuestion ?? null),
+          );
           setSelectedValues(replacedSession.selectedValues ?? []);
           setDeferredSelectedValues(replacedSession.deferredSelectedValues ?? []);
           setCompactedMessageCount(replacedSession.compactedMessageCount ?? 0);
@@ -4528,10 +7335,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
             recentProjects: prev.recentProjects.map((item) =>
               item.projectId === snapshot.projectId ? updatedSnapshot : item,
             ),
-            recentProjectSessions: [
-              replacedSession,
-              ...(prev.recentProjectSessions ?? []).filter((item) => item.projectId !== snapshot.projectId),
-            ],
+            recentProjectSessions: upsertRecentProjectSession(prev.recentProjectSessions, replacedSession),
           }));
         });
         setDeferredDraft(replacedSession.deferredDraft ?? "");
@@ -4543,10 +7347,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
             recentProjects: prev.recentProjects.map((item) =>
               item.projectId === snapshot.projectId ? updatedSnapshot : item,
             ),
-            recentProjectSessions: [
-              replacedSession,
-              ...(prev.recentProjectSessions ?? []).filter((item) => item.projectId !== snapshot.projectId),
-            ],
+            recentProjectSessions: upsertRecentProjectSession(prev.recentProjectSessions, replacedSession),
           }));
         });
       }
@@ -4665,8 +7466,8 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
 
   const performDeleteProject = useCallback(
     async (snapshot: ConversationProjectSnapshot) => {
-      const others = runtimeRef.current.recentProjects.filter((p) => p.projectId !== snapshot.projectId);
       const wasActive = activeProjectId === snapshot.projectId;
+      let remainingProjectsFromStore: ConversationProjectSnapshot[] = [];
 
       if (wasActive) {
         cancelPendingProjectOpen();
@@ -4683,6 +7484,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         surfacedProjectSuggestionKeysRef.current.clear();
         restoredProjectSuggestionKeysRef.current.clear();
         startTransition(() => {
+          setActiveProjectId(undefined);
           setStreaming(false);
           setQState(null);
           setPopoverOverride(null);
@@ -4691,9 +7493,14 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         });
       }
 
+      let deletedProjectIds = new Set<string>();
       try {
         const store = await loadProjectStore();
-        await store.deleteConversationProject(snapshot);
+        const deleteResult = await store.deleteConversationProject(snapshot);
+        deletedProjectIds = new Set(deleteResult.deletedProjectIds);
+        remainingProjectsFromStore = filterRecentlyDeletedProjectSnapshots(
+          await store.listRecentConversationSnapshots(HOME_RECENT_PROJECTS_LIMIT, { fast: true }),
+        ).filter((project) => !deletedProjectIds.has(project.projectId));
       } catch (error) {
         flashMaintenanceHint(
           error instanceof Error ? error.message : "删除会话失败，请稍后重试。",
@@ -4702,24 +7509,46 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         return;
       }
 
-      startTransition(() => {
-        setRuntime((prev) => ({
+      const remainingProjects = reconcileRecentProjectsWithStableOrder(
+        runtimeRef.current.recentProjects,
+        remainingProjectsFromStore,
+      );
+      const remainingProjectIds = new Set(remainingProjects.map((project) => project.projectId));
+
+      setRuntime((prev) => {
+        const nextRecentProjects = reconcileRecentProjectsWithStableOrder(
+          prev.recentProjects,
+          remainingProjectsFromStore,
+        );
+        const nextRemainingProjectIds = new Set(nextRecentProjects.map((project) => project.projectId));
+        return {
           ...prev,
-          recentProjects: sortConversationSnapshots(
-            prev.recentProjects.filter((p) => p.projectId !== snapshot.projectId),
-          ),
+          recentProjects: nextRecentProjects,
           recentProjectSessions: (prev.recentProjectSessions ?? []).filter(
-            (s) => s.projectId !== snapshot.projectId,
+            (s) => Boolean(s.projectId && nextRemainingProjectIds.has(s.projectId)),
           ),
-          ...(prev.currentProjectSnapshot?.projectId === snapshot.projectId
+          ...(prev.currentProjectSnapshot?.projectId &&
+          deletedProjectIds.has(prev.currentProjectSnapshot.projectId)
             ? {
                 currentProjectSnapshot: null,
                 currentDramaProject: null,
                 currentVideoProject: null,
               }
             : {}),
-        }));
+        };
       });
+
+      deletedProjectIds.forEach((projectId) => {
+        staleProjectIdsRef.current.add(projectId);
+      });
+
+      runtimeRef.current = {
+        ...runtimeRef.current,
+        recentProjects: remainingProjects,
+        recentProjectSessions: (runtimeRef.current.recentProjectSessions ?? []).filter(
+          (session) => Boolean(session.projectId && remainingProjectIds.has(session.projectId)),
+        ),
+      };
 
       if (wasActive) {
         // 鍦ㄨ皟鐢?openProject 鍓嶆竻闄?runtimeRef 涓殑褰撳墠椤圭洰寮曠敤锛?
@@ -4732,12 +7561,36 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         };
         // 缃┖ flushSessionRef锛岄槻姝?openProject 鍐呴儴鐨?flush 鎶婂凡鍒犻櫎鐨勪細璇濆啓鍥?localStorage
         flushSessionRef.current = () => {};
-        const next = others[0];
+        const blockedAutoOpenProjectId =
+          snapshot.projectKind === "video" && typeof snapshot.sourceProjectId === "string"
+            ? snapshot.sourceProjectId.trim()
+            : "";
+        const next =
+          selectRecentProjectForAutomationMode({
+            recentProjects: remainingProjects.filter(
+              (project) => project.projectId !== blockedAutoOpenProjectId,
+            ),
+            recentProjectSessions: (runtimeRef.current.recentProjectSessions ?? []).filter(
+              (session) =>
+                Boolean(session.projectId && remainingProjectIds.has(session.projectId)) &&
+                session.projectId !== blockedAutoOpenProjectId,
+            ),
+            currentSessionProjectId: activeProjectId,
+            mode: historyAutomationMode,
+          }) ??
+          remainingProjects.find((project) => project.projectId !== blockedAutoOpenProjectId) ??
+          remainingProjects[0];
         if (next) {
           void openProject(next.projectId);
         } else {
-          staleProjectIdsRef.current.add(snapshot.projectId);
-          reset();
+          runtimeReset();
+          setRuntime((prev) => ({
+            ...prev,
+            recentProjects: remainingProjects,
+            recentProjectSessions: (prev.recentProjectSessions ?? []).filter(
+              (session) => Boolean(session.projectId && remainingProjectIds.has(session.projectId)),
+            ),
+          }));
         }
       } else {
         flashMaintenanceHint("已删除该会话。", 2200);
@@ -4746,16 +7599,19 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     [
       activeProjectId,
       cancelPendingProjectOpen,
+      filterRecentlyDeletedProjectSnapshots,
       flashMaintenanceHint,
+      historyAutomationMode,
       loadAskUserQuestionModule,
       loadProjectStore,
       openProject,
       qState?.request.id,
-      reset,
+      runtimeReset,
       restoredProjectSuggestionKeysRef,
       runtimeRef,
       setPopoverOverride,
       setQState,
+      setActiveProjectId,
       setRuntime,
       setSelectedValues,
       setStreaming,
@@ -4828,6 +7684,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
 
         startTransition(() => {
           if (activeProjectId === snapshot.projectId && nextSession) {
+            setFullAutoChecklistCollapsed(nextSession.fullAutoChecklistCollapsed ?? true);
             setMessages(nextSession.messages);
             setCompactedMessageCount(nextSession.compactedMessageCount ?? 0);
           }
@@ -4835,19 +7692,10 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           setRuntime((prev) => ({
             ...prev,
             recentProjects: result.snapshot
-              ? sortConversationSnapshots(
-                  prev.recentProjects.map((item) =>
-                    item.projectId === snapshot.projectId ? result.snapshot! : item,
-                  ),
-                )
+              ? mergeRecentProjects(prev.recentProjects, result.snapshot)
               : prev.recentProjects,
             recentProjectSessions: nextSession
-              ? [
-                  nextSession,
-                  ...(prev.recentProjectSessions ?? []).filter(
-                    (item) => item.projectId !== snapshot.projectId,
-                  ),
-                ]
+              ? upsertRecentProjectSession(prev.recentProjectSessions, nextSession)
               : prev.recentProjectSessions,
             ...(prev.currentProjectSnapshot?.projectId === snapshot.projectId && result.snapshot
               ? { currentProjectSnapshot: result.snapshot }
@@ -4904,22 +7752,12 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         return;
       }
 
-      if (actionId === "switch_to_api") {
-        void handleJimengExecutionModeChange("api");
-        return;
-      }
-
-      if (actionId === "switch_to_cli") {
-        void handleJimengExecutionModeChange("cli");
-        return;
-      }
-
       if (actionId === "continue_script_only" && launchNoticeKey) {
         setSuppressedLaunchNoticeKey(launchNoticeKey);
         flashMaintenanceHint("已按仅剧本 / 改编模式继续，视频配置提醒本轮先收起。", 2400);
       }
     },
-    [flashMaintenanceHint, handleJimengExecutionModeChange, handleOpenSettings, launchNoticeKey],
+    [flashMaintenanceHint, handleOpenSettings, launchNoticeKey],
   );
 
   const {
@@ -4956,7 +7794,8 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   });
   interruptWorkflowShortcutRef.current = interruptWorkflowShortcut;
 
-  // 包装 runWorkflowActionShortcut：对单目标媒体重生成 action，优先走 inline 路径（和卡片重生成按钮行为一致）
+  // 包装 runWorkflowActionShortcut：媒体生成 action 统一走快捷工作流守卫，
+  // 这样单目标与批量目标都能先展示日志并进入 3 秒可撤回窗口。
   const runWorkflowActionShortcutWithInlineCheck = useCallback(
     (
       action: string,
@@ -4972,8 +7811,15 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
             if (!result.data) return;
             const nextRuntime = mergeRuntimeWithWorkflowDelta(runtimeRef.current, result.data);
             setRuntime(nextRuntime);
-            if (result.data.projectSnapshot?.projectId) {
-              setActiveProjectId(result.data.projectSnapshot.projectId);
+            const nextSessionProjectId = resolveSessionProjectIdForSnapshot({
+              currentSessionProjectId: activeProjectId,
+              snapshot: result.data.projectSnapshot ?? nextRuntime.currentProjectSnapshot,
+              fallbackProjectId:
+                result.data.projectSnapshot?.projectId ??
+                nextRuntime.currentProjectSnapshot?.projectId,
+            });
+            if (nextSessionProjectId) {
+              setActiveProjectId(nextSessionProjectId);
             }
             const nextQuestion = result.data.projectSnapshot
               ? recQuestion(result.data.projectSnapshot, nextRuntime.currentVideoProject)
@@ -4990,40 +7836,12 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         return;
       }
 
-      const isMediaRegenAction =
-        action === "generate_video_assets" ||
-        action === "generate_storyboard_frames" ||
-        action === "generate_video_reference_assets";
-
-      if (isMediaRegenAction) {
-        const targetIds = Array.isArray(input.targetIds) ? (input.targetIds as string[]) : [];
-        if (targetIds.length === 1) {
-          const targetId = targetIds[0];
-          const list = messagesRef.current;
-          // 找最新 assistant 消息（即重生成按钮可见的那条）
-          const lastAssistantIdx = [...list].reduce<number>((acc, m, i) => (m.role === "assistant" ? i : acc), -1);
-          const lastAssistantMsg = lastAssistantIdx >= 0 ? list[lastAssistantIdx] : null;
-          if (lastAssistantMsg?.attachments?.length) {
-            for (const attachment of lastAssistantMsg.attachments) {
-              if (attachment.pending) continue;
-              const target = resolveInlineAttachmentTarget(attachment);
-              if (target && target.targetId === targetId && target.action === action) {
-                void handleRegenerateAssistant(lastAssistantMsg.id, attachment.id);
-                return;
-              }
-            }
-          }
-        }
-      }
-
       runWorkflowActionShortcut(action, input, label, options);
     },
     [
+      activeProjectId,
       flashMaintenanceHint,
       loadWorkflowActionsModule,
-      messagesRef,
-      resolveInlineAttachmentTarget,
-      handleRegenerateAssistant,
       runWorkflowActionShortcut,
       runtimeRef,
       setActiveProjectId,
@@ -5032,73 +7850,60 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       setSuggested,
     ],
   );
+  workflowRefreshShortcutRunnerRef.current = runWorkflowActionShortcutWithInlineCheck;
+  workflowRefreshShortcutChainRunnerRef.current = runWorkflowActionShortcutChain;
 
   const handlePendingVideoKickoffStyleReferenceUpload = useCallback(
     async (
       currentFiles: File[],
-      displayText: string,
       rawText: string,
-      preparedAttachments: ChatAttachment[],
     ) => {
       const pendingRequest = pendingVideoKickoffStyleReferenceUploadRef.current;
       if (!pendingRequest) return false;
-
-      setAttachedFiles([]);
-      push(
-        "user",
-        displayText,
-        undefined,
-        preparedAttachments.map((attachment) => stripAttachmentPayloadForHistory(attachment)),
-      );
-
-      const imageFiles = currentFiles.filter(isSupportedImageFile);
-      if (!imageFiles.length) {
+      if (!currentFiles.some(isSupportedImageFile)) {
         push("assistant", "我正在等你上传参考图。请至少上传一张图片，发送后我会继续识别并自动进入下一步。");
         return true;
       }
 
       try {
-        const recognition = await analyzeHomeAgentImageStyleFiles(imageFiles, {
-          userPrompt: rawText.trim() || draftRef.current || persistedDraft || "识别当前上传参考图的画面风格。",
-        });
-        const nextImagePrefs = normalizeVideoImageGenerationPrefs({
-          ...imageGenerationPrefs,
-          ...buildImagePrefsPatchFromRecognition(recognition),
-        });
-        await commitEffectiveImagePrefs(nextImagePrefs);
-        pendingVideoKickoffStyleReferenceUploadRef.current = null;
-        setAwaitingVideoKickoffStyleReferenceUpload(false);
-        push(
-          "assistant",
-          [
-            "已识别参考图风格，摘要如下：",
-            `画面风格：${buildVideoImageStyleSummary(nextImagePrefs)}`,
-            `参考图摘要：${recognition.summary}`,
-            "接下来我会自动继续补平台与镜头偏好。",
-          ].join("\n"),
-        );
-        void runBackgroundVideoBridgeResearch(
-          pendingRequest.label || "继续补齐平台与镜头偏好",
-          "all",
-        );
+        await runVideoKickoffStyleReferenceRecognition(currentFiles, rawText);
         return true;
-      } catch (error) {
-        push(
-          "assistant",
-          `${
-            error instanceof Error ? error.message : "参考图风格识别失败。"
-          }请重新上传参考图，或改用自定义风格说明。`,
-        );
+      } catch {
         return true;
       }
     },
     [
-      commitEffectiveImagePrefs,
-      imageGenerationPrefs,
-      persistedDraft,
-      push,
-      runBackgroundVideoBridgeResearch,
+      runVideoKickoffStyleReferenceRecognition,
     ],
+  );
+
+  const handlePendingCharacterAudioReferenceUpload = useCallback(
+    async (currentFiles: File[]) => bindPendingCharacterAudioReferenceUpload(currentFiles),
+    [bindPendingCharacterAudioReferenceUpload],
+  );
+
+  const handleAttachedFilesChange = useCallback(
+    (nextFiles: File[]) => {
+      const pendingRequest = resolvePendingCharacterAudioUploadRequest();
+      if (!pendingRequest) {
+        setAttachedFiles(nextFiles);
+        return;
+      }
+
+      const audioFiles = collectSupportedCharacterAudioFiles(nextFiles);
+      if (audioFiles.length > 1) {
+        flashMaintenanceHint(
+          pendingRequest.characterName
+            ? `角色《${pendingRequest.characterName}》一次只能绑定 1 个音色，请只保留 1 个音频文件后再发送。`
+            : "当前角色一次只能绑定 1 个音色，请只保留 1 个音频文件后再发送。",
+          3200,
+        );
+        return;
+      }
+
+      setAttachedFiles(nextFiles);
+    },
+    [flashMaintenanceHint, resolvePendingCharacterAudioUploadRequest, setAttachedFiles],
   );
 
   const handleExportLocalAction = useCallback(
@@ -5174,7 +7979,12 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   );
 
   const handleVideoKickoff = useCallback(() => {
-    const hasDramaProject = Boolean(runtimeRef.current.currentDramaProject?.id);
+    const hasDramaProject = Boolean(
+      runtimeRef.current.currentDramaProject?.id ||
+      isBridgeableVideoWorkflowSourceSnapshot(runtimeRef.current.currentProjectSnapshot) ||
+      (automationMode === "full-auto" &&
+        isBridgeableVideoWorkflowSourceSnapshot(preferredVideoWorkflowSourceSnapshotRef.current)),
+    );
     push("user", "接入视频工作流");
     push("assistant", buildVideoWorkflowKickoffIntro());
     setPopoverOverride(null);
@@ -5183,7 +7993,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     setMode("active");
     resetComposerDraft("");
     setQState(createQuestionState(buildVideoWorkflowKickoffRequest(hasDramaProject), "restored"));
-  }, [createQuestionState, push, resetComposerDraft, runtimeRef, setMode, setPopoverOverride, setQState, setSelectedValues, setSuggested]);
+  }, [automationMode, createQuestionState, push, resetComposerDraft, runtimeRef, setMode, setPopoverOverride, setQState, setSelectedValues, setSuggested]);
 
   const {
     videoProjectChoiceHandler,
@@ -5194,25 +8004,69 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     getCurrentQuestion: () => question,
     rememberInterruptRestoreQuestion: (nextQuestion) => {
       interruptRestoreQuestionRef.current = nextQuestion;
+      setInterruptedChoiceQuestion(nextQuestion);
     },
     push,
     setPopoverOverride,
+    openPopoverQuestion: openWorkflowPopoverQuestion,
     setSuggested,
     setMode,
     resetComposerDraft,
     runWorkflowActionShortcut: runWorkflowActionShortcutWithInlineCheck,
     runWorkflowActionShortcutChain,
     runBackgroundVideoBridgeResearch,
+    commitVideoProjectPatch: commitCurrentVideoProjectPatch,
     commitImageGenerationPrefs: commitEffectiveImagePrefs,
     commitVideoGenerationPrefs: commitEffectiveVideoPrefs,
     getImageGenerationPrefs: () => imageGenerationPrefs,
     getVideoGenerationPrefs: () => videoGenerationPrefs,
     getAttachedImageCount: () => attachedFiles.filter(isSupportedImageFile).length,
+    clearAttachedFiles: () => setAttachedFiles([]),
     recognizeImageStyle: handleRecognizeImageStyle,
+    submitAttachedStyleReference: handleSubmitAttachedStyleReference,
     onAwaitVideoKickoffStyleReferenceUpload: (label) => {
       pendingVideoKickoffStyleReferenceUploadRef.current = { label };
       setAwaitingVideoKickoffStyleReferenceUpload(true);
     },
+    onAwaitCharacterAudioReferenceUpload: (label, characterId, characterName, restoreQuestion) => {
+      const exactRestoreQuestion = markQuestionForExactRestore(restoreQuestion ?? null);
+      pendingCharacterAudioReferenceUploadRef.current = {
+        label,
+        characterId,
+        characterName,
+        restoreQuestion: exactRestoreQuestion,
+        restoreContext: {
+          question: exactRestoreQuestion,
+          qState,
+          selectedValues: [...selectedValues],
+          draft: resolveComposerDraftSnapshot(draftRef.current, persistedDraft) || "",
+        },
+      };
+      setAwaitingCharacterAudioReferenceUpload(true);
+      setAttachedFiles([]);
+      openWorkflowPopoverQuestion(
+        buildPendingCharacterAudioUploadQuestion({
+          projectId: runtimeRef.current.currentProjectSnapshot?.projectId ?? null,
+          characterId,
+          characterName,
+          canReturnToMenu: Boolean(exactRestoreQuestion),
+        }),
+      );
+    },
+    onOpenCharacterAudioReferencePresetPicker: (
+      label,
+      characterId,
+      characterName,
+      restoreQuestion,
+    ) =>
+      openCharacterAudioReferencePresetPicker(
+        label,
+        characterId,
+        characterName,
+        restoreQuestion,
+      ),
+    onBindCharacterAudioReferencePreset: (selection) =>
+      bindCharacterAudioReferencePreset(selection),
     onClearVideoKickoffStyleReferenceUploadWait: () => {
       pendingVideoKickoffStyleReferenceUploadRef.current = null;
       setAwaitingVideoKickoffStyleReferenceUpload(false);
@@ -5244,32 +8098,146 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     onVideoKickoff: handleVideoKickoff,
   });
 
+  const handleUploadCharacterAudioReferenceFromSidebar = useCallback(
+    (characterId: string, characterName?: string) => {
+      const snapshot = runtimeRef.current.currentProjectSnapshot;
+      if (!snapshot || snapshot.projectKind !== "video") {
+        push("assistant", "当前没有可用的视频项目，请先进入角色与场景资产面板后再上传音频参考。");
+        return;
+      }
+
+      const matchedCharacter = runtimeRef.current.currentVideoProject?.characters.find(
+        (character) => character.id === characterId,
+      );
+      const resolvedCharacterName =
+        matchedCharacter?.name?.trim() || characterName?.trim() || undefined;
+      const hasAudioReference = Boolean(
+        matchedCharacter?.audioUrl?.trim() || matchedCharacter?.audioFileName?.trim(),
+      );
+      const label = `${hasAudioReference ? "更新" : "上传"}${
+        resolvedCharacterName ?? "角色"
+      }音频参考`;
+
+      videoProjectChoiceHandler(
+        snapshot,
+        `video:bridge:reference-audio:character:${characterId}`,
+        label,
+      );
+    },
+    [push, videoProjectChoiceHandler],
+  );
+
+  const handleRemoveCharacterAudioReferenceFromSidebar = useCallback(
+    async (characterId: string, characterName?: string) => {
+      let currentVideoProject = runtimeRef.current.currentVideoProject;
+      if (!currentVideoProject) {
+        const fallbackProjectId = runtimeRef.current.currentProjectSnapshot?.projectId;
+        if (fallbackProjectId) {
+          currentVideoProject =
+            (await loadStoredVideoProjectById(fallbackProjectId, { fast: true })) ??
+            (await loadStoredVideoProjectById(fallbackProjectId));
+        }
+      }
+
+      if (!currentVideoProject) {
+        push("assistant", "当前没有可用的视频项目，请先进入角色与场景资产面板后再管理音频参考。");
+        return;
+      }
+
+      const targetCharacter = currentVideoProject.characters.find(
+        (character) => character.id === characterId,
+      );
+      if (!targetCharacter) {
+        push("assistant", "没有找到要移除音频参考的角色，请重新打开素材菜单后再试一次。");
+        return;
+      }
+
+      const resolvedCharacterName =
+        targetCharacter.name?.trim() || characterName?.trim() || "当前角色";
+      const hasAudioReference = Boolean(
+        targetCharacter.audioUrl?.trim() || targetCharacter.audioFileName?.trim(),
+      );
+      if (!hasAudioReference) {
+        push("assistant", `角色《${resolvedCharacterName}》当前还没有已绑定的音频参考。`);
+        return;
+      }
+
+      const nextCharacters = currentVideoProject.characters.map((character) =>
+        character.id === targetCharacter.id
+          ? {
+              ...character,
+              audioUrl: undefined,
+              audioFileName: undefined,
+            }
+          : character,
+      );
+      const nextProject = await upsertStoredVideoProject(
+        synchronizeVideoProductionState({
+          ...currentVideoProject,
+          characters: nextCharacters,
+        }),
+      );
+
+      startTransition(() => {
+        setRuntime((previous) => ({
+          ...previous,
+          currentVideoProject:
+            previous.currentVideoProject?.id === nextProject.id ||
+            previous.currentProjectSnapshot?.projectId === nextProject.id
+              ? nextProject
+              : previous.currentVideoProject,
+        }));
+      });
+
+      push("assistant", `已删除角色《${resolvedCharacterName}》的音频参考。`);
+    },
+    [push, runtimeRef, setRuntime],
+  );
+
+  const handlePendingCharacterAudioUploadChoice = useCallback(
+    (
+      value: string,
+      label?: string,
+      currentQuestion?: ComposerQuestion | null,
+    ) => {
+      const isPendingAudioQuestion =
+        currentQuestion?.answerKey === PENDING_CHARACTER_AUDIO_QUESTION_KEY ||
+        question?.answerKey === PENDING_CHARACTER_AUDIO_QUESTION_KEY;
+      if (
+        value === PENDING_CHARACTER_AUDIO_RETURN_MENU_VALUE ||
+        (isPendingAudioQuestion &&
+          (value.trim() === "返回菜单" || label?.trim() === "返回菜单"))
+      ) {
+        return cancelPendingCharacterAudioReferenceUpload({ restoreMenu: true });
+      }
+      if (
+        value === PENDING_CHARACTER_AUDIO_CANCEL_VALUE ||
+        (isPendingAudioQuestion &&
+          (value.trim() === "取消上传" || label?.trim() === "取消上传"))
+      ) {
+        return cancelPendingCharacterAudioReferenceUpload();
+      }
+      return false;
+    },
+    [cancelPendingCharacterAudioReferenceUpload, question],
+  );
+
   const handleGlobalInterrupt = useCallback(() => {
-    const restoreQuestion = interruptRestoreQuestionRef.current;
+    const explicitRestoreQuestion = interruptRestoreQuestionRef.current;
     interruptRestoreQuestionRef.current = null;
     const activeSnapshot = runtimeRef.current.currentProjectSnapshot;
-    const bridgeRetryQuestion =
-      activeWorkflowAction === "video:bridge:platform"
-        ? buildVideoBridgeRetryQuestion(activeSnapshot)
-        : null;
+    const restoreQuestion = resolveInterruptedWorkflowQuestion({
+      explicitRestoreQuestion,
+      activeWorkflowAction,
+      snapshot: activeSnapshot,
+      videoProject: runtimeRef.current.currentVideoProject,
+    });
 
     const stopResult = stopActiveExecution();
     interruptWorkflowShortcut();
     const stoppedTaskCount = stopRunningTasks();
 
     setStreaming(false);
-    if (bridgeRetryQuestion) {
-      setMode("active");
-      setPopoverOverride(bridgeRetryQuestion);
-      setSuggested(null);
-      resetComposerDraft("");
-      const interruptMessage =
-        stopResult.cancelledRemoteVideoTaskCount > 0
-          ? `已停止当前补齐，并已向视频生成服务发起 ${stopResult.cancelledRemoteVideoTaskCount} 条撤销请求。你可以继续补齐平台与镜头偏好。`
-          : "已停止当前补齐。你可以继续补齐平台与镜头偏好。";
-      push("assistant", interruptMessage);
-      return;
-    }
     if (restoreQuestion) {
       restoreInterruptedChoiceQuestion(restoreQuestion);
       const restoreInterruptMessage =
@@ -5280,23 +8248,25 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       return;
     }
 
-    if (lastSuggestedRef.current) {
+    if (
+      shouldRestoreLastSuggestedAfterInterrupt(activeWorkflowAction) &&
+      lastSuggestedRef.current
+    ) {
       setSuggested(lastSuggestedRef.current);
     }
+
+    setInterruptedChoiceQuestion(null);
 
     if (stopResult.hadActiveExecution || stoppedTaskCount > 0) {
       push("assistant", "已停止当前执行。你可以调整后继续。");
     }
   }, [
     activeWorkflowAction,
-    buildVideoBridgeRetryQuestion,
     interruptWorkflowShortcut,
     lastSuggestedRef,
     push,
-    resetComposerDraft,
     runtimeRef,
-    setMode,
-    setPopoverOverride,
+    setInterruptedChoiceQuestion,
     setStreaming,
     setSuggested,
     stopRunningTasks,
@@ -5325,11 +8295,23 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         ...questionState,
         source: "deferred" as const,
       };
-      const currentProjectId = runtimeRef.current.currentProjectSnapshot?.projectId ?? activeProjectId;
-      dismissedDeferredQuestionStepRef.current = `${questionState.request.id}:${questionState.currentIndex}`;
+      const currentProjectId = resolveSessionProjectIdForSnapshot({
+        currentSessionProjectId: activeProjectId,
+        snapshot: runtimeRef.current.currentProjectSnapshot,
+        fallbackProjectId: runtimeRef.current.currentProjectSnapshot?.projectId ?? activeProjectId,
+      });
+      const stepKey = `${questionState.request.id}:${questionState.currentIndex}`;
+      const lastAssistantMessage =
+        [...messages].reverse().find((message) => message.role === "assistant") ?? null;
+      dismissedDeferredQuestionStepRef.current = stepKey;
       setDeferredQuestionState(nextDeferredQuestionState);
       setDeferredSelectedValues(nextSelectedValues);
       setDeferredDraft(nextDraft);
+      setPendingDeferredQuestionRestoreAfterAssistantReply({
+        stepKey,
+        lastAssistantMessageId: lastAssistantMessage?.id ?? null,
+        projectId: currentProjectId ?? null,
+      });
       if (currentProjectId) {
         queueStudioSessionWrite({
           sessionId: runtimeRef.current.sessionId,
@@ -5359,7 +8341,9 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           draft: "",
           qState: null,
           deferredQuestionState: nextDeferredQuestionState,
+          pendingWorkflowUploadKind,
           pendingChoiceQuestion: null,
+          interruptedChoiceQuestion: pendingWorkflowUploadKind ? null : interruptedChoiceQuestion,
           selectedValues: [],
           deferredSelectedValues: nextSelectedValues,
           deferredDraft: nextDraft,
@@ -5367,7 +8351,8 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           surfacedTaskFollowupKeys: [...surfacedTaskFollowupIdsRef.current],
           surfacedProjectSuggestionKeys: [...surfacedProjectSuggestionKeysRef.current],
           fullAutoRun: runtimeRef.current.fullAutoRun ?? null,
-        });
+          fullAutoChecklistCollapsed,
+        }, 120, { persistFullBackup: false });
       }
     },
     [
@@ -5376,7 +8361,9 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       compactedMessageCount,
       creationMode,
       devMode,
+      fullAutoChecklistCollapsed,
       imageGenerationPrefs,
+      interruptedChoiceQuestion,
       messages,
       mode,
       runtime,
@@ -5403,7 +8390,11 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         surfacedProjectSuggestionKeysRef.current.delete(suggestionKey);
         restoredProjectSuggestionKeysRef.current.delete(suggestionKey);
       }
-      const currentProjectId = runtimeRef.current.currentProjectSnapshot?.projectId ?? activeProjectId;
+      const currentProjectId = resolveSessionProjectIdForSnapshot({
+        currentSessionProjectId: activeProjectId,
+        snapshot: runtimeRef.current.currentProjectSnapshot,
+        fallbackProjectId: runtimeRef.current.currentProjectSnapshot?.projectId ?? activeProjectId,
+      });
       if (currentProjectId) {
         queueStudioSessionWrite({
           sessionId: runtimeRef.current.sessionId,
@@ -5433,7 +8424,9 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           draft: "",
           qState,
           deferredQuestionState,
-          pendingChoiceQuestion: questionToDismiss,
+          pendingWorkflowUploadKind,
+          pendingChoiceQuestion: pendingWorkflowUploadKind ? null : questionToDismiss,
+          interruptedChoiceQuestion: pendingWorkflowUploadKind ? null : interruptedChoiceQuestion,
           selectedValues: [],
           deferredSelectedValues,
           deferredDraft,
@@ -5441,7 +8434,8 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           surfacedTaskFollowupKeys: [...surfacedTaskFollowupIdsRef.current],
           surfacedProjectSuggestionKeys: [...surfacedProjectSuggestionKeysRef.current],
           fullAutoRun: runtimeRef.current.fullAutoRun ?? null,
-        });
+          fullAutoChecklistCollapsed,
+        }, 120, { persistFullBackup: false });
       }
       setPopoverOverride(questionToDismiss);
       setSuggested(null);
@@ -5455,7 +8449,10 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       deferredQuestionState,
       deferredSelectedValues,
       devMode,
+      fullAutoChecklistCollapsed,
       imageGenerationPrefs,
+      interruptedChoiceQuestion,
+      pendingWorkflowUploadKind,
       messages,
       mode,
       qState,
@@ -5477,9 +8474,15 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   // 鏂板缓椤圭洰鍓嶅厛鎶婂綋鍓嶉」鐩?ID 鏍囪涓?stale锛岄槻姝㈠叾鍚庡彴 delta 姹℃煋鏂伴」鐩潰鏉?
   // 鍚屾椂鎸佷箙鍖栧綋鍓嶉」鐩紝闃叉鍒囨崲鍚庨」鐩涪澶?
   const handleNewProject = useCallback(() => {
+    suppressAutoRestore();
+    cancelPendingProjectOpen();
     const currentProjectId = runtimeRef.current.currentProjectSnapshot?.projectId;
     if (currentProjectId) {
       staleProjectIdsRef.current.add(currentProjectId);
+    }
+    // 无项目的自由对话：reset 前先保存，防止切换后历史丢失
+    if (!currentProjectId && messagesRef.current.length > 0) {
+      flushSessionRef.current();
     }
     // 濡傛灉褰撳墠鏈夊墽鏈」鐩紝鍏堜繚瀛樺埌 localStorage 鍐?reset
     const currentDramaProject = runtimeRef.current.currentDramaProject;
@@ -5489,7 +8492,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       });
     }
     handleReset();
-  }, [handleReset, runtimeRef]);
+  }, [cancelPendingProjectOpen, handleReset, runtimeRef, suppressAutoRestore]);
 
   // 鍖呰 send锛屽鐞嗛檮鍔犳枃浠?
   /*
@@ -5633,6 +8636,19 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
       const displayText = (shown ?? rawText).trim() || `上传了 ${currentFiles.map((file) => file.name).join("、")}`;
 
       try {
+        if (
+          await handlePendingVideoKickoffStyleReferenceUpload(
+            currentFiles,
+            rawText,
+          )
+        ) {
+          return;
+        }
+
+        if (await handlePendingCharacterAudioReferenceUpload(currentFiles)) {
+          return;
+        }
+
         const textModelRuntime = resolveHomeAgentTextModelRuntime(
           await loadApiConfigModule(),
           selectedTextModelKey,
@@ -5647,17 +8663,6 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           attachments: preparedAttachments,
           capabilities,
         });
-
-        if (
-          await handlePendingVideoKickoffStyleReferenceUpload(
-            currentFiles,
-            displayText,
-            rawText,
-            preparedAttachments,
-          )
-        ) {
-          return;
-        }
 
         setAttachedFiles([]);
         return send(promptWithFiles, displayText, {
@@ -5684,6 +8689,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     },
     [
       attachedFiles,
+      handlePendingCharacterAudioReferenceUpload,
       handlePendingVideoKickoffStyleReferenceUpload,
       loadApiConfigModule,
       selectedTextModelKey,
@@ -5692,25 +8698,28 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     ],
   );
 
-  // 浠庝細璇濇秷鎭腑鎻愬彇鎵€鏈夊凡鐢熸垚鐨勫浘鐗?瑙嗛闄勪欢锛堥潪 pending锛夛紝鐢ㄤ簬濯掍綋鏀剁撼鎶藉眽
-  const conversationMediaItems = useMemo(() => {
-    const items: ChatAttachment[] = [];
-    for (const msg of messages) {
-      if (!msg.attachments?.length) continue;
-      for (const att of msg.attachments) {
-        if (
-          (att.kind === "image" || att.kind === "video") &&
-          !att.pending &&
-          att.previewUrl &&
-          !isExpiredRemoteSignedMediaUrl(att.previewUrl) &&
-          !isExpiredRemoteSignedMediaUrl(att.localPath)
-        ) {
-          items.push(att);
-        }
-      }
-    }
-    return items;
-  }, [messages]);
+  const hasPendingMediaMessage = useMemo(
+    () =>
+      messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          message.status === "pending" &&
+          message.attachments?.some(
+            (attachment) =>
+              (attachment.kind === "image" || attachment.kind === "video") &&
+              attachment.pending,
+          ),
+      ),
+    [messages],
+  );
+  const hasRunningVideoGeneration = useMemo(() => {
+    const project = runtime.currentVideoProject;
+    return (
+      listRunningVideoScenes(project).length > 0 ||
+      listRunningSegmentVideoLabels(project).length > 0
+    );
+  }, [runtime.currentVideoProject]);
+  const isMediaGenerating = hasPendingMediaMessage || hasRunningVideoGeneration;
 
   const { idleComposer, activeComposer, workflowProgress } = useHomeAgentComposerBindings({
     idle,
@@ -5718,6 +8727,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     maintenanceHint,
     videoTransportHint,
     launchNotice,
+    suppressFloatingTaskBoard: pendingDeleteSnapshot !== null,
     draftInitialValue,
     draftResetVersion,
     draftPresence,
@@ -5727,6 +8737,9 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     qState,
     selectedValues,
     streaming,
+    fullAutoRun: runtime.fullAutoRun ?? null,
+    isMediaGenerating,
+    isAwaitingWorkflowDocumentUpload,
     reduceMotion,
     composerShellClass,
     activeTheme,
@@ -5748,12 +8761,14 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     videoGenerationPrefs,
     onSelectVideoModel: handleSelectVideoModel,
     onConfirmVideoResolution: handleConfirmVideoResolution,
+    onConfirmVideoPrefs: handleConfirmVideoResolution,
     onDevVideoGenerationModeChange: handleDevVideoGenerationModeChange,
     onDevImageViewModeChange: handleDevImageViewModeChange,
     creationMode,
     onCreationModeChange: setCreationMode,
     devMode,
     onDevModeChange: setDevMode,
+    automationMode,
     runtimeRef,
     draftRef,
     engineRef,
@@ -5776,8 +8791,29 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     videoAssetChoiceHandler,
     scriptProjectChoiceHandler,
     autoResearchChoiceHandler,
+    onBeforeChoiceSelect: (value, label, currentQuestion) =>
+      handlePendingCharacterAudioUploadChoice(value, label, currentQuestion),
+    canHandleQuestionBack: (currentQuestion) =>
+      currentQuestion?.answerKey === PENDING_CHARACTER_AUDIO_QUESTION_KEY ||
+      currentQuestion?.answerKey === CHARACTER_AUDIO_PRESET_PICKER_ANSWER_KEY,
+    onBeforeQuestionBack: (currentQuestion) => {
+      if (
+        currentQuestion?.answerKey !== PENDING_CHARACTER_AUDIO_QUESTION_KEY
+      ) {
+        if (
+          currentQuestion?.answerKey === CHARACTER_AUDIO_PRESET_PICKER_ANSWER_KEY
+        ) {
+          return exitCharacterAudioReferencePresetPicker();
+        }
+        return false;
+      }
+      return cancelPendingCharacterAudioReferenceUpload({ restoreMenu: true });
+    },
     handleFullAutoChoiceSelect,
+    handleFullAutoQuestionBack,
+    handleFullAutoQuestionReset,
     onLaunchAction: handleLaunchNoticeAction,
+    onStopFullAuto: handleStopFullAuto,
     activeTrackClassName: ACTIVE_TRACK_CLASS,
     idleTrackClassName: IDLE_TRACK_CLASS,
     lastSuggestedRef,
@@ -5785,14 +8821,19 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
     onGlobalInterrupt: handleGlobalInterrupt,
     clearInterruptRestoreQuestion: () => {
       interruptRestoreQuestionRef.current = null;
+      setInterruptedChoiceQuestion(null);
     },
     rememberInterruptRestoreQuestion: (nextQuestion) => {
       interruptRestoreQuestionRef.current = nextQuestion;
+      setInterruptedChoiceQuestion(nextQuestion);
     },
+    getInterruptedChoiceQuestion: () => interruptRestoreQuestionRef.current ?? interruptedChoiceQuestion,
     attachedFiles,
-    onAttachedFilesChange: setAttachedFiles,
-    conversationMediaItems,
+    onAttachedFilesChange: handleAttachedFilesChange,
+    setMode,
+    queueWorkflowPopoverAfterAssistantReply,
   });
+  const suppressSyntheticStreamingMessage = shouldForceSilentWorkflowShortcut(activeWorkflowAction ?? "");
 
   return (
     <div
@@ -5859,97 +8900,120 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
           </div>
         </div>
       )}
-      <DesktopSidebar
-        idle={idle}
-        recentProjects={deferredRecentProjects}
-        recentProjectsReady={recentProjectsReady}
-        templates={sidebarTemplates}
-        assets={deferredSidebarAssets}
-        currentProjectId={activeProjectId}
-        collapsed={desktopSidebarCollapsed}
-        brandLabel={SIDEBAR_BRAND}
-        expandedWidth={sidebarWidth}
-        collapsedWidth={DESKTOP_SIDEBAR_COLLAPSED_WIDTH}
-        onWidthChange={handleSidebarWidthChange}
-        onTemplateLaunch={handleTemplateLaunch}
-        onOpenProject={handleOpenProject}
-        onTogglePinProject={handleToggleProjectPin}
-        onRenameProject={handleRenameProject}
-        onDuplicateProject={handleDuplicateProject}
-        onCleanExpiredVideos={handleCleanExpiredVideos}
-        onDeleteProject={handleDeleteProject}
-        onBulkDeleteProjects={handleBulkDeleteProjects}
-        onExportChatHistory={handleExportChatHistory}
-        onImportChatHistory={handleImportChatHistory}
-        onOpenProjectFolder={handleOpenProjectFolder}
-        onGlobalImportChatHistory={handleGlobalImportChatHistory}
-        onNewProject={handleNewProject}
-        onOpenSettings={handleToggleSettings}
-        onToggleCollapse={handleToggleDesktopSidebar}
-        onRefreshProjects={handleRefreshProjects}
-        isRefreshingProjects={isRefreshingProjects}
-        jimengExecutionMode={jimengExecutionMode}
-        onChangeJimengExecutionMode={handleJimengExecutionModeChange}
-        dreaminaCliAvailable={dreaminaCapability.available}
-        onDeleteAsset={handleDeleteAsset}
-        highlightedAssetId={sidebarAssetFocus?.assetId}
-        highlightedAssetMessage={sidebarAssetFocus?.message}
-        automationMode={automationMode}
-      />
-      <MobileSidebarSheet
-        open={mobileNavOpen}
-        onOpenChange={setMobileNavOpen}
-        idle={idle}
-        recentProjects={deferredRecentProjects}
-        recentProjectsReady={recentProjectsReady}
-        templates={sidebarTemplates}
-        assets={deferredSidebarAssets}
-        currentProjectId={activeProjectId}
-        brandLabel={SIDEBAR_BRAND}
-        sheetClassName={MOBILE_NAV_SHEET}
-        onTemplateLaunch={handleTemplateLaunch}
-        onOpenProject={handleOpenProject}
-        onTogglePinProject={handleToggleProjectPin}
-        onRenameProject={handleRenameProject}
-        onDuplicateProject={handleDuplicateProject}
-        onCleanExpiredVideos={handleCleanExpiredVideos}
-        onDeleteProject={handleDeleteProject}
-        onBulkDeleteProjects={handleBulkDeleteProjects}
-        onExportChatHistory={handleExportChatHistory}
-        onImportChatHistory={handleImportChatHistory}
-        onOpenProjectFolder={handleOpenProjectFolder}
-        onGlobalImportChatHistory={handleGlobalImportChatHistory}
-        onNewProject={handleNewProject}
-        onOpenSettings={handleToggleSettings}
-        onRefreshProjects={handleRefreshProjects}
-        isRefreshingProjects={isRefreshingProjects}
-        jimengExecutionMode={jimengExecutionMode}
-        onChangeJimengExecutionMode={handleJimengExecutionModeChange}
-        dreaminaCliAvailable={dreaminaCapability.available}
-        onDeleteAsset={handleDeleteAsset}
-        highlightedAssetId={sidebarAssetFocus?.assetId}
-        highlightedAssetMessage={sidebarAssetFocus?.message}
-        automationMode={automationMode}
-      />
+      {shouldUseMobileLayout ? (
+        <React.Suspense fallback={<MobileSidebarFallback open={mobileNavOpen} />}>
+          <LazyMobileSidebarSheet
+            open={mobileNavOpen}
+            onOpenChange={setMobileNavOpen}
+            idle={idle}
+            recentProjects={deferredRecentProjects}
+            recentProjectSessions={runtime.recentProjectSessions}
+            recentProjectsReady={recentProjectsReady}
+            templates={sidebarTemplates}
+            assets={deferredSidebarAssets}
+            currentProjectId={activeProjectId}
+            currentProjectSnapshot={runtime.currentProjectSnapshot}
+            brandLabel={SIDEBAR_BRAND}
+            sheetClassName={MOBILE_NAV_SHEET}
+            onTemplateLaunch={handleTemplateLaunch}
+            onOpenProject={handleOpenProject}
+            onTogglePinProject={handleToggleProjectPin}
+            onRenameProject={handleRenameProject}
+            onDuplicateProject={handleDuplicateProject}
+            onCleanExpiredVideos={handleCleanExpiredVideos}
+            onDeleteProject={handleDeleteProject}
+            onBulkDeleteProjects={handleBulkDeleteProjects}
+            onExportChatHistory={handleExportChatHistory}
+            onImportChatHistory={handleImportChatHistory}
+            onOpenProjectFolder={handleOpenProjectFolder}
+            onGlobalImportChatHistory={handleGlobalImportChatHistory}
+            onNewProject={handleNewProject}
+            onOpenSettings={handleToggleSettings}
+            onRefreshProjects={handleRefreshProjects}
+            isRefreshingProjects={isRefreshingProjects}
+            onDeleteAsset={handleDeleteAsset}
+            onUploadCharacterAudioReference={handleUploadCharacterAudioReferenceFromSidebar}
+            onRemoveCharacterAudioReference={handleRemoveCharacterAudioReferenceFromSidebar}
+            onRefreshSegmentContinuity={handleRefreshSegmentContinuityAsset}
+            highlightedAssetId={sidebarAssetFocus?.assetId}
+            highlightedAssetMessage={sidebarAssetFocus?.message}
+            automationMode={historyAutomationMode}
+            fullAutoRunStatus={runtime.fullAutoRun?.status ?? null}
+          />
+        </React.Suspense>
+      ) : (
+        <React.Suspense
+          fallback={
+            <DesktopSidebarFallback
+              collapsed={desktopSidebarCollapsed}
+              expandedWidth={sidebarWidth}
+              collapsedWidth={DESKTOP_SIDEBAR_COLLAPSED_WIDTH}
+            />
+          }
+        >
+          <LazyDesktopSidebar
+            idle={idle}
+            recentProjects={deferredRecentProjects}
+            recentProjectSessions={runtime.recentProjectSessions}
+            recentProjectsReady={recentProjectsReady}
+            templates={sidebarTemplates}
+            assets={deferredSidebarAssets}
+            currentProjectId={activeProjectId}
+            currentProjectSnapshot={runtime.currentProjectSnapshot}
+            collapsed={desktopSidebarCollapsed}
+            brandLabel={SIDEBAR_BRAND}
+            expandedWidth={sidebarWidth}
+            collapsedWidth={DESKTOP_SIDEBAR_COLLAPSED_WIDTH}
+            onWidthChange={handleSidebarWidthChange}
+            onTemplateLaunch={handleTemplateLaunch}
+            onOpenProject={handleOpenProject}
+            onTogglePinProject={handleToggleProjectPin}
+            onRenameProject={handleRenameProject}
+            onDuplicateProject={handleDuplicateProject}
+            onCleanExpiredVideos={handleCleanExpiredVideos}
+            onDeleteProject={handleDeleteProject}
+            onBulkDeleteProjects={handleBulkDeleteProjects}
+            onExportChatHistory={handleExportChatHistory}
+            onImportChatHistory={handleImportChatHistory}
+            onOpenProjectFolder={handleOpenProjectFolder}
+            onGlobalImportChatHistory={handleGlobalImportChatHistory}
+            onNewProject={handleNewProject}
+            onOpenSettings={handleToggleSettings}
+            onToggleCollapse={handleToggleDesktopSidebar}
+            onRefreshProjects={handleRefreshProjects}
+            isRefreshingProjects={isRefreshingProjects}
+            onDeleteAsset={handleDeleteAsset}
+            onUploadCharacterAudioReference={handleUploadCharacterAudioReferenceFromSidebar}
+            onRemoveCharacterAudioReference={handleRemoveCharacterAudioReferenceFromSidebar}
+            onRefreshSegmentContinuity={handleRefreshSegmentContinuityAsset}
+            highlightedAssetId={sidebarAssetFocus?.assetId}
+            highlightedAssetMessage={sidebarAssetFocus?.message}
+            automationMode={historyAutomationMode}
+            fullAutoRunStatus={runtime.fullAutoRun?.status ?? null}
+          />
+        </React.Suspense>
+      )}
       <DesktopSettingsPanel
         open={settingsOpen}
         onClose={handleCloseSettings}
-        onSaved={() => {
-          void refreshLaunchReadiness();
-        }}
+        onSaved={handleSettingsSaved}
         leftOffset={desktopSidebarOffset}
         width={DESKTOP_SETTINGS_WIDTH}
       />
       <MobileSettingsSheet
         open={settingsOpen}
         onOpenChange={handleSettingsOpenChange}
-        onSaved={() => {
-          void refreshLaunchReadiness();
-        }}
+        onSaved={handleSettingsSaved}
       />
 
       <div className="relative z-10 flex min-h-screen flex-col">
-        <MobileTopbar idle={idle} brandLabel={SIDEBAR_BRAND} onOpenNavigation={handleOpenMobileNavigation} />
+        {shouldUseMobileLayout ? (
+          <MobileTopbar
+            idle={idle}
+            brandLabel={SIDEBAR_BRAND}
+            onOpenNavigation={handleOpenMobileNavigation}
+          />
+        ) : null}
         <main
           className={cn(
             "relative flex-1 overflow-x-visible overflow-y-visible px-3.5 transition-[padding-left] duration-300 ease-out motion-reduce:transition-none sm:px-4 md:px-8",
@@ -5963,35 +9027,99 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
             } as React.CSSProperties
           }
         >
+          {maintenanceHints.length ? (
+            <div className="pointer-events-none fixed right-3 top-3 z-[90] flex w-[min(78vw,360px)] flex-col gap-2 sm:right-4 sm:top-4 md:right-6">
+              <AnimatePresence initial={false}>
+                {maintenanceHints
+                  .slice()
+                  .reverse()
+                  .map((hint) => (
+                    <motion.div
+                      key={hint.id}
+                      layout
+                      data-testid="home-maintenance-hint-panel"
+                      initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -10, scale: 0.985 }}
+                      animate={reduceMotion ? { opacity: 1 } : { opacity: 1, y: 0, scale: 1 }}
+                      exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -14, scale: 0.975 }}
+                      transition={{
+                        duration: reduceMotion ? 0.14 : 0.28,
+                        ease: [0.22, 1, 0.36, 1],
+                      }}
+                      className={cn(
+                        "pointer-events-auto rounded-[20px] border px-3.5 py-3 shadow-[0_18px_48px_rgba(0,0,0,0.22)] backdrop-blur-xl",
+                        "text-[12px] leading-[1.55] transition-all duration-200 ease-out",
+                        hint.tone !== "error" && "border-border/35 bg-background/92 text-foreground/88",
+                        hint.tone === "error" &&
+                          "border-rose-400/24 bg-rose-500/[0.09] text-rose-50 dark:text-rose-100",
+                      )}
+                    >
+                      <div className="flex items-start gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div
+                            className={cn(
+                              "text-[10px] font-medium uppercase tracking-[0.18em]",
+                              hint.tone !== "error" && "text-muted-foreground/70",
+                              hint.tone === "error" && "text-rose-100/70",
+                            )}
+                          >
+                            {hint.tone === "error" ? "处理失败" : "系统提示"}
+                          </div>
+                          <div className="mt-1 break-words">{hint.message}</div>
+                        </div>
+                        <button
+                          type="button"
+                          aria-label="关闭提示"
+                          className={cn(
+                            "mt-0.5 inline-flex h-6 w-6 items-center justify-center rounded-full transition",
+                            hint.tone !== "error" && "text-muted-foreground/70 hover:bg-muted/70 hover:text-foreground",
+                            hint.tone === "error" && "text-rose-100/72 hover:bg-rose-400/12 hover:text-rose-50",
+                          )}
+                          onClick={() => dismissMaintenanceHint(hint.id)}
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    </motion.div>
+                  ))}
+              </AnimatePresence>
+            </div>
+          ) : null}
           {idle ? (
             <IdleLanding composer={idleComposer} reduceMotion={reduceMotion} title={TITLE} trackClassName={IDLE_TRACK_CLASS} />
           ) : (
             <>
               <ActiveConversationShell
+                conversationId={runtime.sessionId}
                 messages={deferredMessages}
                 tasks={deferredVisibleTasks}
                 onStopTask={handleStopTask}
                 endRef={endRef}
+                scrollContainerRef={scrollContainerRef}
+                onRequestOlderHistory={handleRequestOlderHistory}
                 composer={activeComposer}
                 streaming={streaming}
+                suppressSyntheticStreamingMessage={suppressSyntheticStreamingMessage}
                 hasUnreadMessage={hasUnreadMessage}
                 trackClassName={ACTIVE_TRACK_CLASS}
                 snapshot={currentProject}
                 workflowProgress={workflowProgress}
                 fullAutoRun={runtime.fullAutoRun ?? null}
+                fullAutoChecklistCollapsed={fullAutoChecklistCollapsed}
+                onFullAutoChecklistCollapsedChange={setFullAutoChecklistCollapsed}
                 onStopFullAuto={handleStopFullAuto}
-                onArtifactAction={(value, label, input) => {
-                  if (currentProject) {
-                    if (
-                      currentProject.projectKind === "video" &&
-                      (videoProjectChoiceHandler(currentProject, value, label) ||
-                        videoAssetChoiceHandler(currentProject, value, label))
-                    ) {
-                      return;
-                    }
+                onArtifactAction={(value, label, input, sourceSnapshot) => {
+                  const actionSnapshot = sourceSnapshot ?? currentProject;
+                  if (!actionSnapshot) return;
 
-                    scriptProjectChoiceHandler(currentProject, value, label, input);
+                  if (
+                    actionSnapshot.projectKind === "video" &&
+                    (videoProjectChoiceHandler(actionSnapshot, value, label) ||
+                      videoAssetChoiceHandler(actionSnapshot, value, label))
+                  ) {
+                    return;
                   }
+
+                  scriptProjectChoiceHandler(actionSnapshot, value, label, input);
                 }}
                 onSaveArtifactText={handleSaveArtifactText}
                 onRelationshipDiagramCollapsedChange={handleRelationshipDiagramCollapsedChange}

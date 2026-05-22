@@ -20,6 +20,12 @@ function stringify(data: unknown): string {
   return JSON.stringify(data, null, 2);
 }
 
+function countExhaustedReferenceTargets(project: PersistedVideoProject): number {
+  return Object.values(project.automationState?.referenceTargets || {}).filter(
+    (target) => target.status === "exhausted",
+  ).length;
+}
+
 export interface VideoProductionBundleExportResult {
   directoryPath: string;
   overviewPath: string;
@@ -29,6 +35,8 @@ export interface VideoProductionBundleExportResult {
 
 export function buildVideoProductionBundlePreviewMessage(project: PersistedVideoProject): string {
   const synced = synchronizeVideoProductionState(project);
+  const automationTargetCount = Object.keys(synced.automationState?.referenceTargets || {}).length;
+  const exhaustedTargetCount = countExhaustedReferenceTargets(synced);
   return [
     `当前《${synced.title || synced.id}》的生产状态包摘要如下：`,
     "",
@@ -42,9 +50,14 @@ export function buildVideoProductionBundlePreviewMessage(project: PersistedVideo
     `- 场景设定数：${synced.sceneSettings.length}`,
     `- 资产清单：${synced.assetManifest?.items.length ?? 0} 项`,
     `- 镜头指令包：${synced.shotPackets?.length ?? 0} 个`,
+    `- Automation Targets：${automationTargetCount} 个`,
+    `- Exhausted Automation Targets：${exhaustedTargetCount} 个`,
+    `- QA 审核：${synced.videoAuditPackets?.length ?? 0} 个`,
+    `- Repair 记录：${synced.videoRepairTasks?.length ?? 0} 个`,
+    `- Review Queue：${synced.reviewQueue?.length ?? 0} 个`,
     "",
-    "导出内容会包含：overview / style-lock / world-model / asset-manifest / shot-packets / README。",
-    "这份摘要只用于首页内预览，不会改动当前项目运行态。",
+    "导出内容会包含：overview / style-lock / world-model / asset-manifest / shot-packets / automation-state / video-audits / video-repair-tasks / review-queue / README。",
+    "这份摘要仅用于首页内预览，不会改动当前项目运行态。",
   ].join("\n");
 }
 
@@ -97,6 +110,11 @@ export async function exportVideoProductionBundle(
           sceneSettings: synced.sceneSettings.length,
           assetManifestItems: synced.assetManifest?.items.length ?? 0,
           shotPackets: synced.shotPackets?.length ?? 0,
+          automationReferenceTargets: Object.keys(synced.automationState?.referenceTargets || {}).length,
+          exhaustedAutomationReferenceTargets: countExhaustedReferenceTargets(synced),
+          videoAuditPackets: synced.videoAuditPackets?.length ?? 0,
+          videoRepairTasks: synced.videoRepairTasks?.length ?? 0,
+          reviewQueue: synced.reviewQueue?.length ?? 0,
         },
       }),
     },
@@ -115,6 +133,22 @@ export async function exportVideoProductionBundle(
     {
       name: "shot-packets.json",
       content: stringify(synced.shotPackets ?? []),
+    },
+    {
+      name: "automation-state.json",
+      content: stringify(synced.automationState ?? null),
+    },
+    {
+      name: "video-audits.json",
+      content: stringify(synced.videoAuditPackets ?? []),
+    },
+    {
+      name: "video-repair-tasks.json",
+      content: stringify(synced.videoRepairTasks ?? []),
+    },
+    {
+      name: "review-queue.json",
+      content: stringify(synced.reviewQueue ?? []),
     },
   ];
 
@@ -142,6 +176,9 @@ export async function exportVideoProductionBundle(
     "- world-model.json",
     "- asset-manifest.json",
     "- shot-packets.json",
+    "- automation-state.json",
+    "- video-audits.json",
+    "- video-repair-tasks.json",
     "- review-queue.json",
     "",
     "这是一份受控导出的生产状态包，用于审计、复盘或迁移，不会改变当前项目运行态。",

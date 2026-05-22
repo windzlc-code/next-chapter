@@ -1,35 +1,40 @@
 import {
+  Fragment,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
+  type WheelEvent as ReactWheelEvent,
 } from "react";
-import { Check, ChevronDown, ChevronLeft, Sparkles, X } from "lucide-react";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, RotateCcw, Sparkles, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type {
   ComposerQuestion,
   ComposerQuestionOption,
 } from "@/lib/home-agent/types";
-import type { VideoGenerationMode, VideoImageGenerationPrefs } from "@/types/project";
+import { CHARACTER_AUDIO_PRESET_PICKER_ANSWER_KEY } from "@/lib/home-agent/character-audio-preset-library";
+import type { VideoGenerationMode } from "@/types/project";
 import { GENRES } from "@/types/drama";
+import {
+  filterComposerQuestionOptions,
+  getComposerCustomCaptureDescriptor,
+} from "./composer-custom-capture";
 
 export interface ComposerChoicePanelProps {
   question: ComposerQuestion;
   onSelect: (value: string, label: string) => void;
   onConfirm?: () => void;
   onBack?: () => void;
+  onReset?: () => void;
   onDismiss?: () => void;
   canConfirm?: boolean;
   tone?: "light" | "dark";
   devMode?: boolean;
+  showVideoModeBadge?: boolean;
   devVideoGenerationMode?: VideoGenerationMode;
-  devImageViewMode?: VideoImageGenerationPrefs["viewMode"];
   onDevVideoGenerationModeChange?: (mode: VideoGenerationMode) => void;
-  onDevImageViewModeChange?: (
-    mode: NonNullable<VideoImageGenerationPrefs["viewMode"]>,
-  ) => void;
 }
 
 /** 全局固定的开发者回退按钮，始终显示在 dev 区（不依赖当前步骤选项） */
@@ -56,25 +61,333 @@ const TERTIARY_INPUT_PANEL_DESKTOP_WIDTH_PX = 272;
 const TERTIARY_INPUT_PANEL_MIN_WIDTH_PX = 224;
 const QUATERNARY_PANEL_DESKTOP_WIDTH_PX = 188;
 const QUATERNARY_PANEL_MIN_WIDTH_PX = 156;
+const HALF_VIEWPORT_PANEL_MAX_HEIGHT_CLASS = "max-h-[50vh]";
+const PRIMARY_CHOICE_PANEL_MAX_HEIGHT_CLASS = "max-h-[min(48dvh,560px)]";
 const NESTED_PANEL_FRAME_CLASS = "overflow-hidden rounded-[14px] border";
-const NESTED_PANEL_HEADER_CLASS = "px-3 pb-1.5 pt-2 text-[11px] font-medium";
+const NESTED_PANEL_HEADER_CLASS = "px-3 pb-1 pt-2 text-[10.5px] font-medium";
 const NESTED_PANEL_LIST_CLASS = "flex flex-col gap-1 px-2 pb-2";
-const NESTED_PANEL_SCROLL_LIST_CLASS = `${NESTED_PANEL_LIST_CLASS} max-h-[340px] overflow-y-auto scrollbar-none`;
+const NESTED_PANEL_SCROLL_LIST_CLASS = `${NESTED_PANEL_LIST_CLASS} ${HALF_VIEWPORT_PANEL_MAX_HEIGHT_CLASS} overflow-y-auto overscroll-contain scrollbar-none`;
+const NESTED_PRIMARY_LIST_CLASS =
+  "flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto overscroll-contain scrollbar-none pr-1";
+const OPTION_SECTION_DIVIDER_TEST_ID = "choice-option-section-divider";
+const CHIP_OPTION_SCROLL_LIST_CLASS =
+  "flex min-h-[44px] flex-wrap gap-1.5 max-h-[min(34vh,220px)] overflow-y-auto overscroll-contain scrollbar-none pr-1";
+const CARD_OPTION_SCROLL_LIST_CLASS =
+  "max-h-[min(44vh,360px)] overflow-y-auto overscroll-contain scrollbar-none pr-1";
 const NESTED_PANEL_OPTION_CLASS =
-  "w-full min-h-[50px] rounded-[12px] border px-3 py-2.5 text-left transition-colors";
+  "w-full min-h-[44px] rounded-[12px] border px-3 py-2 text-left transition-colors";
 const NESTED_PANEL_HEADER_ESTIMATED_HEIGHT_PX = 30;
 const NESTED_PANEL_ITEM_ESTIMATED_HEIGHT_PX = 58;
 const NESTED_PANEL_BOTTOM_PADDING_ESTIMATED_PX = 16;
 const NESTED_PANEL_SCROLL_MAX_HEIGHT_PX = 340;
+const OPTION_RATIONALE_SUMMARY_MAX = 48;
 
 function localizeDevVideoGenerationMode(mode: VideoGenerationMode): string {
   return mode === "image-to-video" ? "图生视频" : "文生视频";
 }
 
-function localizeDevImageViewMode(
-  mode: NonNullable<VideoImageGenerationPrefs["viewMode"]>,
-): string {
-  return mode === "single" ? "单图" : "三视图";
+const PRE_KICKOFF_VIDEO_BADGE_ANSWER_KEYS = new Set([
+  "video-kickoff-prefs-mode",
+  "video-post-analyze-mode",
+  "video-bridge-retry",
+  "video-analyze-duration",
+  "video-analyze-pace",
+  "video-analyze-resume",
+]);
+
+function shouldHideVideoModeBadge(question: ComposerQuestion): boolean {
+  return PRE_KICKOFF_VIDEO_BADGE_ANSWER_KEYS.has(question.answerKey);
+}
+
+function shouldTreatAsVideoWorkflowPanel(question: ComposerQuestion): boolean {
+  return question.answerKey.startsWith("video-") || question.answerKey === "review-stage-panel";
+}
+
+const SUPPRESS_SELECTED_CHOICE_APPEARANCE_ANSWER_KEYS = new Set([
+  "video-kickoff-prefs-mode",
+  "video-post-analyze-mode",
+  "video-kickoff-prefs-style",
+]);
+
+function usesSinglePanelDrilldownNavigation(answerKey: string): boolean {
+  return (
+    answerKey.startsWith("script-episode") ||
+    answerKey.startsWith("script-compliance") ||
+    answerKey.startsWith("script-export") ||
+    answerKey === "video-bridge-panel" ||
+    answerKey === CHARACTER_AUDIO_PRESET_PICKER_ANSWER_KEY ||
+    answerKey === "video-generation-panel" ||
+    answerKey === "review-stage-panel"
+  );
+}
+
+function shouldUseFloatingSinglePanelSubmenu(
+  option: ComposerQuestionOption | null | undefined,
+): boolean {
+  return (
+    option?.singlePanelPresentation === "floating-submenu" &&
+    Boolean(option.children?.length || option.childInput)
+  );
+}
+
+function shouldSuppressSelectedChoiceAppearance(answerKey: string): boolean {
+  return (
+    SUPPRESS_SELECTED_CHOICE_APPEARANCE_ANSWER_KEYS.has(answerKey) ||
+    answerKey.startsWith("full-auto-preflight:")
+  );
+}
+
+function buildComposerQuestionResetKey(question: ComposerQuestion): string {
+  const optionSignature = question.options
+    .map((option) => {
+      const childCount = option.children?.length ?? 0;
+      const hasChildInput = option.childInput ? "input" : "plain";
+      return `${option.value}:${childCount}:${hasChildInput}`;
+    })
+    .join("|");
+
+  return [
+    question.id,
+    question.answerKey,
+    String(question.stepIndex ?? ""),
+    question.title?.trim() ?? "",
+    optionSignature,
+  ].join("::");
+}
+
+function scrollScrollableContainerOnWheel(event: ReactWheelEvent<HTMLDivElement>): void {
+  const container = event.currentTarget;
+  const maxScrollTop = container.scrollHeight - container.clientHeight;
+  if (!Number.isFinite(event.deltaY) || event.deltaY === 0 || maxScrollTop <= 0) {
+    return;
+  }
+
+  const nextScrollTop = Math.max(0, Math.min(maxScrollTop, container.scrollTop + event.deltaY));
+  if (nextScrollTop === container.scrollTop) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+  container.scrollTop = nextScrollTop;
+}
+
+function truncateOptionSummary(text: string, max = OPTION_RATIONALE_SUMMARY_MAX): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1).trimEnd()}…`;
+}
+
+function summarizeMissingRequirementRationale(rationale: string): string | null {
+  const match = rationale.match(/^缺失必要(素材|资产|条件)：(.+)$/);
+  if (!match) return null;
+
+  const prefix = match[1] === "条件" ? "缺条件" : "缺素材";
+  const items = match[2]
+    .split(/[；;]+/)
+    .map((part) => part.replace(/[。]+$/u, "").replace(/\s+/gu, " ").trim())
+    .filter(Boolean);
+
+  if (!items.length) return prefix;
+
+  const summarizedItems = Array.from(new Set(items.map((part) => {
+    const compactPart = part.replace(/[《“"'（(].*$/u, "").trim();
+    return compactPart || part;
+  })));
+  const visibleItems = summarizedItems.slice(0, 2).join("、");
+
+  return summarizedItems.length > 2
+    ? `${prefix}：${visibleItems} 等 ${summarizedItems.length} 项`
+    : `${prefix}：${visibleItems}`;
+}
+
+function summarizeOptionRationale(option: Pick<ComposerQuestionOption, "rationale">): string | null {
+  const normalized = option.rationale?.replace(/\s+/gu, " ").trim();
+  if (!normalized) return null;
+
+  const missingSummary = summarizeMissingRequirementRationale(normalized);
+  if (missingSummary) return missingSummary;
+
+  const simplified = normalized
+    .replace(/^文生视频模式：/u, "")
+    .replace(/^图生视频模式：/u, "")
+    .replace(/^当前镜头正在生成中，请先轮询这一条的最新结果。?$/u, "当前镜头生成中，先轮询结果")
+    .replace(/^已有已生成视频，可继续重新生成。?$/u, "已有视频，可直接重新生成")
+    .replace(/，请先/gu, "，先")
+    .replace(/。$/u, "");
+
+  return truncateOptionSummary(simplified);
+}
+
+function summarizeCompactNestedRationale(
+  option: Pick<ComposerQuestionOption, "rationale">,
+): string | null {
+  const summary = summarizeOptionRationale(option);
+  if (!summary) return null;
+
+  const simplified = summary
+    .replace(/^当前/u, "")
+    .replace(/^角色主参考图/u, "主图")
+    .replace(/^场景主参考图/u, "主图")
+    .replace(/角色主参考图/u, "主图")
+    .replace(/场景主参考图/u, "主图")
+    .replace(/角色参考图/u, "主图")
+    .replace(/场景参考图/u, "主图")
+    .replace(/角色变体/u, "变体")
+    .replace(/场景变体/u, "变体")
+    .replace(/已绑定/gu, "已绑")
+    .replace(/重新上传后会覆盖/gu, "重传覆盖")
+    .replace(/可继续重新生成/gu, "可重生")
+    .replace(/可继续重新/g, "可重")
+    .replace(/可整组重新生成/gu, "可整组重生")
+    .replace(/可以继续重新生成/gu, "可重生")
+    .replace(/进入后可继续[^。；，]*/gu, "")
+    .replace(/识别到/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .replace(/[；。]+$/u, "");
+
+  const parts = simplified
+    .split(/[；。]/u)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const firstPart = parts[0] ?? simplified;
+  const compact = firstPart
+    .split(/，/u)
+    .slice(0, 2)
+    .join("，")
+    .trim();
+
+  return truncateOptionSummary(compact || simplified, 24);
+}
+
+function normalizeDividerMenuSection(
+  section: string | null | undefined,
+): string | null {
+  const normalized = section?.trim().toLowerCase();
+  if (!normalized) return null;
+  return normalized;
+}
+
+function shouldRenderOptionSectionDivider(
+  options: ComposerQuestionOption[] | undefined,
+  index: number,
+): boolean {
+  if (!options || index <= 0) return false;
+  const previousSection = normalizeDividerMenuSection(options[index - 1]?.menuSection);
+  const currentSection = normalizeDividerMenuSection(options[index]?.menuSection);
+  return Boolean(previousSection && currentSection && previousSection !== currentSection);
+}
+
+function renderOptionSectionDivider(
+  key: string,
+  dark: boolean,
+): JSX.Element {
+  return (
+    <div
+      key={key}
+      role="separator"
+      data-testid={OPTION_SECTION_DIVIDER_TEST_ID}
+      className={`mx-1.5 my-2 h-[1.5px] rounded-full ${
+        dark ? "bg-white/[0.2]" : "bg-slate-400"
+      }`}
+    />
+  );
+}
+
+function renderOptionStatusLabel(
+  option: ComposerQuestionOption,
+  dark: boolean,
+): JSX.Element | null {
+  if (!option.statusLabel) return null;
+  const toneClass = option.disabled
+    ? dark
+      ? "text-slate-600"
+      : "text-slate-400"
+    : option.statusTone === "inactive"
+      ? dark
+        ? "text-slate-300"
+        : "text-slate-500"
+      : dark
+        ? "text-[#8bb3ff]"
+        : "text-[#245dff]";
+  return (
+    <span
+      className={`shrink-0 text-[12px] font-semibold leading-none tracking-[0.01em] ${toneClass}`}
+    >
+      {option.statusLabel}
+    </span>
+  );
+}
+
+function renderOptionStatusBadges(
+  option: ComposerQuestionOption,
+  dark: boolean,
+): JSX.Element | null {
+  if (!option.statusBadges?.length) return null;
+  return (
+    <span className="flex shrink-0 items-center gap-2 text-[11px] font-semibold leading-none tracking-[0.01em]">
+      {option.statusBadges.map((badge) => {
+        const toneClass =
+          badge.tone === "danger"
+            ? dark
+              ? "text-red-300"
+              : "text-red-600"
+            : badge.tone === "warning"
+              ? dark
+                ? "text-orange-300"
+                : "text-orange-600"
+              : badge.tone === "notice"
+                ? dark
+                  ? "text-yellow-300"
+                  : "text-yellow-700"
+                : badge.tone === "success"
+                  ? dark
+                    ? "text-emerald-300"
+                    : "text-emerald-600"
+                  : dark
+                    ? "text-slate-300"
+                    : "text-slate-600";
+        return (
+          <span key={`${badge.label}-${badge.value ?? ""}`} className={toneClass}>
+            {badge.label}
+            {badge.value != null ? ` ${badge.value}` : ""}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+function renderOptionStatusMeta(
+  option: ComposerQuestionOption,
+  dark: boolean,
+): JSX.Element | null {
+  const label = renderOptionStatusLabel(option, dark);
+  const badges = renderOptionStatusBadges(option, dark);
+  if (!label && !badges) return null;
+  return (
+    <div className="flex shrink-0 items-center gap-2">
+      {badges}
+      {label}
+    </div>
+  );
+}
+
+function getQuestionStatusBadgeValue(
+  question: ComposerQuestion,
+  label: string,
+): string | number | null {
+  return question.statusBadges?.find((badge) => badge.label === label)?.value ?? null;
+}
+
+const PRELIGHT_RESERVED_STATUS_BADGE_LABELS = new Set(["全自动", "总步骤", "子步骤"]);
+
+function listQuestionContextBadges(
+  question: ComposerQuestion,
+): NonNullable<ComposerQuestion["statusBadges"]> {
+  return (question.statusBadges ?? []).filter(
+    (badge) => !PRELIGHT_RESERVED_STATUS_BADGE_LABELS.has(badge.label),
+  );
 }
 
 function DevOptionToggleGroup<T extends string>({
@@ -119,24 +432,15 @@ export function DevOptionsPanel({
   devOptions,
   onSelect,
   devVideoGenerationMode,
-  devImageViewMode,
   onDevVideoGenerationModeChange,
-  onDevImageViewModeChange,
 }: {
   devOptions: ComposerQuestionOption[];
   onSelect: (value: string, label: string) => void;
   devVideoGenerationMode?: VideoGenerationMode;
-  devImageViewMode?: VideoImageGenerationPrefs["viewMode"];
   onDevVideoGenerationModeChange?: (mode: VideoGenerationMode) => void;
-  onDevImageViewModeChange?: (
-    mode: NonNullable<VideoImageGenerationPrefs["viewMode"]>,
-  ) => void;
 }) {
   const resolvedVideoMode = devVideoGenerationMode ?? "text-to-video";
-  const resolvedImageViewMode = devImageViewMode ?? "three";
-  const hasToggles = Boolean(
-    onDevVideoGenerationModeChange || onDevImageViewModeChange,
-  );
+  const hasToggles = Boolean(onDevVideoGenerationModeChange);
 
   if (!hasToggles && devOptions.length === 0 && DEV_GLOBAL_ACTIONS.length === 0) {
     return null;
@@ -150,7 +454,6 @@ export function DevOptionsPanel({
       {hasToggles ? (
         <div className="sr-only">
           <span>{`当前 ${localizeDevVideoGenerationMode(resolvedVideoMode)}，默认文生视频`}</span>
-          <span>{`当前 ${localizeDevImageViewMode(resolvedImageViewMode)}，默认三视图`}</span>
         </div>
       ) : null}
       {devOptions.length > 0 ? (
@@ -193,15 +496,6 @@ export function DevOptionsPanel({
                 ]}
                 onChange={onDevVideoGenerationModeChange}
                 testId="dev-video-generation-mode-toggle"
-              />
-              <DevOptionToggleGroup
-                value={resolvedImageViewMode}
-                options={[
-                  { value: "three", label: "三视图" },
-                  { value: "single", label: "单图" },
-                ]}
-                onChange={onDevImageViewModeChange}
-                testId="dev-image-view-mode-toggle"
               />
             </div>
           ) : null}
@@ -364,15 +658,23 @@ function GenreCategoryPicker({
   onSelect,
   dark,
   registerEscapeHandler,
+  singlePanelMode = false,
+  onNavigationDepthChange,
 }: {
   question: ComposerQuestion;
   onSelect: (value: string, label: string) => void;
   dark: boolean;
   registerEscapeHandler?: (handler: (() => boolean) | null) => void;
+  singlePanelMode?: boolean;
+  onNavigationDepthChange?: (depth: number) => void;
 }) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const panelListRef = useRef<HTMLDivElement | null>(null);
+  const questionResetKey = useMemo(
+    () => buildComposerQuestionResetKey(question),
+    [question],
+  );
   const categoryButtonRefs = useRef<Record<string, HTMLButtonElement | null>>(
     {},
   );
@@ -403,7 +705,7 @@ function GenreCategoryPicker({
   }, [allowedValues]);
 
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
-  const genrePanelId = `genre-secondary-panel-${toDomId(question.id)}`;
+  const genrePanelId = `genre-secondary-panel-${toDomId(questionResetKey)}`;
 
   const activeGenres = useMemo(
     () => groupedGenres.find(([cat]) => cat === activeCategory)?.[1] ?? [],
@@ -416,7 +718,7 @@ function GenreCategoryPicker({
 
   useEffect(() => {
     setActiveCategory(null);
-  }, [question.id]);
+  }, [questionResetKey]);
 
   useEffect(() => {
     const rootNode = rootRef.current;
@@ -456,6 +758,10 @@ function GenreCategoryPicker({
     return () => registerEscapeHandler(null);
   }, [registerEscapeHandler, activeCategory]);
 
+  useEffect(() => {
+    onNavigationDepthChange?.(activeCategory ? 1 : 0);
+  }, [activeCategory, onNavigationDepthChange]);
+
   const genrePanelMaxHeight =
     parentHeight > 0 ? parentHeight : rootTop + listHeight || 260;
   const genrePanelChromeHeight = 4;
@@ -475,6 +781,95 @@ function GenreCategoryPicker({
         )
       : undefined;
   const genrePanelTop = -rootTop;
+
+  if (singlePanelMode) {
+    return (
+      <div ref={rootRef} data-testid="genre-picker-root" className="relative">
+        <div
+          ref={listRef}
+          data-testid={activeCategory === null ? "genre-primary-list" : "genre-drilldown-list"}
+          className="flex flex-col gap-1.5"
+        >
+          {activeCategory === null
+            ? groupedGenres.map(([category]) => {
+                const selectedInCategory =
+                  groupedGenres
+                    .find(([c]) => c === category)?.[1]
+                    .filter((g) => selectedValues.has(g.value)).length ?? 0;
+                return (
+                  <button
+                    key={category}
+                    ref={(node) => {
+                      categoryButtonRefs.current[category] = node;
+                    }}
+                    type="button"
+                    onClick={() => setActiveCategory(category)}
+                    className={`flex min-h-[46px] w-full items-center justify-between rounded-[16px] border px-3.5 py-2.5 text-left transition-colors ${
+                      dark
+                        ? "border-white/[0.06] bg-white/[0.04] hover:bg-white/[0.08]"
+                        : "border-slate-200 bg-slate-50 hover:bg-white"
+                    }`}
+                  >
+                    <span
+                      className={`text-[13px] font-medium ${dark ? "text-slate-100" : "text-slate-900"}`}
+                    >
+                      {category}
+                    </span>
+                    <div className="flex items-center gap-2">
+                      {selectedInCategory > 0 ? (
+                        <span className="inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-[#0f62fe] px-1 text-[9px] font-medium text-white">
+                          {selectedInCategory}
+                        </span>
+                      ) : null}
+                      <ChevronDown
+                        className={`h-3.5 w-3.5 shrink-0 -rotate-90 ${dark ? "text-slate-400" : "text-slate-500"}`}
+                      />
+                    </div>
+                  </button>
+                );
+              })
+            : activeGenres.map((genre) => {
+                const isSelected = selectedValues.has(genre.value);
+                return (
+                  <button
+                    key={genre.value}
+                    type="button"
+                    onClick={() => onSelect(genre.value, genre.label)}
+                    className={`w-full rounded-[14px] border px-3 py-2.5 text-left transition-colors ${
+                      isSelected
+                        ? "border-[#2a73ff]/34 bg-[#0f62fe]/14"
+                        : dark
+                          ? "border-white/[0.04] bg-white/[0.025] hover:bg-white/[0.055]"
+                          : "border-slate-200/90 bg-slate-50/90 hover:bg-white"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <span
+                        className={`line-clamp-1 text-[12px] font-medium ${isSelected ? "text-white" : dark ? "text-slate-100" : "text-slate-900"}`}
+                      >
+                        {genre.label}
+                      </span>
+                      {isSelected ? (
+                        <Check className="mt-0.5 h-3 w-3 shrink-0 text-white" />
+                      ) : null}
+                    </div>
+                    <div
+                      className={`mt-1 line-clamp-2 text-[10px] leading-[1.4] ${isSelected ? "text-white/72" : dark ? "text-slate-500" : "text-slate-500"}`}
+                    >
+                      {genre.desc}
+                      <span
+                        className={`ml-1 ${isSelected ? "text-white/52" : dark ? "text-slate-600" : "text-slate-400"}`}
+                      >
+                        受众：{genre.audience}
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div ref={rootRef} data-testid="genre-picker-root" className="relative">
@@ -604,13 +999,26 @@ function NestedOptionPicker({
   onOpenConfirm,
   dark,
   registerEscapeHandler,
+  singlePanelMode = false,
+  onNavigationDepthChange,
 }: {
   question: ComposerQuestion;
   onSelect: (value: string, label: string) => void;
   onOpenConfirm: (option: ComposerQuestionOption) => void;
   dark: boolean;
   registerEscapeHandler?: (handler: (() => boolean) | null) => void;
+  singlePanelMode?: boolean;
+  onNavigationDepthChange?: (depth: number) => void;
 }) {
+  const suppressSelectedChoiceAppearance = shouldSuppressSelectedChoiceAppearance(
+    question.answerKey,
+  );
+  const clipSinglePanelOverflow =
+    question.answerKey === CHARACTER_AUDIO_PRESET_PICKER_ANSWER_KEY;
+  const questionResetKey = useMemo(
+    () => buildComposerQuestionResetKey(question),
+    [question],
+  );
   const normalizedOptions = useMemo(
     () => ensureUniqueNestedOptionIds(question.options),
     [question.options],
@@ -630,6 +1038,9 @@ function NestedOptionPicker({
   const [activeGrandchildId, setActiveGrandchildId] = useState<string | null>(
     null,
   );
+  const [activeGreatGrandchildId, setActiveGreatGrandchildId] = useState<string | null>(
+    null,
+  );
   const [expandedQuaternaryGroupIds, setExpandedQuaternaryGroupIds] = useState<Set<string>>(new Set());
   const [childCustomValue, setChildCustomValue] = useState("");
   const [desktopNestedPanelWidths, setDesktopNestedPanelWidths] = useState<{
@@ -641,13 +1052,14 @@ function NestedOptionPicker({
     secondaryTop?: number;
     tertiaryTop?: number;
     quaternaryTop?: number;
+    singlePanelFloatingTop?: number;
   }>({});
   const optionButtonRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const childButtonRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const grandchildButtonRefs = useRef<Record<string, HTMLButtonElement | null>>(
     {},
   );
-  const nestedPanelId = `nested-panel-${toDomId(question.id)}`;
+  const nestedPanelId = `nested-panel-${toDomId(questionResetKey)}`;
 
   const restoreOptionFocus = (optionId: string | null) => {
     if (!optionId) return;
@@ -670,14 +1082,24 @@ function NestedOptionPicker({
   const collapseActiveGrandchild = () => {
     if (!activeGrandchildId) return false;
     const previousGrandchildId = activeGrandchildId;
+    setActiveGreatGrandchildId(null);
     setActiveGrandchildId(null);
     restoreGrandchildFocus(previousGrandchildId);
+    return true;
+  };
+
+  const collapseActiveGreatGrandchild = () => {
+    if (!activeGreatGrandchildId) return false;
+    const previousGreatGrandchildId = activeGreatGrandchildId;
+    setActiveGreatGrandchildId(null);
+    restoreGrandchildFocus(previousGreatGrandchildId);
     return true;
   };
 
   const collapseActiveChild = () => {
     if (!activeChildId) return false;
     const previousChildId = activeChildId;
+    setActiveGreatGrandchildId(null);
     setActiveGrandchildId(null);
     setActiveChildId(null);
     setChildCustomValue("");
@@ -692,6 +1114,7 @@ function NestedOptionPicker({
     setCustomValue("");
     setActiveChildId(null);
     setActiveGrandchildId(null);
+    setActiveGreatGrandchildId(null);
     setChildCustomValue("");
     restoreOptionFocus(previousOptionId);
     return true;
@@ -702,12 +1125,14 @@ function NestedOptionPicker({
     setCustomValue("");
     setActiveChildId(null);
     setActiveGrandchildId(null);
+    setActiveGreatGrandchildId(null);
     setChildCustomValue("");
-  }, [question.id]);
+  }, [questionResetKey]);
 
   useEffect(() => {
     if (!registerEscapeHandler) return;
     registerEscapeHandler(() => {
+      if (collapseActiveGreatGrandchild()) return true;
       if (collapseActiveGrandchild()) return true;
       if (collapseActiveChild()) return true;
       if (collapseActiveOption()) return true;
@@ -716,6 +1141,7 @@ function NestedOptionPicker({
     return () => registerEscapeHandler(null);
   }, [
     registerEscapeHandler,
+    activeGreatGrandchildId,
     activeGrandchildId,
     activeChildId,
     activeOptionId,
@@ -741,12 +1167,48 @@ function NestedOptionPicker({
     [activeChild, activeGrandchildId],
   );
 
+  const activeGreatGrandchild = useMemo(
+    () =>
+      activeGrandchild?.children?.find((child) => child.id === activeGreatGrandchildId) ??
+      null,
+    [activeGrandchild, activeGreatGrandchildId],
+  );
+
+  const activeOptionUsesFloatingSubmenu = shouldUseFloatingSinglePanelSubmenu(activeOption);
+  const activeChildUsesFloatingSubmenu = shouldUseFloatingSinglePanelSubmenu(activeChild);
+  const activeGrandchildUsesFloatingSubmenu =
+    shouldUseFloatingSinglePanelSubmenu(activeGrandchild);
+  const activeGreatGrandchildUsesFloatingSubmenu =
+    shouldUseFloatingSinglePanelSubmenu(activeGreatGrandchild);
+  const activeOptionUsesDrilldown =
+    Boolean(activeOption?.children?.length || activeOption?.childInput) &&
+    !activeOptionUsesFloatingSubmenu;
+  const activeChildUsesDrilldown =
+    Boolean(activeChild?.children?.length || activeChild?.childInput) &&
+    !activeChildUsesFloatingSubmenu;
+  const activeGrandchildUsesDrilldown =
+    Boolean(activeGrandchild?.children?.length || activeGrandchild?.childInput) &&
+    !activeGrandchildUsesFloatingSubmenu;
+  const activeGreatGrandchildUsesDrilldown =
+    Boolean(activeGreatGrandchild?.children?.length || activeGreatGrandchild?.childInput) &&
+    !activeGreatGrandchildUsesFloatingSubmenu;
+  const navigationDepth =
+    (activeOptionUsesDrilldown ? 1 : 0) +
+    (activeChildUsesDrilldown ? 1 : 0) +
+    (activeGrandchildUsesDrilldown ? 1 : 0) +
+    (activeGreatGrandchildUsesDrilldown ? 1 : 0);
+
+  useEffect(() => {
+    onNavigationDepthChange?.(navigationDepth);
+  }, [navigationDepth, onNavigationDepthChange]);
+
   useEffect(() => {
     if (!activeOptionId || activeOption) return;
     setActiveOptionId(null);
     setCustomValue("");
     setActiveChildId(null);
     setActiveGrandchildId(null);
+    setActiveGreatGrandchildId(null);
     setChildCustomValue("");
     setExpandedQuaternaryGroupIds(new Set());
   }, [activeOption, activeOptionId]);
@@ -755,6 +1217,7 @@ function NestedOptionPicker({
     if (!activeChildId || activeChild) return;
     setActiveChildId(null);
     setActiveGrandchildId(null);
+    setActiveGreatGrandchildId(null);
     setChildCustomValue("");
     setExpandedQuaternaryGroupIds(new Set());
   }, [activeChild, activeChildId]);
@@ -762,8 +1225,24 @@ function NestedOptionPicker({
   useEffect(() => {
     if (!activeGrandchildId || activeGrandchild) return;
     setActiveGrandchildId(null);
+    setActiveGreatGrandchildId(null);
     setExpandedQuaternaryGroupIds(new Set());
   }, [activeGrandchild, activeGrandchildId]);
+
+  useEffect(() => {
+    if (!activeGreatGrandchildId || activeGreatGrandchild) return;
+    setActiveGreatGrandchildId(null);
+  }, [activeGreatGrandchild, activeGreatGrandchildId]);
+
+  const resetNestedSelectionState = () => {
+    setActiveOptionId(null);
+    setCustomValue("");
+    setActiveChildId(null);
+    setActiveGrandchildId(null);
+    setActiveGreatGrandchildId(null);
+    setChildCustomValue("");
+    setExpandedQuaternaryGroupIds(new Set());
+  };
 
   const hideDeepVideoWorkflowRationale =
     question.answerKey === "video-bridge-panel" ||
@@ -799,6 +1278,9 @@ function NestedOptionPicker({
       }
 
       const rootRect = rootRef.current.getBoundingClientRect();
+      const panelRect = rootRef.current
+        .closest("[data-choice-mode]")
+        ?.getBoundingClientRect();
       const availableWidth = Math.max(
         0,
         window.innerWidth - rootRect.right - NESTED_DESKTOP_EDGE_PADDING_PX,
@@ -921,6 +1403,9 @@ function NestedOptionPicker({
         secondaryTop: nextSecondaryTop,
         tertiaryTop: nextTertiaryTop,
         quaternaryTop: nextQuaternaryTop,
+        singlePanelFloatingTop: panelRect
+          ? Math.round(panelRect.top - rootRect.top)
+          : 0,
       });
     };
 
@@ -951,6 +1436,7 @@ function NestedOptionPicker({
       return;
     }
 
+    resetNestedSelectionState();
     onSelect(option.value, option.label);
   };
 
@@ -963,6 +1449,7 @@ function NestedOptionPicker({
       setCustomValue("");
       setActiveChildId(null);
       setActiveGrandchildId(null);
+      setActiveGreatGrandchildId(null);
       setChildCustomValue("");
       return;
     }
@@ -975,12 +1462,14 @@ function NestedOptionPicker({
     if (child.children?.length) {
       setActiveChildId((current) => (current === child.id ? null : child.id));
       setActiveGrandchildId(null);
+      setActiveGreatGrandchildId(null);
       setChildCustomValue("");
       return;
     }
     if (child.childInput) {
       setActiveChildId((current) => (current === child.id ? null : child.id));
       setActiveGrandchildId(null);
+      setActiveGreatGrandchildId(null);
       setChildCustomValue("");
       return;
     }
@@ -993,10 +1482,22 @@ function NestedOptionPicker({
       setActiveGrandchildId((current) =>
         current === grandchild.id ? null : grandchild.id,
       );
+      setActiveGreatGrandchildId(null);
       setExpandedQuaternaryGroupIds(new Set());
       return;
     }
     handleLeafSelection(grandchild);
+  };
+
+  const handleGreatGrandchildClick = (greatGrandchild: ComposerQuestionOption) => {
+    if (greatGrandchild.disabled) return;
+    if (greatGrandchild.children?.length) {
+      setActiveGreatGrandchildId((current) =>
+        current === greatGrandchild.id ? null : greatGrandchild.id,
+      );
+      return;
+    }
+    handleLeafSelection(greatGrandchild);
   };
 
   const toggleQuaternaryGroup = (id: string) => {
@@ -1101,7 +1602,8 @@ function NestedOptionPicker({
   };
 
   const renderDisabledRationale = (option: ComposerQuestionOption) => {
-    if (!option.disabled || !option.rationale) return null;
+    const rationaleSummary = summarizeOptionRationale(option);
+    if (!option.disabled || !rationaleSummary) return null;
     return (
       <div
         className={`mt-1.5 rounded-[10px] border px-2 py-1.5 text-[10px] leading-[1.45] ${
@@ -1110,7 +1612,7 @@ function NestedOptionPicker({
             : "border-amber-200 bg-amber-50 text-amber-800"
         }`}
       >
-        {option.rationale}
+        {rationaleSummary}
       </div>
     );
   };
@@ -1160,14 +1662,391 @@ function NestedOptionPicker({
       ? { top: `${desktopNestedPanelOffsets.quaternaryTop}px` }
       : {}),
   };
+  const singlePanelFloatingPositionStyle = {
+    ...(desktopNestedPanelOffsets.singlePanelFloatingTop != null
+      ? { top: `${desktopNestedPanelOffsets.singlePanelFloatingTop}px` }
+      : {}),
+  };
+  const activeSinglePanelFloatingOption = activeGreatGrandchildUsesFloatingSubmenu
+    ? activeGreatGrandchild
+    : activeGrandchildUsesFloatingSubmenu
+      ? activeGrandchild
+      : activeChildUsesFloatingSubmenu
+        ? activeChild
+        : activeOptionUsesFloatingSubmenu
+          ? activeOption
+          : null;
+
+  if (singlePanelMode) {
+    const currentOptions =
+      (activeGreatGrandchildUsesDrilldown ? activeGreatGrandchild?.children : null) ??
+      (activeGrandchildUsesDrilldown ? activeGrandchild?.children : null) ??
+      (activeChildUsesDrilldown ? activeChild?.children : null) ??
+      (activeOptionUsesDrilldown ? activeOption?.children : null) ??
+      normalizedOptions;
+    const currentInputConfig = activeChildUsesDrilldown
+      ? activeChild?.childInput ?? null
+      : activeOptionUsesDrilldown
+        ? activeOption?.childInput ?? null
+        : null;
+    const showChildInputOnly =
+      activeChildUsesDrilldown &&
+      Boolean(activeChild?.childInput) &&
+      !activeChild?.children?.length;
+    const showOptionCustomInput =
+      activeOptionUsesDrilldown && Boolean(activeOption?.childInput);
+
+    return (
+      <div
+        ref={rootRef}
+        className={`relative flex h-full min-h-0 flex-col ${
+          clipSinglePanelOverflow ? "overflow-hidden" : "overflow-visible"
+        }`}
+      >
+        <div
+          ref={primaryListRef}
+          data-testid="genre-primary-option-list"
+          className={NESTED_PRIMARY_LIST_CLASS}
+          onWheelCapture={
+            clipSinglePanelOverflow ? scrollScrollableContainerOnWheel : undefined
+          }
+        >
+          {!showChildInputOnly
+            ? currentOptions?.map((option, optionIndex) => {
+                const hasChildren = Boolean(option.children?.length || option.childInput);
+                const isActive =
+                  (navigationDepth === 0 && activeOptionId === option.id) ||
+                  (navigationDepth === 1 && activeChildId === option.id) ||
+                  (navigationDepth === 2 && activeGrandchildId === option.id) ||
+                  (navigationDepth >= 3 && activeGreatGrandchildId === option.id);
+                const showSelectedState =
+                  option.selected && !suppressSelectedChoiceAppearance;
+                const optionSummary = summarizeOptionRationale(option);
+                const showSectionDivider = shouldRenderOptionSectionDivider(currentOptions, optionIndex);
+
+                const handleClick = () => {
+                  if (navigationDepth === 0) {
+                    handlePrimaryClick(option);
+                    return;
+                  }
+                  if (navigationDepth === 1) {
+                    handleChildClick(option);
+                    return;
+                  }
+                  if (navigationDepth === 2) {
+                    handleGrandchildClick(option);
+                    return;
+                  }
+                  handleGreatGrandchildClick(option);
+                };
+
+                return (
+                  <Fragment key={option.id}>
+                    {showSectionDivider
+                      ? renderOptionSectionDivider(
+                          `${option.id}-section-divider`,
+                          dark,
+                        )
+                      : null}
+                    <button
+                      ref={(node) => {
+                        if (navigationDepth === 0) {
+                          optionButtonRefs.current[option.id] = node;
+                          if (currentOptions?.[0]?.id === option.id) firstPrimaryOptionRef.current = node;
+                        } else if (navigationDepth === 1) {
+                          childButtonRefs.current[option.id] = node;
+                          if (currentOptions?.[0]?.id === option.id) firstSecondaryOptionRef.current = node;
+                        } else if (navigationDepth === 2) {
+                          grandchildButtonRefs.current[option.id] = node;
+                          if (currentOptions?.[0]?.id === option.id) firstTertiaryOptionRef.current = node;
+                        } else {
+                          grandchildButtonRefs.current[option.id] = node;
+                          if (currentOptions?.[0]?.id === option.id) firstQuaternaryOptionRef.current = node;
+                        }
+                      }}
+                      type="button"
+                      disabled={option.disabled}
+                      onClick={handleClick}
+                      aria-expanded={hasChildren ? isActive : undefined}
+                      className={`flex min-h-[54px] w-full items-start justify-between gap-3 rounded-[16px] border px-3.5 py-3 text-left transition-colors ${
+                        showSelectedState
+                          ? "border-[#2a73ff]/40 bg-[#0f62fe]/16 text-white"
+                          : option.disabled
+                            ? dark
+                              ? "cursor-not-allowed border-white/[0.05] bg-white/[0.025] text-slate-500 opacity-55"
+                              : "cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400 opacity-70"
+                            : dark
+                              ? "border-white/[0.06] bg-white/[0.04] hover:bg-white/[0.08]"
+                              : "border-slate-200 bg-slate-50 hover:bg-white"
+                      }`}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div
+                          className={`text-[12.5px] font-medium ${
+                            showSelectedState
+                              ? "text-white"
+                              : option.disabled
+                                ? dark
+                                  ? "text-slate-500"
+                                  : "text-slate-400"
+                                : dark
+                                  ? "text-slate-100"
+                                  : "text-slate-900"
+                          } line-clamp-1 pr-1 leading-[1.35]`}
+                        >
+                          {option.label}
+                        </div>
+                        {!option.disabled && optionSummary ? (
+                          <div
+                            className={`mt-1 line-clamp-1 text-[10px] leading-[1.45] ${
+                              showSelectedState
+                                ? "text-white/78"
+                                : dark
+                                  ? "text-slate-500"
+                                  : "text-slate-500"
+                            }`}
+                          >
+                            {optionSummary}
+                          </div>
+                        ) : null}
+                        {renderDisabledRationale(option)}
+                      </div>
+                      <div className="flex items-center gap-2 pt-0.5">
+                        {renderOptionStatusMeta(option, dark)}
+                        {hasChildren ? (
+                          <ChevronDown className="h-4 w-4 shrink-0 -rotate-90" />
+                        ) : showSelectedState ? (
+                          <Check className="h-4 w-4 shrink-0" />
+                        ) : null}
+                      </div>
+                    </button>
+                  </Fragment>
+                );
+              })
+            : null}
+
+          {showOptionCustomInput && currentInputConfig && navigationDepth === 1 ? (
+            <div
+              className={`space-y-2 rounded-[12px] border px-3 py-3 ${
+                dark
+                  ? "border-white/[0.05] bg-white/[0.03]"
+                  : "border-slate-200 bg-slate-50/80"
+              }`}
+            >
+              <div
+                className={`text-[11px] font-medium ${dark ? "text-slate-200" : "text-slate-800"}`}
+              >
+                自定义
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type={isNumberInput ? "number" : "text"}
+                  min={isNumberInput ? currentInputConfig.min : undefined}
+                  max={isNumberInput ? currentInputConfig.max : undefined}
+                  minLength={!isNumberInput ? currentInputConfig.minLength : undefined}
+                  maxLength={!isNumberInput ? currentInputConfig.maxLength : undefined}
+                  pattern={!isNumberInput ? currentInputConfig.pattern : undefined}
+                  value={customValue}
+                  onChange={(event) => setCustomValue(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      submitCustomValue();
+                    }
+                  }}
+                  placeholder={currentInputConfig.placeholder}
+                  className={`h-9 min-w-0 flex-1 rounded-[10px] border px-3 text-[12px] outline-none transition-colors ${
+                    dark
+                      ? "border-white/[0.08] bg-[#0f1115] text-slate-100 placeholder:text-slate-500 focus:border-[#2a73ff]/50"
+                      : "border-slate-200 bg-white text-slate-900 placeholder:text-slate-400 focus:border-[#2a73ff]/50"
+                  }`}
+                />
+                {currentInputConfig.suffix ? (
+                  <span className={`text-[11px] ${dark ? "text-slate-400" : "text-slate-500"}`}>
+                    {currentInputConfig.suffix}
+                  </span>
+                ) : null}
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                className="h-8 w-full rounded-full bg-[#0f62fe] px-3.5 text-[12px] text-white shadow-[0_8px_16px_rgba(15,98,254,0.16)] hover:bg-[#1b6fff]"
+                onClick={submitCustomValue}
+                disabled={!customValueInRange}
+              >
+                {currentInputConfig.buttonLabel ?? "确认"}
+              </Button>
+            </div>
+          ) : null}
+
+          {showChildInputOnly && currentInputConfig ? (
+            <div
+              className={`space-y-2 rounded-[12px] border px-3 py-3 ${
+                dark
+                  ? "border-white/[0.05] bg-white/[0.03]"
+                  : "border-slate-200 bg-slate-50/80"
+              }`}
+            >
+              <div
+                className={`text-[11px] leading-[1.55] ${dark ? "text-slate-300" : "text-slate-600"}`}
+              >
+                {activeChild?.rationale ?? "补充内容后继续。"}
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type={isChildNumberInput ? "number" : "text"}
+                  min={isChildNumberInput ? currentInputConfig.min : undefined}
+                  max={isChildNumberInput ? currentInputConfig.max : undefined}
+                  minLength={!isChildNumberInput ? currentInputConfig.minLength : undefined}
+                  maxLength={!isChildNumberInput ? currentInputConfig.maxLength : undefined}
+                  pattern={!isChildNumberInput ? currentInputConfig.pattern : undefined}
+                  value={childCustomValue}
+                  onChange={(event) => setChildCustomValue(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      submitChildCustomValue();
+                    }
+                  }}
+                  placeholder={currentInputConfig.placeholder}
+                  className={`h-10 min-w-0 flex-1 rounded-[10px] border px-3 text-[12px] outline-none transition-colors ${
+                    dark
+                      ? "border-white/[0.08] bg-[#0f1115] text-slate-100 placeholder:text-slate-500 focus:border-[#2a73ff]/50"
+                      : "border-slate-200 bg-white text-slate-900 placeholder:text-slate-400 focus:border-[#2a73ff]/50"
+                  }`}
+                />
+                {currentInputConfig.suffix ? (
+                  <span className={`text-[11px] ${dark ? "text-slate-400" : "text-slate-500"}`}>
+                    {currentInputConfig.suffix}
+                  </span>
+                ) : null}
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                className="h-8 w-full rounded-full bg-[#0f62fe] px-3.5 text-[12px] text-white shadow-[0_8px_16px_rgba(15,98,254,0.16)] hover:bg-[#1b6fff]"
+                onClick={submitChildCustomValue}
+                disabled={!childCustomValueInRange}
+              >
+                {currentInputConfig.buttonLabel ?? "确认"}
+              </Button>
+            </div>
+          ) : null}
+        </div>
+
+        {activeSinglePanelFloatingOption?.children?.length ? (
+            <div
+              className="relative mt-2 sm:absolute sm:left-[calc(100%+14px)] sm:mt-0"
+              style={singlePanelFloatingPositionStyle}
+            >
+              <div
+                data-testid="single-panel-floating-submenu"
+                className={`z-20 w-full ${NESTED_PANEL_FRAME_CLASS} sm:w-auto ${
+                  dark
+                    ? "border-white/[0.05] bg-[linear-gradient(180deg,rgba(25,26,29,0.94),rgba(21,22,25,0.97))] shadow-[0_8px_18px_rgba(0,0,0,0.16)] backdrop-blur-md"
+                    : "border-slate-200/85 bg-white/98 shadow-[0_6px_16px_rgba(148,163,184,0.12)]"
+                }`}
+                style={secondaryDesktopStyle}
+              >
+                <div
+                  className={`${NESTED_PANEL_HEADER_CLASS} ${dark ? "text-slate-300" : "text-slate-700"}`}
+                >
+                  {activeSinglePanelFloatingOption.label}
+                </div>
+                <div className={NESTED_PANEL_SCROLL_LIST_CLASS}>
+                  {activeSinglePanelFloatingOption.children.map((child, childIndex) => {
+                    const showChildSelectedState =
+                      child.selected && !suppressSelectedChoiceAppearance;
+                    const childSummary = summarizeCompactNestedRationale(child);
+                    const showSectionDivider = shouldRenderOptionSectionDivider(
+                      activeSinglePanelFloatingOption.children,
+                      childIndex,
+                    );
+                    return (
+                      <Fragment key={child.id}>
+                        {showSectionDivider
+                          ? renderOptionSectionDivider(
+                              `${child.id}-section-divider`,
+                              dark,
+                            )
+                          : null}
+                        <button
+                          type="button"
+                          disabled={child.disabled}
+                          onClick={() => handleLeafSelection(child)}
+                          className={`${NESTED_PANEL_OPTION_CLASS} ${
+                            showChildSelectedState
+                              ? "border-[#2a73ff]/34 bg-[#0f62fe]/14"
+                              : child.disabled
+                                ? dark
+                                  ? "cursor-not-allowed border-white/[0.04] bg-white/[0.02] opacity-55"
+                                  : "cursor-not-allowed border-slate-200/90 bg-slate-100/90 opacity-70"
+                                : dark
+                                  ? "border-white/[0.04] bg-white/[0.025] hover:bg-white/[0.055]"
+                                  : "border-slate-200/90 bg-slate-50/90 hover:bg-white"
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-1.5">
+                            <span
+                              className={`line-clamp-1 text-[12px] font-medium ${
+                                showChildSelectedState
+                                  ? "text-white"
+                                  : child.disabled
+                                    ? dark
+                                      ? "text-slate-500"
+                                      : "text-slate-400"
+                                    : dark
+                                      ? "text-slate-100"
+                                      : "text-slate-900"
+                              }`}
+                            >
+                              {child.label}
+                            </span>
+                            {showChildSelectedState ? (
+                              <Check className="mt-0.5 h-3 w-3 shrink-0 text-white" />
+                            ) : null}
+                          </div>
+                          {!child.disabled && childSummary ? (
+                            <div
+                              className={`mt-0.5 line-clamp-1 text-[9.5px] leading-[1.35] ${
+                                showChildSelectedState
+                                  ? "text-white/72"
+                                  : dark
+                                    ? "text-slate-500"
+                                    : "text-slate-500"
+                              }`}
+                            >
+                              {childSummary}
+                            </div>
+                          ) : null}
+                          {renderDisabledRationale(child)}
+                        </button>
+                      </Fragment>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          ) : null}
+      </div>
+    );
+  }
+
   return (
-    <div ref={rootRef} className="relative">
-      <div ref={primaryListRef} className="flex flex-col gap-1.5">
+    <div ref={rootRef} className="relative flex h-full min-h-0 flex-col overflow-visible">
+      <div
+        ref={primaryListRef}
+        data-testid="nested-primary-option-list"
+        className={NESTED_PRIMARY_LIST_CLASS}
+      >
         {normalizedOptions.map((option) => {
           const hasChildren = Boolean(
             option.children?.length || option.childInput,
           );
           const isActive = activeOptionId === option.id;
+          const showSelectedState =
+            option.selected && !suppressSelectedChoiceAppearance;
+          const optionSummary = summarizeOptionRationale(option);
 
           return (
             <button
@@ -1184,7 +2063,7 @@ function NestedOptionPicker({
               aria-expanded={hasChildren ? isActive : undefined}
               aria-controls={hasChildren ? nestedPanelId : undefined}
               className={`flex min-h-[54px] w-full items-start justify-between gap-3 rounded-[16px] border px-3.5 py-3 text-left transition-colors ${
-                option.selected
+                showSelectedState
                   ? "border-[#2a73ff]/40 bg-[#0f62fe]/16 text-white"
                   : option.disabled
                     ? dark
@@ -1198,7 +2077,7 @@ function NestedOptionPicker({
               <div className="min-w-0 flex-1">
                 <div
                   className={`text-[12.5px] font-medium ${
-                    option.selected
+                    showSelectedState
                       ? "text-white"
                       : option.disabled
                         ? dark
@@ -1211,26 +2090,28 @@ function NestedOptionPicker({
                 >
                   {option.label}
                 </div>
-                {option.rationale ? (
+                {!option.disabled && optionSummary ? (
                   <div
                     className={`mt-1 line-clamp-1 text-[10px] leading-[1.45] ${
-                      option.selected
+                      showSelectedState
                         ? "text-white/78"
                         : dark
                           ? "text-slate-500"
                           : "text-slate-500"
                     }`}
                   >
-                    {option.rationale}
+                    {optionSummary}
                   </div>
                 ) : null}
+                {renderDisabledRationale(option)}
               </div>
               <div className="flex items-center gap-2 pt-0.5">
+                {renderOptionStatusMeta(option, dark)}
                 {hasChildren ? (
                   <ChevronDown
                     className={`h-4 w-4 shrink-0 transition-transform ${isActive ? "-rotate-90" : ""}`}
                   />
-                ) : option.selected ? (
+                ) : showSelectedState ? (
                   <Check className="h-4 w-4 shrink-0" />
                 ) : null}
               </div>
@@ -1262,11 +2143,14 @@ function NestedOptionPicker({
                 {activeOption.label}
               </div>
 
-              <div className={NESTED_PANEL_LIST_CLASS}>
+              <div className={NESTED_PANEL_SCROLL_LIST_CLASS}>
                 {activeOption.children?.map((child) => {
                   const childHasInput = Boolean(child.childInput);
                   const childHasChildren = Boolean(child.children?.length);
                   const isChildActive = activeChildId === child.id;
+                  const showChildSelectedState =
+                    child.selected && !suppressSelectedChoiceAppearance;
+                  const childSummary = summarizeCompactNestedRationale(child);
                   return (
                     <div key={child.id}>
                       <button
@@ -1290,7 +2174,7 @@ function NestedOptionPicker({
                             : undefined
                         }
                         className={`${NESTED_PANEL_OPTION_CLASS} ${
-                          child.selected
+                          showChildSelectedState
                             ? "border-[#2a73ff]/34 bg-[#0f62fe]/14"
                             : child.disabled
                               ? dark
@@ -1304,7 +2188,7 @@ function NestedOptionPicker({
                         <div className="flex items-start justify-between gap-1.5">
                           <span
                             className={`line-clamp-1 text-[12px] font-medium ${
-                              child.selected
+                              showChildSelectedState
                                 ? "text-white"
                                 : child.disabled
                                   ? dark
@@ -1317,6 +2201,7 @@ function NestedOptionPicker({
                           >
                             {child.label}
                           </span>
+                          {renderOptionStatusMeta(child, dark)}
                           {childHasChildren ? (
                             <ChevronDown
                               className={`mt-0.5 h-3 w-3 shrink-0 transition-transform ${isChildActive ? "-rotate-90" : ""} ${dark ? "text-slate-400" : "text-slate-500"}`}
@@ -1325,21 +2210,21 @@ function NestedOptionPicker({
                             <ChevronDown
                               className={`mt-0.5 h-3 w-3 shrink-0 transition-transform ${isChildActive ? "-rotate-90" : ""} ${dark ? "text-slate-400" : "text-slate-500"}`}
                             />
-                          ) : child.selected ? (
+                          ) : showChildSelectedState ? (
                             <Check className="mt-0.5 h-3 w-3 shrink-0 text-white" />
                           ) : null}
                         </div>
-                        {!child.disabled && child.rationale ? (
+                        {!child.disabled && childSummary ? (
                           <div
-                            className={`mt-1 line-clamp-1 text-[10px] leading-[1.4] ${
-                              child.selected
+                            className={`mt-0.5 line-clamp-1 text-[9.5px] leading-[1.35] ${
+                              showChildSelectedState
                                 ? "text-white/72"
                                 : dark
                                   ? "text-slate-500"
                                   : "text-slate-500"
                             }`}
                           >
-                            {child.rationale}
+                            {childSummary}
                           </div>
                         ) : null}
                         {renderDisabledRationale(child)}
@@ -1634,11 +2519,11 @@ function NestedOptionPicker({
                             />
                           ) : null}
                         </div>
-                        {shouldShowDeepNestedRationale(grandchild) ? (
+                        {shouldShowDeepNestedRationale(grandchild) && summarizeCompactNestedRationale(grandchild) ? (
                           <div
-                            className={`mt-1 line-clamp-2 text-[10px] leading-[1.4] ${dark ? "text-slate-500" : "text-slate-500"}`}
+                            className={`mt-1 line-clamp-1 text-[10px] leading-[1.35] ${dark ? "text-slate-500" : "text-slate-500"}`}
                           >
-                            {grandchild.rationale}
+                            {summarizeCompactNestedRationale(grandchild)}
                           </div>
                         ) : null}
                         {renderDisabledRationale(grandchild)}
@@ -1692,9 +2577,9 @@ function NestedOptionPicker({
                                   className={`mt-0.5 h-3 w-3 shrink-0 transition-transform ${isGroupExpanded ? "rotate-180" : ""} ${dark ? "text-slate-400" : "text-slate-500"}`}
                                 />
                               </div>
-                              {shouldShowDeepNestedRationale(leaf) ? (
-                                <div className={`mt-1 line-clamp-2 text-[10px] leading-[1.45] ${dark ? "text-slate-400" : "text-slate-500"}`}>
-                                  {leaf.rationale}
+                              {shouldShowDeepNestedRationale(leaf) && summarizeCompactNestedRationale(leaf) ? (
+                                <div className={`mt-1 line-clamp-1 text-[10px] leading-[1.35] ${dark ? "text-slate-400" : "text-slate-500"}`}>
+                                  {summarizeCompactNestedRationale(leaf)}
                                 </div>
                               ) : null}
                             </button>
@@ -1723,9 +2608,9 @@ function NestedOptionPicker({
                                     }`}>
                                       {child.label}
                                     </div>
-                                    {shouldShowDeepNestedRationale(child) ? (
-                                      <div className={`mt-1 line-clamp-2 text-[10px] leading-[1.45] ${dark ? "text-slate-400" : "text-slate-500"}`}>
-                                        {child.rationale}
+                                    {shouldShowDeepNestedRationale(child) && summarizeCompactNestedRationale(child) ? (
+                                      <div className={`mt-1 line-clamp-1 text-[10px] leading-[1.35] ${dark ? "text-slate-400" : "text-slate-500"}`}>
+                                        {summarizeCompactNestedRationale(child)}
                                       </div>
                                     ) : null}
                                     {renderDisabledRationale(child)}
@@ -1746,7 +2631,7 @@ function NestedOptionPicker({
                           disabled={leaf.disabled}
                           onClick={() => handleLeafSelection(leaf)}
                           className={`${NESTED_PANEL_OPTION_CLASS} ${
-                            leaf.selected
+                            leaf.selected && !suppressSelectedChoiceAppearance
                               ? "border-[#2a73ff]/34 bg-[#0f62fe]/14"
                               : leaf.disabled
                                 ? dark
@@ -1760,7 +2645,7 @@ function NestedOptionPicker({
                           <div className="flex items-start justify-between gap-2">
                             <div
                               className={`text-[12px] font-medium ${
-                                leaf.selected
+                                leaf.selected && !suppressSelectedChoiceAppearance
                                   ? "text-white"
                                   : leaf.disabled
                                     ? dark ? "text-slate-500" : "text-slate-400"
@@ -1769,13 +2654,13 @@ function NestedOptionPicker({
                             >
                               {leaf.label}
                             </div>
-                            {leaf.selected ? (
+                            {leaf.selected && !suppressSelectedChoiceAppearance ? (
                               <Check className="mt-0.5 h-3 w-3 shrink-0 text-white" />
                             ) : null}
                           </div>
-                          {shouldShowDeepNestedRationale(leaf) ? (
-                            <div className={`mt-1 line-clamp-2 text-[10px] leading-[1.45] ${dark ? "text-slate-400" : "text-slate-500"}`}>
-                              {leaf.rationale}
+                          {shouldShowDeepNestedRationale(leaf) && summarizeCompactNestedRationale(leaf) ? (
+                            <div className={`mt-1 line-clamp-1 text-[10px] leading-[1.35] ${dark ? "text-slate-400" : "text-slate-500"}`}>
+                              {summarizeCompactNestedRationale(leaf)}
                             </div>
                           ) : null}
                           {renderDisabledRationale(leaf)}
@@ -1798,31 +2683,51 @@ export function ComposerChoicePanel({
   onSelect,
   onConfirm,
   onBack,
+  onReset,
   onDismiss,
   canConfirm = false,
   tone = "dark",
   devMode = false,
+  showVideoModeBadge = false,
   devVideoGenerationMode,
-  devImageViewMode,
   onDevVideoGenerationModeChange,
-  onDevImageViewModeChange,
 }: ComposerChoicePanelProps) {
   const dark = tone === "dark";
+  const useSinglePanelDrilldownNavigation = usesSinglePanelDrilldownNavigation(question.answerKey);
+  const clipNestedPanelToFrame =
+    question.answerKey === CHARACTER_AUDIO_PRESET_PICKER_ANSWER_KEY;
+  const questionResetKey = useMemo(
+    () => buildComposerQuestionResetKey(question),
+    [question],
+  );
   const [collapsed, setCollapsed] = useState(false);
   const [inlineConfirm, setInlineConfirm] =
     useState<ComposerQuestionOption | null>(null);
+  const [nestedNavigationDepth, setNestedNavigationDepth] = useState(0);
   const collapsedButtonRef = useRef<HTMLButtonElement | null>(null);
   const nestedEscapeHandlerRef = useRef<(() => boolean) | null>(null);
-  const panelBodyId = `composer-choice-panel-body-${toDomId(question.id)}`;
+  const panelBodyId = `composer-choice-panel-body-${toDomId(questionResetKey)}`;
+  const composerCustomCapture = useMemo(
+    () => getComposerCustomCaptureDescriptor(question),
+    [question],
+  );
+  const filteredOptions = useMemo(
+    () =>
+      filterComposerQuestionOptions(
+        question.options,
+        composerCustomCapture?.hiddenOptionIds ?? [],
+      ),
+    [composerCustomCapture, question.options],
+  );
 
   // 分离主选项和 dev 专属选项
   const mainOptions = useMemo(
-    () => question.options.filter((o) => !o.devOnly),
-    [question.options],
+    () => filteredOptions.filter((o) => !o.devOnly),
+    [filteredOptions],
   );
   const devOptions = useMemo(
-    () => question.options.filter((o) => o.devOnly),
-    [question.options],
+    () => filteredOptions.filter((o) => o.devOnly),
+    [filteredOptions],
   );
   // 用 mainOptions 替代 question.options 参与布局计算
   const visibleQuestion = useMemo(
@@ -1835,13 +2740,55 @@ export function ComposerChoicePanel({
   const hasNestedOptions = visibleQuestion.options.some(
     (option) => option.children?.length || option.childInput,
   );
+  const resolvedShowVideoModeBadge = Boolean(showVideoModeBadge && devVideoGenerationMode);
   const showQuestionStepIndicator =
     question.totalSteps > 1 &&
     question.answerKey !== "video-kickoff-prefs-mode";
-  const showVideoModeBadge =
-    question.answerKey.startsWith("video-") &&
-    question.answerKey !== "video-kickoff-prefs-mode" &&
+  const shouldShowVideoModeBadge =
+    shouldTreatAsVideoWorkflowPanel(question) &&
+    !shouldHideVideoModeBadge(question) &&
+    resolvedShowVideoModeBadge &&
     Boolean(devVideoGenerationMode);
+  const questionAutoPhaseValue = getQuestionStatusBadgeValue(question, "全自动");
+  const questionContextBadges = listQuestionContextBadges(question);
+  const questionMajorStepValue = getQuestionStatusBadgeValue(question, "总步骤");
+  const questionSubstepValue = getQuestionStatusBadgeValue(question, "子步骤");
+  const questionSubstepDisplayValue: string | null = null;
+  const shouldUseStatusStepPills =
+    question.answerKey.startsWith("full-auto-preflight:") &&
+    (questionAutoPhaseValue != null ||
+      questionContextBadges.length > 0 ||
+      questionMajorStepValue != null ||
+      questionSubstepDisplayValue != null);
+  const preflightPhasePillClass = dark
+    ? "border border-sky-400/20 bg-sky-500/10 text-sky-200"
+    : "border border-sky-200 bg-sky-50 text-sky-600";
+  const preflightContextPillClass = dark
+    ? "border border-violet-400/20 bg-violet-500/10 text-violet-200"
+    : "border border-violet-200 bg-violet-50 text-violet-600";
+  const preflightTextModePillClass = dark
+    ? "border border-sky-400/20 bg-sky-500/10 text-sky-200"
+    : "border border-sky-200 bg-sky-50 text-sky-600";
+  const preflightImageModePillClass = dark
+    ? "border border-violet-400/20 bg-violet-500/14 text-violet-200"
+    : "border border-violet-200 bg-violet-50 text-violet-600";
+  const preflightModePillClass = dark
+    ? "border border-cyan-400/20 bg-cyan-500/10 text-cyan-200"
+    : "border border-cyan-200 bg-cyan-50 text-cyan-600";
+  const preflightMajorPillClass = dark
+    ? "border border-white/[0.08] bg-white/[0.05] text-slate-400"
+    : "border border-slate-200 bg-slate-100 text-slate-500";
+  const preflightSubstepPillClass = dark
+    ? "border border-orange-400/20 bg-orange-500/10 text-orange-200"
+    : "border border-orange-200 bg-orange-50 text-orange-600";
+  const getPreflightContextPillClass = (
+    badge: NonNullable<ComposerQuestion["statusBadges"]>[number],
+  ) => {
+    if (badge.label !== "视频模式") return preflightContextPillClass;
+    if (badge.value === "文生视频") return preflightTextModePillClass;
+    if (badge.value === "图生视频") return preflightImageModePillClass;
+    return preflightModePillClass;
+  };
   const autoCompactChoiceMode =
     !isGenreQuestion &&
     !hasNestedOptions &&
@@ -1857,6 +2804,9 @@ export function ComposerChoicePanel({
       : visibleQuestion.presentation === "card"
         ? false
         : autoCompactChoiceMode;
+  const suppressSelectedChoiceAppearance = shouldSuppressSelectedChoiceAppearance(
+    visibleQuestion.answerKey,
+  );
   const helperCopy = visibleQuestion.multiSelect
     ? "\u53ef\u591a\u9009\u3002\u5148\u70b9\u9009\u5efa\u8bae\uff0c\u518d\u8865\u5145\u8f93\u5165\u3002"
     : visibleQuestion.submissionMode === "confirm"
@@ -1864,14 +2814,30 @@ export function ComposerChoicePanel({
         ? "\u786e\u8ba4\u540e\u76f4\u63a5\u6267\u884c\u3002"
         : "\u5148\u9009\u4e00\u4e2a\u65b9\u5411\uff0c\u518d\u786e\u8ba4\u7ee7\u7eed\u3002"
       : "\u70b9\u4efb\u4e00\u5efa\u8bae\u5373\u53ef\u76f4\u63a5\u63d0\u4ea4\u3002";
+  const renderTopLevelDisabledRationale = (option: ComposerQuestionOption) => {
+    const rationaleSummary = summarizeOptionRationale(option);
+    if (!option.disabled || !rationaleSummary) return null;
+    return (
+      <div
+        className={`mt-1.5 rounded-[10px] border px-2 py-1.5 text-[10px] leading-[1.45] ${
+          dark
+            ? "border-amber-400/20 bg-amber-500/10 text-amber-200"
+            : "border-amber-200 bg-amber-50 text-amber-800"
+        }`}
+      >
+        {rationaleSummary}
+      </div>
+    );
+  };
   const bottomHint =
-    visibleQuestion.submissionMode === "confirm" || visibleQuestion.multiSelect
+    composerCustomCapture?.panelHint ??
+    (visibleQuestion.submissionMode === "confirm" || visibleQuestion.multiSelect
       ? visibleQuestion.allowCustomInput
         ? "\u4e5f\u53ef\u5728\u5e95\u90e8\u8f93\u5165\u6846\u8865\u5145\u8bf4\u660e\u3002"
         : "\u5982\u679c\u4e0d\u9700\u8981\u8865\u5145\u8f93\u5165\uff0c\u53ef\u4ee5\u76f4\u63a5\u7ee7\u7eed\u3002"
       : visibleQuestion.allowCustomInput
         ? "\u4e5f\u53ef\u5728\u5e95\u90e8\u8f93\u5165\u6846\u586b\u5199\u81ea\u5b9a\u4e49\u7b54\u6848\uff0c\u4e0d\u5fc5\u53d7\u9884\u8bbe\u9009\u9879\u9650\u5236\u3002"
-        : null;
+        : null);
   const isSingleActionCard =
     !compactChoiceMode &&
     !visibleQuestion.multiSelect &&
@@ -1881,6 +2847,13 @@ export function ComposerChoicePanel({
     !compactChoiceMode && visibleQuestion.options.length <= 2;
   const useRelaxedPanelSpacing =
     !compactChoiceMode && visibleQuestion.options.length <= 2;
+  const shouldUseScrollableChipList =
+    compactChoiceMode && visibleQuestion.options.length > 8;
+  const shouldUseScrollableCardList =
+    !compactChoiceMode &&
+    !isSingleActionCard &&
+    !useRelaxedCardListHeight &&
+    visibleQuestion.options.length > 3;
 
   const handleBackAction = () => {
     if (!isGenreQuestion && nestedEscapeHandlerRef.current?.()) return;
@@ -1890,12 +2863,16 @@ export function ComposerChoicePanel({
   useEffect(() => {
     setCollapsed(false);
     setInlineConfirm(null);
-  }, [question.id]);
+    setNestedNavigationDepth(0);
+  }, [questionResetKey]);
 
   useEffect(() => {
     if (!collapsed) return;
     window.setTimeout(() => collapsedButtonRef.current?.focus(), 0);
   }, [collapsed]);
+
+  const showBackButton = Boolean(onBack || nestedNavigationDepth > 0);
+  const showResetButton = Boolean(onReset && shouldUseStatusStepPills);
 
   const handlePanelKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "Escape") return;
@@ -1927,15 +2904,23 @@ export function ComposerChoicePanel({
     <div
       onKeyDownCapture={handlePanelKeyDown}
       data-choice-mode={compactChoiceMode ? "chip" : "card"}
-      className={`w-full max-w-[488px] rounded-[18px] border p-2 sm:p-2.5 ${
+          className={`flex w-full max-w-[488px] flex-col border ${
+        collapsed ? "rounded-[10px] px-1.5 py-1" : "rounded-[18px] px-2 pb-1 pt-1 sm:px-2.5 sm:pb-1.5 sm:pt-1.5"
+      } ${
         dark
           ? "border-white/[0.05] bg-[linear-gradient(180deg,rgba(27,28,31,0.82),rgba(20,21,24,0.93))] shadow-[0_12px_30px_rgba(0,0,0,0.15)] backdrop-blur-xl"
           : "border-slate-200/80 bg-white/96 shadow-[0_10px_20px_rgba(148,163,184,0.11)]"
-      } transition-[border-color,background-color,box-shadow] duration-150 ${
+      } transition-[border-color,background-color,box-shadow,border-radius,padding] duration-150 ${
         collapsed
           ? ""
           : isGenreQuestion || hasNestedOptions
-            ? ""
+            ? `${
+                clipNestedPanelToFrame
+                  ? HALF_VIEWPORT_PANEL_MAX_HEIGHT_CLASS
+                  : PRIMARY_CHOICE_PANEL_MAX_HEIGHT_CLASS
+              } ${
+                clipNestedPanelToFrame ? "overflow-hidden" : "overflow-visible"
+              }`
             : "max-h-[min(64vh,760px)] overflow-y-auto scrollbar-none"
       }`}
     >
@@ -1946,7 +2931,7 @@ export function ComposerChoicePanel({
           onClick={() => setCollapsed(false)}
           aria-expanded={false}
           aria-controls={panelBodyId}
-          className={`flex w-full items-center justify-between rounded-[14px] border px-3 py-2.5 text-left transition-colors ${
+          className={`flex w-full items-center justify-between rounded-[10px] border px-3.5 py-2 text-left transition-colors ${
             dark
               ? "border-white/[0.06] bg-white/[0.04] hover:bg-white/[0.07]"
               : "border-slate-200 bg-slate-50 hover:bg-white"
@@ -1954,18 +2939,52 @@ export function ComposerChoicePanel({
           aria-label={`展开选择窗：${question.title}`}
         >
           <span className="flex min-w-0 items-center gap-2.5">
-            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-[12px] bg-[#0f62fe]/92 text-white shadow-[0_6px_14px_rgba(15,98,254,0.2)]">
-              <Sparkles className="h-2.5 w-2.5" />
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[14px] bg-[#0f62fe]/92 text-white shadow-[0_6px_14px_rgba(15,98,254,0.2)]">
+              <Sparkles className="h-3 w-3" />
             </span>
-            <span className="min-w-0">
+            <span className="min-w-0 flex-1">
               <span
-                className={`block truncate text-[12.5px] font-medium ${dark ? "text-slate-100" : "text-slate-900"}`}
+                className={`block truncate text-[13.5px] font-medium ${dark ? "text-slate-100" : "text-slate-900"}`}
               >
                 {question.title}
               </span>
-              {showQuestionStepIndicator ? (
+              {shouldUseStatusStepPills ? (
+                  <span className="mt-1 flex flex-nowrap items-center justify-start gap-1.5 overflow-hidden whitespace-nowrap">
+                  {questionAutoPhaseValue != null ? (
+                    <span
+                      className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${preflightPhasePillClass}`}
+                    >
+                      {questionAutoPhaseValue}
+                    </span>
+                  ) : null}
+                  {questionContextBadges.map((badge) => (
+                    <span
+                      key={`${badge.label}-${badge.value ?? ""}`}
+                      className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${getPreflightContextPillClass(badge)}`}
+                    >
+                      {badge.value}
+                    </span>
+                  ))}
+                  {questionSubstepDisplayValue != null ? (
+                    <span
+                      className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${preflightSubstepPillClass}`}
+                    >
+                      <span>子步骤</span>
+                      <span className="ml-1">{questionSubstepDisplayValue}</span>
+                    </span>
+                  ) : null}
+                  {questionMajorStepValue != null ? (
+                    <span
+                      className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${preflightMajorPillClass}`}
+                    >
+                      <span>总步骤</span>
+                      <span className="ml-1">{questionMajorStepValue}</span>
+                    </span>
+                  ) : null}
+                </span>
+              ) : showQuestionStepIndicator ? (
                 <span
-                  className={`mt-0.5 block text-[10px] ${dark ? "text-slate-500" : "text-slate-500"}`}
+                  className={`mt-0.5 block text-[11px] ${dark ? "text-slate-500" : "text-slate-500"}`}
                 >
                   {"\u7b2c "}
                   {question.stepIndex + 1}
@@ -1976,16 +2995,16 @@ export function ComposerChoicePanel({
               ) : null}
             </span>
           </span>
-          <span className="ml-3 inline-flex items-center gap-1 text-[10px] font-medium text-slate-400">
+          <span className="ml-3 inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-400">
             展开
-            <ChevronDown className="h-3.5 w-3.5" />
+            <ChevronDown className="h-4 w-4" />
           </span>
         </button>
       ) : inlineConfirm?.confirmDialog ? (
         <div id={panelBodyId} className="flex flex-col gap-3 px-1 py-0.5">
           <div className="flex items-start gap-2.5">
-            <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-[12px] bg-[#0f62fe]/92 text-white shadow-[0_6px_14px_rgba(15,98,254,0.2)]">
-              <Sparkles className="h-2.5 w-2.5" />
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[14px] bg-[#0f62fe]/92 text-white shadow-[0_6px_14px_rgba(15,98,254,0.2)]">
+              <Sparkles className="h-3 w-3" />
             </div>
             <div className="min-w-0 flex-1">
               <div
@@ -2058,38 +3077,67 @@ export function ComposerChoicePanel({
         </div>
       ) : (
         <>
-          <div id={panelBodyId} className="mb-2 flex items-start gap-2.5">
-            {onBack ? (
+          <div id={panelBodyId} className="mb-1.5 flex items-start gap-2.5">
+            {showBackButton ? (
               <button
                 type="button"
                 onClick={handleBackAction}
-                className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-[12px] transition-colors ${
+                className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-[14px] transition-colors ${
                   dark
                     ? "text-slate-400 hover:bg-white/[0.08] hover:text-slate-200"
                     : "text-slate-500 hover:bg-slate-100 hover:text-slate-700"
                 }`}
                 aria-label={"\u8fd4\u56de\u4e0a\u4e00\u6b65"}
               >
-                <ChevronLeft className="h-3.5 w-3.5" />
+                <ChevronLeft className="h-4 w-4" />
               </button>
             ) : (
-              <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-[12px] bg-[#0f62fe]/92 text-white shadow-[0_6px_14px_rgba(15,98,254,0.2)]">
-                <Sparkles className="h-2.5 w-2.5" />
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[14px] bg-[#0f62fe]/92 text-white shadow-[0_6px_14px_rgba(15,98,254,0.2)]">
+                <Sparkles className="h-3 w-3" />
               </div>
             )}
             <div className="min-w-0 flex-1">
+              {shouldUseStatusStepPills ? (
+                <div className="mb-1.5 flex flex-nowrap items-center justify-end gap-1.5 overflow-hidden whitespace-nowrap">
+                  {questionAutoPhaseValue != null ? (
+                    <div className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${preflightPhasePillClass}`}>
+                      {questionAutoPhaseValue}
+                    </div>
+                  ) : null}
+                  {questionContextBadges.map((badge) => (
+                    <div
+                      key={`${badge.label}-${badge.value ?? ""}`}
+                      className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${getPreflightContextPillClass(badge)}`}
+                    >
+                      {badge.value}
+                    </div>
+                  ))}
+                  {questionSubstepDisplayValue != null ? (
+                    <div className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${preflightSubstepPillClass}`}>
+                      <span>子步骤</span>
+                      <span className="ml-1">{questionSubstepDisplayValue}</span>
+                    </div>
+                  ) : null}
+                  {questionMajorStepValue != null ? (
+                    <div className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${preflightMajorPillClass}`}>
+                      <span>总步骤</span>
+                      <span className="ml-1">{questionMajorStepValue}</span>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
               <div className="flex items-center justify-between gap-2.5">
                 <div
-                  className={`min-h-[18px] text-[12.5px] font-medium ${dark ? "text-slate-100" : "text-slate-900"}`}
+                  className={`min-h-[18px] text-[13.5px] font-medium ${dark ? "text-slate-100" : "text-slate-900"}`}
                 >
                   {question.title}
                 </div>
-                {showQuestionStepIndicator ? (
+                {showQuestionStepIndicator && !shouldUseStatusStepPills ? (
                   <div className="flex shrink-0 flex-col items-end gap-1">
-                    <div className="flex items-center gap-1.5">
-                      {showVideoModeBadge ? (
+                    <div className="flex items-center gap-2">
+                      {shouldShowVideoModeBadge ? (
                         <div
-                          className={`rounded-full px-1.5 py-0.5 text-[9.5px] font-medium ${
+                          className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
                             devVideoGenerationMode === "image-to-video"
                               ? dark
                                 ? "bg-violet-500/20 text-violet-300"
@@ -2102,39 +3150,67 @@ export function ComposerChoicePanel({
                           {devVideoGenerationMode === "image-to-video" ? "\u56fe\u751f\u89c6\u9891" : "\u6587\u751f\u89c6\u9891"}
                         </div>
                       ) : null}
+                      {questionAutoPhaseValue != null && shouldUseStatusStepPills ? (
+                        <div
+                          className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${preflightPhasePillClass}`}
+                        >
+                          {questionAutoPhaseValue}
+                        </div>
+                      ) : null}
+                      {shouldUseStatusStepPills
+                        ? questionContextBadges.map((badge) => (
+                            <div
+                              key={`${badge.label}-${badge.value ?? ""}`}
+                              className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${
+                                badge.label === "视频模式"
+                                  ? preflightModePillClass
+                                  : preflightContextPillClass
+                              }`}
+                            >
+                              {badge.value}
+                            </div>
+                          ))
+                        : null}
+                      {questionSubstepDisplayValue != null && shouldUseStatusStepPills ? (
+                        <div
+                          className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${preflightSubstepPillClass}`}
+                        >
+                          <span>子步骤</span>
+                          <span className="ml-1">{questionSubstepDisplayValue}</span>
+                        </div>
+                      ) : null}
                       <div
-                        className={`rounded-full px-1.5 py-0.5 text-[9.5px] ${
-                          dark
-                            ? "border border-white/[0.08] bg-white/[0.05] text-slate-400"
-                            : "border border-slate-200 bg-slate-100 text-slate-500"
-                        }`}
+                        className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${preflightMajorPillClass}`}
                       >
-                        {"\u7b2c "}
-                        {question.stepIndex + 1}
-                        {" / "}
-                        {question.totalSteps}
-                        {" \u6b65"}
+                        {shouldUseStatusStepPills && questionMajorStepValue != null ? (
+                          <>
+                            <span>总步骤</span>
+                            <span className="ml-1">{questionMajorStepValue}</span>
+                          </>
+                        ) : (
+                          `第 ${question.stepIndex + 1} / ${question.totalSteps} 步`
+                        )}
                       </div>
                       <button
                         type="button"
                         onClick={() => setCollapsed(true)}
                         aria-expanded={true}
                         aria-controls={panelBodyId}
-                        className={`flex h-5 w-5 items-center justify-center rounded-full transition-colors ${
+                        className={`flex h-7 w-7 items-center justify-center rounded-full transition-colors ${
                           dark
                             ? "text-slate-500 hover:bg-white/[0.08] hover:text-slate-300"
                             : "text-slate-400 hover:bg-slate-100 hover:text-slate-600"
                         }`}
                         aria-label={`收起选择窗：${question.title}`}
                       >
-                        <ChevronDown className="h-3 w-3" />
+                        <ChevronDown className="h-4 w-4" />
                       </button>
                       {onDismiss ? (
                         <button
                           type="button"
                           onClick={onDismiss}
                           data-testid="composer-choice-dismiss"
-                          className={`flex h-5 w-5 items-center justify-center rounded-full transition-colors ${
+                          className={`hidden h-5 w-5 items-center justify-center rounded-full transition-colors ${
                             dark
                               ? "text-slate-500 hover:bg-white/[0.08] hover:text-slate-300"
                               : "text-slate-400 hover:bg-slate-100 hover:text-slate-600"
@@ -2145,54 +3221,44 @@ export function ComposerChoicePanel({
                         </button>
                       ) : null}
                     </div>
-                    {question.statusBadges &&
-                    question.statusBadges.length > 0 ? (
-                      <div className="flex items-center gap-1">
-                        {question.statusBadges.map((badge) => (
-                          <span
-                            key={badge.label}
-                            className={`rounded px-1 py-0.5 text-[9px] font-medium ${
-                              badge.tone === "danger"
-                                ? dark
-                                  ? "bg-red-500/15 text-red-400"
-                                  : "bg-red-50 text-red-600"
-                                : badge.tone === "warning"
-                                  ? dark
-                                    ? "bg-orange-500/15 text-orange-400"
-                                    : "bg-orange-50 text-orange-600"
-                                  : dark
-                                    ? "bg-white/[0.06] text-slate-400"
-                                    : "bg-slate-100 text-slate-500"
-                            }`}
-                          >
-                            {badge.label} {badge.value}
-                          </span>
-                        ))}
-                      </div>
-                    ) : null}
                   </div>
                 ) : (
-                  <div className="flex shrink-0 items-center gap-0.5">
+                <div className="flex shrink-0 items-center gap-1">
+                  {showResetButton ? (
                     <button
                       type="button"
-                      onClick={() => setCollapsed(true)}
+                      onClick={onReset}
+                      className={`inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[11px] font-medium transition-colors ${
+                        dark
+                          ? "border border-white/[0.08] bg-white/[0.04] text-slate-300 hover:bg-white/[0.08] hover:text-slate-100"
+                          : "border border-slate-200 bg-slate-50 text-slate-600 hover:bg-white hover:text-slate-900"
+                      }`}
+                      aria-label="重置到第一个选项"
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                      <span>重置</span>
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={() => setCollapsed(true)}
                       aria-expanded={true}
                       aria-controls={panelBodyId}
-                      className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full transition-colors ${
+                      className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors ${
                         dark
                           ? "text-slate-500 hover:bg-white/[0.08] hover:text-slate-300"
                           : "text-slate-400 hover:bg-slate-100 hover:text-slate-600"
                       }`}
                       aria-label={`收起选择窗：${question.title}`}
                     >
-                      <ChevronDown className="h-3 w-3" />
+                      <ChevronDown className="h-4 w-4" />
                     </button>
                     {onDismiss ? (
                       <button
                         type="button"
                         onClick={onDismiss}
                         data-testid="composer-choice-dismiss"
-                        className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full transition-colors ${
+                        className={`hidden h-5 w-5 shrink-0 items-center justify-center rounded-full transition-colors ${
                           dark
                             ? "text-slate-500 hover:bg-white/[0.08] hover:text-slate-300"
                             : "text-slate-400 hover:bg-slate-100 hover:text-slate-600"
@@ -2205,140 +3271,174 @@ export function ComposerChoicePanel({
                   </div>
                 )}
               </div>
-              <div className="mt-0.5">
-                <div
-                  className={`${useRelaxedPanelSpacing ? "min-h-[18px]" : "min-h-[34px]"} text-[11px] leading-[1.55] ${dark ? "text-slate-400" : "text-slate-600"}`}
-                >
-                  {question.description ?? ""}
-                </div>
-                <div
-                  className={`mt-1 ${useRelaxedPanelSpacing ? "min-h-[12px]" : "min-h-[15px]"} text-[10px] ${dark ? "text-slate-500" : "text-slate-500"}`}
-                >
-                  {helperCopy}
-                </div>
-              </div>
             </div>
           </div>
 
-          {isGenreQuestion ? (
-            <GenreCategoryPicker
-              question={visibleQuestion}
-              onSelect={onSelect}
-              dark={dark}
-              registerEscapeHandler={(handler) => {
-                nestedEscapeHandlerRef.current = handler;
-              }}
-            />
-          ) : hasNestedOptions ? (
-            <NestedOptionPicker
-              question={visibleQuestion}
-              onSelect={onSelect}
-              onOpenConfirm={setInlineConfirm}
-              dark={dark}
-              registerEscapeHandler={(handler) => {
-                nestedEscapeHandlerRef.current = handler;
-              }}
-            />
-          ) : compactChoiceMode ? (
-            <div className="flex min-h-[44px] flex-wrap gap-1.5">
-              {visibleQuestion.options.map((option) => (
-                <button
-                  key={option.id}
-                  type="button"
-                  disabled={option.disabled}
-                  onClick={() => onSelect(option.value, option.label)}
-                  className={`inline-flex min-h-9 items-center rounded-full border px-3 py-1.5 text-left text-[12px] font-medium transition-colors ${
-                    option.selected
-                      ? "border-[#2a73ff] bg-[#0f62fe]/18 text-white shadow-[0_8px_16px_rgba(15,98,254,0.12)]"
-                      : option.disabled
-                        ? dark
-                          ? "cursor-not-allowed border-white/[0.06] bg-white/[0.03] text-slate-500 opacity-55"
-                          : "cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400 opacity-70"
-                        : dark
-                          ? "border-white/[0.08] bg-white/[0.04] text-slate-200 hover:bg-white/[0.07]"
-                          : "border-slate-200 bg-slate-50 text-slate-900 hover:bg-white"
-                  }`}
-                >
-                  <span className="truncate">{option.label}</span>
-                </button>
-              ))}
+          <div
+            className={
+              isGenreQuestion || hasNestedOptions
+                ? `flex min-h-0 flex-1 flex-col ${
+                    clipNestedPanelToFrame ? "overflow-hidden" : "overflow-visible"
+                  }`
+                : undefined
+            }
+          >
+            {isGenreQuestion ? (
+              <GenreCategoryPicker
+                question={visibleQuestion}
+                onSelect={onSelect}
+                dark={dark}
+                singlePanelMode={useSinglePanelDrilldownNavigation}
+                onNavigationDepthChange={setNestedNavigationDepth}
+                registerEscapeHandler={(handler) => {
+                  nestedEscapeHandlerRef.current = handler;
+                }}
+              />
+            ) : hasNestedOptions ? (
+              <NestedOptionPicker
+                question={visibleQuestion}
+                onSelect={onSelect}
+                onOpenConfirm={setInlineConfirm}
+                dark={dark}
+                singlePanelMode={useSinglePanelDrilldownNavigation}
+                onNavigationDepthChange={setNestedNavigationDepth}
+                registerEscapeHandler={(handler) => {
+                  nestedEscapeHandlerRef.current = handler;
+                }}
+              />
+            ) : compactChoiceMode ? (
+            <div
+              data-testid="composer-choice-option-list"
+              className={shouldUseScrollableChipList ? CHIP_OPTION_SCROLL_LIST_CLASS : "flex min-h-[44px] flex-wrap gap-1.5"}
+            >
+              {visibleQuestion.options.map((option) => {
+                const showSelectedState =
+                  option.selected && !suppressSelectedChoiceAppearance;
+                const showDrilldownHint =
+                  option.drilldownHint && !option.disabled && !showSelectedState;
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    disabled={option.disabled}
+                    onClick={() => onSelect(option.value, option.label)}
+                    className={`inline-flex min-h-9 items-center rounded-full border px-3 py-1.5 text-left text-[12px] font-medium transition-colors ${
+                      showSelectedState
+                        ? "border-[#2a73ff] bg-[#0f62fe]/18 text-white shadow-[0_8px_16px_rgba(15,98,254,0.12)]"
+                        : option.disabled
+                          ? dark
+                            ? "cursor-not-allowed border-white/[0.06] bg-white/[0.03] text-slate-500 opacity-55"
+                            : "cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400 opacity-70"
+                          : dark
+                            ? "border-white/[0.08] bg-white/[0.04] text-slate-200 hover:bg-white/[0.07]"
+                            : "border-slate-200 bg-slate-50 text-slate-900 hover:bg-white"
+                    }`}
+                  >
+                    <span className="truncate">{option.label}</span>
+                    {showDrilldownHint ? (
+                      <ChevronRight
+                        className={`ml-1 h-3.5 w-3.5 shrink-0 ${
+                          dark ? "text-slate-500" : "text-slate-400"
+                        }`}
+                      />
+                    ) : null}
+                  </button>
+                );
+              })}
             </div>
           ) : (
             <div
+              data-testid="composer-choice-option-list"
               className={
-                isSingleActionCard || useRelaxedCardListHeight
+                `${isSingleActionCard || useRelaxedCardListHeight
                   ? "space-y-1.5"
-                  : "min-h-[156px] space-y-1.5"
+                  : "min-h-[156px] space-y-1.5"}${shouldUseScrollableCardList ? ` ${CARD_OPTION_SCROLL_LIST_CLASS}` : ""}`
               }
             >
-              {visibleQuestion.options.map((option) => (
-                <button
-                  key={option.id}
-                  type="button"
-                  disabled={option.disabled}
-                  onClick={() => {
-                    if (option.disabled) return;
-                    if (option.confirmDialog) {
-                      setInlineConfirm(option);
-                    } else {
-                      onSelect(option.value, option.label);
-                    }
-                  }}
-                  className={`group w-full rounded-[16px] border px-3 py-2 text-left transition-colors ${
-                    option.selected
-                      ? "border-[#2a73ff]/40 bg-[#0f62fe]/16 text-white"
-                      : option.disabled
-                        ? dark
-                          ? "cursor-not-allowed border-white/[0.05] bg-white/[0.025] opacity-55"
-                          : "cursor-not-allowed border-slate-200 bg-slate-100 opacity-70"
-                        : dark
-                          ? "border-white/[0.06] bg-white/[0.04] hover:bg-white/[0.08]"
-                          : "border-slate-200 bg-slate-50 hover:bg-white"
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div
-                      className={`text-[12.5px] font-medium ${
-                        option.selected
-                          ? "text-white"
-                          : option.disabled
-                            ? dark
-                              ? "text-slate-500"
-                              : "text-slate-400"
-                            : dark
-                              ? "text-slate-100"
-                              : "text-slate-900"
-                      }`}
-                    >
-                      {option.label}
-                    </div>
-                    {option.selected ? (
-                      <Check className="mt-0.5 h-4 w-4 shrink-0" />
-                    ) : null}
-                  </div>
-                  {option.rationale ? (
-                    <div
-                      className={`mt-0.5 line-clamp-1 text-[10px] leading-[1.45] ${
-                        option.selected
-                          ? "text-white/78"
+              {visibleQuestion.options.map((option) => {
+                const showSelectedState =
+                  option.selected && !suppressSelectedChoiceAppearance;
+                const showDrilldownHint =
+                  option.drilldownHint && !option.disabled && !showSelectedState;
+                const optionSummary = summarizeOptionRationale(option);
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    disabled={option.disabled}
+                    onClick={() => {
+                      if (option.disabled) return;
+                      if (option.confirmDialog) {
+                        setInlineConfirm(option);
+                      } else {
+                        onSelect(option.value, option.label);
+                      }
+                    }}
+                    className={`group w-full rounded-[16px] border px-3 py-2 text-left transition-colors ${
+                      showSelectedState
+                        ? "border-[#2a73ff]/40 bg-[#0f62fe]/16 text-white"
+                        : option.disabled
+                          ? dark
+                            ? "cursor-not-allowed border-white/[0.05] bg-white/[0.025] opacity-55"
+                            : "cursor-not-allowed border-slate-200 bg-slate-100 opacity-70"
                           : dark
-                            ? "text-slate-500"
-                            : "text-slate-500"
-                      }`}
-                    >
-                      {option.rationale}
+                            ? "border-white/[0.06] bg-white/[0.04] hover:bg-white/[0.08]"
+                            : "border-slate-200 bg-slate-50 hover:bg-white"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div
+                        className={`text-[13.5px] font-medium ${
+                          showSelectedState
+                            ? "text-white"
+                            : option.disabled
+                              ? dark
+                                ? "text-slate-500"
+                                : "text-slate-400"
+                              : dark
+                                ? "text-slate-100"
+                                : "text-slate-900"
+                        }`}
+                      >
+                        {option.label}
+                      </div>
+                      {renderOptionStatusMeta(option, dark)}
+                      {showSelectedState ? (
+                        <Check className="mt-0.5 h-4 w-4 shrink-0" />
+                      ) : showDrilldownHint ? (
+                        <ChevronRight
+                          className={`mt-0.5 h-4 w-4 shrink-0 ${
+                            dark ? "text-slate-500 transition-colors group-hover:text-slate-300" : "text-slate-400 transition-colors group-hover:text-slate-600"
+                          }`}
+                        />
+                      ) : null}
                     </div>
-                  ) : null}
-                </button>
-              ))}
+                    {!option.disabled && optionSummary ? (
+                      <div
+                        className={`mt-0.5 line-clamp-1 text-[11px] leading-[1.45] ${
+                          showSelectedState
+                            ? "text-white/78"
+                            : dark
+                              ? "text-slate-500"
+                              : "text-slate-500"
+                        }`}
+                      >
+                        {optionSummary}
+                      </div>
+                    ) : null}
+                    {renderTopLevelDisabledRationale(option)}
+                  </button>
+                );
+              })}
             </div>
           )}
+          </div>
 
           <div
             className={
               isSingleActionCard || useRelaxedPanelSpacing
-                ? "mt-1.5"
-                : "mt-2 min-h-[42px]"
+                ? "mt-1"
+                : "mt-1"
             }
           >
             {(visibleQuestion.submissionMode === "confirm" ||
@@ -2376,9 +3476,7 @@ export function ComposerChoicePanel({
               devOptions={devOptions}
               onSelect={onSelect}
               devVideoGenerationMode={devVideoGenerationMode}
-              devImageViewMode={devImageViewMode}
               onDevVideoGenerationModeChange={onDevVideoGenerationModeChange}
-              onDevImageViewModeChange={onDevImageViewModeChange}
             />
           ) : null}
         </>

@@ -93,6 +93,17 @@ function normalizePromptValue(text: string): string {
   return String(text || "").replace(/\r\n?/g, "\n");
 }
 
+const UI_TIMINGS = {
+  pollMs: 80,
+  overlaySettleMs: 120,
+  modeDetectMs: 900,
+  modeSwitchMs: 1400,
+  selectionMs: 1600,
+  uploadMs: 800,
+  promptFillMs: 1200,
+  postSubmitMs: 180,
+} as const;
+
 export class ReversePlaywrightRunner {
   private context: BrowserContext | null = null;
 
@@ -143,16 +154,16 @@ export class ReversePlaywrightRunner {
 
   private async dismissInterferingOverlays(page: Page, logs: string[]) {
     const candidates = [
-      page.getByRole("button", { name: "同意" }).first(),
-      page.getByRole("button", { name: "知道了" }).first(),
-      page.getByRole("button", { name: "关闭" }).first(),
-      page.getByRole("button", { name: "取消" }).first(),
+      page.getByRole("button", { name: /(?:\u540c\u610f|accept)/i }).first(),
+      page.getByRole("button", { name: /(?:\u77e5\u9053\u4e86|ok|got it)/i }).first(),
+      page.getByRole("button", { name: /(?:\u5173\u95ed|close)/i }).first(),
+      page.getByRole("button", { name: /(?:\u53d6\u6d88|cancel)/i }).first(),
     ];
 
     for (const locator of candidates) {
       if (await locator.isVisible().catch(() => false)) {
         await this.clickLocator(locator, logs, "overlay");
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(UI_TIMINGS.overlaySettleMs);
       }
     }
 
@@ -173,6 +184,105 @@ export class ReversePlaywrightRunner {
     if (typeof neutralized === "number" && neutralized > 0) {
       this.logLine(logs, "overlay", `neutralized ${neutralized} overlay blockers`);
     }
+  }
+
+  private async waitForPageCondition(
+    page: Page,
+    check: () => Promise<boolean>,
+    timeoutMs: number,
+    intervalMs = UI_TIMINGS.pollMs,
+  ): Promise<boolean> {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt <= timeoutMs) {
+      if (await check()) return true;
+      await page.waitForTimeout(intervalMs);
+    }
+    return false;
+  }
+
+  private async waitForVideoGeneratorToolbar(
+    page: Page,
+    timeoutMs: number = UI_TIMINGS.modeDetectMs,
+  ): Promise<boolean> {
+    return this.waitForPageCondition(
+      page,
+      async () => {
+        const texts = await this.getVisibleComboboxTexts(page);
+        return texts.some((text) => text.includes("Seedance 2.0"));
+      },
+      timeoutMs,
+    );
+  }
+
+  private async waitForSelectionValue(
+    page: Page,
+    key: "currentModel" | "currentDuration" | "currentReference",
+    predicate: (value: string) => boolean,
+    timeoutMs: number = UI_TIMINGS.selectionMs,
+  ): Promise<boolean> {
+    return this.waitForPageCondition(
+      page,
+      async () => predicate((await this.readSelections(page))[key] || ""),
+      timeoutMs,
+    );
+  }
+
+  private async waitForPromptValue(
+    page: Page,
+    textboxIndex: number,
+    expectedPrompt: string,
+    timeoutMs: number = UI_TIMINGS.promptFillMs,
+  ): Promise<string> {
+    const normalizedExpected = normalizePromptValue(expectedPrompt);
+    let latestValue = "";
+    const matched = await this.waitForPageCondition(
+      page,
+      async () => {
+        latestValue = await page
+          .evaluate(
+            (source) => eval(source),
+            buildReadPromptValueScript(textboxIndex),
+          )
+          .catch(() => "");
+        return normalizePromptValue(latestValue) === normalizedExpected;
+      },
+      timeoutMs,
+    );
+    return matched ? latestValue : "";
+  }
+
+  private async waitForFileInputsToSettle(
+    page: Page,
+    fileInputIndex: number,
+    expectedUploads: number,
+    timeoutMs: number = UI_TIMINGS.uploadMs,
+  ): Promise<boolean> {
+    const expectedVisibleInputs = Math.max(1, Math.min(expectedUploads, 2));
+    return this.waitForPageCondition(
+      page,
+      async () =>
+        page.evaluate(
+          ({ fileInputIndex: startIndex, expectedVisibleInputs: expectedCount }) => {
+            const inputs = Array.from(
+              document.querySelectorAll("input[type='file']"),
+            ) as HTMLInputElement[];
+            let readyCount = 0;
+            for (
+              let offset = 0;
+              offset < expectedCount && startIndex + offset < inputs.length;
+              offset += 1
+            ) {
+              const input = inputs[startIndex + offset];
+              if (input?.files?.length) {
+                readyCount += 1;
+              }
+            }
+            return readyCount >= expectedCount;
+          },
+          { fileInputIndex, expectedVisibleInputs },
+        ),
+      timeoutMs,
+    );
   }
 
   private async syncCookiesFromElectron(logs: string[]) {
@@ -282,7 +392,7 @@ export class ReversePlaywrightRunner {
     const rawDuration =
       texts.find((text) => /^\d+s$/.test(text) || /\b\d+s\b/.test(text)) || "";
     const rawReference =
-      texts.find((text) => /全能参考|Full Reference|首尾帧|智能多帧|首帧图|图片参考/.test(text)) || "";
+      texts.find((text) => /reference/i.test(text)) || "";
     return {
       currentModel: normalizeModelText(rawModel),
       currentDuration: normalizeDurationText(rawDuration),
@@ -315,27 +425,31 @@ export class ReversePlaywrightRunner {
 
   private async ensureVideoGeneratorMode(page: Page, logs: string[]) {
     await this.dismissInterferingOverlays(page, logs);
-    for (let settle = 1; settle <= 3; settle += 1) {
-      const combosBefore = await this.getVisibleComboboxTexts(page);
-      if (combosBefore.some((text) => text.includes("Seedance 2.0"))) {
-        this.logLine(logs, "mode", "video generator toolbar already visible");
-        return;
-      }
-      await page.waitForTimeout(500);
+    if (await this.waitForVideoGeneratorToolbar(page)) {
+      this.logLine(logs, "mode", "video generator toolbar already visible");
+      return;
     }
 
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       await this.dismissInterferingOverlays(page, logs);
-      const leftGenerate = page.getByText("生成", { exact: true }).nth(0);
+      const leftGenerate = page.getByText(/^(?:\u751f\u6210|generate)$/i).nth(0);
       if (await leftGenerate.isVisible().catch(() => false)) {
         await this.clickLocator(leftGenerate, logs, "mode");
-        await page.waitForTimeout(300);
       }
 
-      const videoEntry = page.getByText("视频生成", { exact: true }).last();
+      const videoEntry = page.getByText(/(?:\u89c6\u9891\u751f\u6210|video generation|video generator)/i).last();
       if (await videoEntry.isVisible().catch(() => false)) {
         await this.clickLocator(videoEntry, logs, "mode");
-        await page.waitForTimeout(900);
+      }
+
+      if (await this.waitForVideoGeneratorToolbar(page, UI_TIMINGS.modeSwitchMs)) {
+        const combosAfter = await this.getVisibleComboboxTexts(page);
+        this.logLine(
+          logs,
+          "mode",
+          `attempt ${attempt}: ${combosAfter.join(" | ") || "no-combobox"}`,
+        );
+        return;
       }
 
       const combosAfter = await this.getVisibleComboboxTexts(page);
@@ -369,7 +483,13 @@ export class ReversePlaywrightRunner {
           currentModel: "",
           debug: "",
         }));
-      await page.waitForTimeout(500);
+      const matched = await this.waitForSelectionValue(
+        page,
+        "currentModel",
+        (value) =>
+          value === targetModel ||
+          (targetModel === "Seedance 2.0 Fast" && value === "Seedance 2.0"),
+      );
 
       const latest = await this.readSelections(page);
       this.logLine(
@@ -377,8 +497,12 @@ export class ReversePlaywrightRunner {
         "model",
         `attempt ${attempt}: ${scriptedResult?.step || "unknown"} -> ${latest.currentModel || "unknown"}${scriptedResult?.debug ? ` / ${scriptedResult.debug}` : ""}`,
       );
-      if (latest.currentModel === targetModel) return;
-      if (targetModel === "Seedance 2.0 Fast" && latest.currentModel === "Seedance 2.0") {
+      if (matched && latest.currentModel === targetModel) return;
+      if (
+        matched &&
+        targetModel === "Seedance 2.0 Fast" &&
+        latest.currentModel === "Seedance 2.0"
+      ) {
         this.logLine(logs, "model", "fallback to Seedance 2.0");
         return;
       }
@@ -414,7 +538,11 @@ export class ReversePlaywrightRunner {
 
       await option.waitFor({ state: "visible", timeout: 5000 });
       await this.clickLocator(option, logs, "duration");
-      await page.waitForTimeout(500);
+      await this.waitForSelectionValue(
+        page,
+        "currentDuration",
+        (value) => value === targetDuration,
+      );
 
       const latest = await this.readSelections(page);
       this.logLine(
@@ -431,8 +559,7 @@ export class ReversePlaywrightRunner {
   private async ensureFullReference(page: Page, logs: string[]) {
     const current = await this.readSelections(page);
     if (
-      current.currentReference?.includes("全能参考") ||
-      current.currentReference?.includes("Full Reference")
+      current.currentReference?.toLowerCase().includes("full reference")
     ) {
       this.logLine(logs, "reference", "already full reference");
       return;
@@ -444,7 +571,11 @@ export class ReversePlaywrightRunner {
       currentReference: "",
     }));
     if (scriptedResult?.ok) {
-      await page.waitForTimeout(400);
+      await this.waitForSelectionValue(
+        page,
+        "currentReference",
+        (value) => Boolean(value.trim()),
+      );
       this.logLine(logs, "reference", `scripted full reference ready: ${scriptedResult.step}`);
       return;
     }
@@ -476,11 +607,11 @@ export class ReversePlaywrightRunner {
         document.querySelectorAll("button, [role='button'], [role='tab'], [role='option'], [role='menuitem'], [role='combobox'], div, span, label, li"),
       ).filter(isVisible);
 
-      const currentMode = nodes.find((node) => /全能参考|Full Reference|首尾帧|首帧图|图片参考/.test(normalize(node.textContent || "")));
+      const currentMode = nodes.find((node) => /reference/i.test(normalize(node.textContent || "")));
       if (!currentMode) return { ok: false, step: "reference-not-found" };
 
       clickNode(currentMode);
-      const fullReference = nodes.find((node) => /^全能参考$|^Full Reference$/.test(normalize(node.textContent || "")));
+      const fullReference = nodes.find((node) => /full reference/i.test(normalize(node.textContent || "")));
       if (fullReference) {
         clickNode(fullReference);
         return { ok: true, step: "full-reference-selected" };
@@ -492,7 +623,11 @@ export class ReversePlaywrightRunner {
     }));
 
     if (result.ok) {
-      await page.waitForTimeout(400);
+      await this.waitForSelectionValue(
+        page,
+        "currentReference",
+        (value) => Boolean(value.trim()),
+      );
       this.logLine(logs, "reference", "full reference ready");
       return;
     }
@@ -524,7 +659,7 @@ export class ReversePlaywrightRunner {
   private async locatePromptContext(page: Page, logs: string[]) {
     const textarea = page
       .locator(
-        "textarea[placeholder*='结合图片'], textarea[placeholder*='描述'], textarea",
+        "textarea",
       )
       .first();
     await textarea.waitFor({ state: "visible", timeout: 15000 });
@@ -626,7 +761,7 @@ export class ReversePlaywrightRunner {
       const secondInput = allInputs.nth(fileInputIndex + 1);
       await secondInput.setInputFiles([payloads[1]]);
     }
-    await page.waitForTimeout(1200);
+    await this.waitForFileInputsToSettle(page, fileInputIndex, payloads.length);
     await this.dismissInterferingOverlays(page, logs);
     this.logLine(logs, "upload", `uploaded ${Math.min(payloads.length, Math.max(1, count - fileInputIndex))} refs`);
     return payloads.length;
@@ -648,12 +783,13 @@ export class ReversePlaywrightRunner {
       currentValue: "",
       message: error instanceof Error ? error.message : String(error),
     }));
-    await page.waitForTimeout(300);
     const immediateValue = typeof result?.currentValue === "string" ? result.currentValue : "";
-    const readBack = await page.evaluate(
-      (source) => eval(source),
-      buildReadPromptValueScript(textboxIndex),
-    ).catch(() => "");
+    const readBack =
+      (await this.waitForPromptValue(page, textboxIndex, prompt)) ||
+      (await page.evaluate(
+        (source) => eval(source),
+        buildReadPromptValueScript(textboxIndex),
+      ).catch(() => ""));
     if (!result?.ok) {
       throw new Error(`prompt fill failed: ${result?.message || "unknown"}`);
     }
@@ -697,8 +833,8 @@ export class ReversePlaywrightRunner {
       let score = 0;
       if (box.width >= 24 && box.width <= 80 && box.height >= 24 && box.height <= 80) score += 120;
       if (!text) score += 150;
-      if (/提交|发送|生成|send|submit|generate/i.test(text)) score += 60;
-      if (/Agent 模式|自动|灵感搜索|创意设计|去查看|首帧|尾帧|16:9|9:16|15s|5s/.test(text)) score -= 300;
+      if (/(?:submit|send|generate|\u63d0\u4ea4|\u53d1\u9001|\u751f\u6210)/i.test(text)) score += 60;
+      if (/(?:Agent|\u81ea\u52a8|\u7075\u611f\u641c\u7d22|\u521b\u610f\u8bbe\u8ba1|\u53bb\u67e5\u770b|\u9996\u5e27|\u5c3e\u5e27|16:9|9:16|15s|5s)/.test(text)) score -= 300;
       if (disabled) score -= 10;
       if (textareaBox) {
         const verticalNear = box.top >= textareaBox.top - 24 && box.top <= textareaBox.bottom + 48;
@@ -750,7 +886,7 @@ export class ReversePlaywrightRunner {
         if (!text && /submit-button/i.test(cls)) score += 140;
         if (!text && !/submit-button/i.test(cls)) score -= 120;
         if (/submit|send|generate/i.test(`${text} ${aria} ${cls}`)) score += 120;
-        if (/Agent 妯″紡|鑷姩|鐏垫劅鎼滅储|鍒涙剰璁捐|鍘绘煡鐪媩棣栧抚|灏惧抚|16:9|9:16|15s|5s/.test(text)) score -= 300;
+        if (/(?:Agent|\u81ea\u52a8|\u7075\u611f\u641c\u7d22|\u521b\u610f\u8bbe\u8ba1|\u53bb\u67e5\u770b|\u9996\u5e27|\u5c3e\u5e27|16:9|9:16|15s|5s)/.test(text)) score -= 300;
         if (textareaBox) {
           const verticalNear =
             rect.top >= textareaBox.top - 24 &&
@@ -838,7 +974,7 @@ export class ReversePlaywrightRunner {
     const startedAt = Date.now();
     let latestState = beforeState;
     while (Date.now() - startedAt <= timeoutMs) {
-      await page.waitForTimeout(120);
+      await page.waitForTimeout(UI_TIMINGS.pollMs);
       latestState = await this.readPromptScopeState(page, promptContext);
       if (this.hasPromptScopeSubmissionAdvanced(beforeState, latestState)) {
         return { ok: true, state: latestState };
@@ -855,7 +991,7 @@ export class ReversePlaywrightRunner {
     await this.dismissInterferingOverlays(page, logs);
     const textarea = page
       .locator(
-        "textarea[placeholder*='结合图片'], textarea[placeholder*='描述'], textarea",
+        "textarea",
       )
       .first();
     const beforeValue = await page.evaluate(
@@ -871,7 +1007,7 @@ export class ReversePlaywrightRunner {
     }));
     if (scriptedResult?.ok) {
       this.logLine(logs, "submit", `scripted submit accepted: ${scriptedResult.step}`);
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(UI_TIMINGS.postSubmitMs);
       return;
     }
     const submitButton = await this.getPreferredSubmitButton(page, logs);
@@ -910,7 +1046,7 @@ export class ReversePlaywrightRunner {
             rect.width <= 80 &&
             rect.height >= 24 &&
             rect.height <= 80 &&
-            !/Agent 模式|自动|灵感搜索|创意设计|去查看|首帧|尾帧|16:9|9:16|15s|5s/.test(text)
+            !/(?:Agent|\u81ea\u52a8|\u7075\u611f\u641c\u7d22|\u521b\u610f\u8bbe\u8ba1|\u53bb\u67e5\u770b|\u9996\u5e27|\u5c3e\u5e27|16:9|9:16|15s|5s)/.test(text)
           );
         });
         const currentValue =
@@ -918,14 +1054,13 @@ export class ReversePlaywrightRunner {
         return (
           currentValue !== previous ||
           !!button?.disabled ||
-          document.body.innerText.includes("生成中") ||
-          document.body.innerText.includes("排队中")
+          /(?:processing|queued|generating|submit)/i.test(document.body.innerText)
         );
       },
       beforeValue,
       { timeout: 10000 },
     );
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(UI_TIMINGS.postSubmitMs);
     this.logLine(logs, "submit", "submission accepted");
   }
 
@@ -954,7 +1089,7 @@ export class ReversePlaywrightRunner {
     return;
     const textarea = page
       .locator(
-        "textarea[placeholder*='结合图片'], textarea[placeholder*='描述'], textarea",
+        "textarea",
       )
       .first();
     await textarea.waitFor({ state: "visible", timeout: 15000 });
@@ -1018,7 +1153,7 @@ export class ReversePlaywrightRunner {
         `submit not confirmed after click: signalTextKey=${confirmation.state?.signalTextKey || ""} taskIndicatorCount=${confirmation.state?.taskIndicatorCount || 0} beforeValueLength=${beforeValue.length}`,
       );
     }
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(UI_TIMINGS.postSubmitMs);
     this.logLine(logs, "submit", "submission accepted");
   }
 
@@ -1051,7 +1186,7 @@ export class ReversePlaywrightRunner {
       timeout: 60000,
     });
     await page.waitForLoadState("domcontentloaded");
-    await page.waitForTimeout(1500);
+    await this.waitForVideoGeneratorToolbar(page, UI_TIMINGS.modeSwitchMs).catch(() => false);
   }
 
   private async prepareSingleSegment(

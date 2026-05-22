@@ -1,13 +1,17 @@
-import { describe, expect, it } from "vitest";
+﻿import { describe, expect, it } from "vitest";
 import type {
   ComposerQuestion,
   ConversationProjectSnapshot,
   StudioRuntimeState,
 } from "./types";
 import {
+  buildWorkflowAssistantMessagePayload,
   buildWorkflowContinuationPrompt,
+  getWorkflowShortcutProgressLabel,
+  mergeRuntimeWithWorkflowDelta,
   resolveAutoWorkflowFollowupAction,
   runWorkflowShortcut,
+  runWorkflowShortcutChain,
 } from "./workflow-shortcut-runner";
 
 function createSnapshot(): ConversationProjectSnapshot {
@@ -59,6 +63,153 @@ function createRuntime(snapshot: ConversationProjectSnapshot): StudioRuntimeStat
 }
 
 describe("runWorkflowShortcut", () => {
+  it("exposes readable workflow progress labels for video script breakdown steps", () => {
+    expect(getWorkflowShortcutProgressLabel("analyze_script_for_video")).toBe(
+      "剧本拆解 [>] 初始化",
+    );
+    expect(getWorkflowShortcutProgressLabel("prepare_video_prompt_batch")).toBe(
+      "镜头提示词 [>] 初始化",
+    );
+    expect(getWorkflowShortcutProgressLabel("prepare_segment_video_prompt")).toBe(
+      "片段提示词 [>] 初始化",
+    );
+  });
+
+  it("builds assistant payloads with the current step artifact label for creative-plan style replies", () => {
+    const previousSnapshot: ConversationProjectSnapshot = {
+      ...createSnapshot(),
+      derivedStage: "setup",
+      artifacts: [
+        {
+          id: "setup",
+          kind: "setup",
+          label: "项目设定",
+          summary: "已确认项目设定",
+          updatedAt: "2026-04-08T00:00:00.000Z",
+        },
+      ],
+    };
+    const nextSnapshot: ConversationProjectSnapshot = {
+      ...createSnapshot(),
+      derivedStage: "creative-plan",
+      artifacts: [
+        ...previousSnapshot.artifacts,
+        {
+          id: "plan",
+          kind: "plan",
+          label: "创意方案",
+          summary: "已生成创意方案",
+          updatedAt: "2026-04-08T00:01:00.000Z",
+        },
+      ],
+    };
+
+    expect(
+      buildWorkflowAssistantMessagePayload({
+        action: "generate_creative_plan",
+        input: { projectId: nextSnapshot.projectId },
+        previousSnapshot,
+        nextSnapshot,
+        summary: "Generated creative plan.",
+      }),
+    ).toEqual({
+      content: "Generated creative plan.",
+      artifactIds: ["plan"],
+      artifactSnapshots: [
+        {
+          id: "plan",
+          kind: "plan",
+          label: "创意方案",
+          summary: "已生成创意方案",
+          updatedAt: "2026-04-08T00:01:00.000Z",
+        },
+      ],
+    });
+  });
+
+  it("hides generated segment prompt details from the homepage chat summary", () => {
+    const previousSnapshot = createSnapshot();
+    const nextSnapshot: ConversationProjectSnapshot = {
+      ...createSnapshot(),
+      projectKind: "video",
+      derivedStage: "片段提示词",
+      artifacts: [
+        {
+          id: "segment-report",
+          kind: "report",
+          label: "片段提示词报告",
+          summary: "已生成片段提示词",
+          updatedAt: "2026-04-08T00:02:00.000Z",
+        },
+      ],
+    };
+
+    expect(
+      buildWorkflowAssistantMessagePayload({
+        action: "prepare_segment_video_prompt",
+        input: { projectId: nextSnapshot.projectId },
+        previousSnapshot,
+        nextSnapshot,
+        summary: [
+          "已生成 1 个片段的合并视频提示词。",
+          "片段列表：1-2",
+          "已收口 2 个镜头的视频提示词批次。",
+          "## 当前批次资产状态（文生视频模式）",
+          "片段 1-2：待生成",
+          "最终提示词稳定性：稳定。",
+          "最终提示词日志：",
+          "### 片段 1-2 最终提示词",
+          "Scene 1",
+          "Scene 2",
+        ].join("\n"),
+      }),
+    ).toEqual({
+      content: [
+        "已生成 1 个片段的合并视频提示词。",
+        "片段列表：1-2",
+        "已收口 2 个镜头的视频提示词批次。",
+        "## 当前批次资产状态（文生视频模式）",
+        "片段 1-2：待生成",
+      ].join("\n"),
+      artifactIds: ["segment-report"],
+      artifactSnapshots: [
+        {
+          id: "segment-report",
+          kind: "report",
+          label: "片段提示词报告",
+          summary: "已生成片段提示词",
+          updatedAt: "2026-04-08T00:02:00.000Z",
+        },
+      ],
+    });
+  });
+
+  it("can defer the first recent-project insertion until streaming finishes", () => {
+    const snapshot = createSnapshot();
+    const runtime: StudioRuntimeState = {
+      ...createRuntime(snapshot),
+      currentProjectSnapshot: null,
+      recentProjects: [],
+    };
+
+    const deferredRuntime = mergeRuntimeWithWorkflowDelta(
+      runtime,
+      {
+        projectSnapshot: snapshot,
+      },
+      { deferRecentProjectUpsert: true },
+    );
+
+    expect(deferredRuntime.currentProjectSnapshot).toEqual(snapshot);
+    expect(deferredRuntime.recentProjects).toEqual([]);
+
+    const promotedRuntime = mergeRuntimeWithWorkflowDelta(deferredRuntime, {
+      projectSnapshot: snapshot,
+    });
+
+    expect(promotedRuntime.recentProjects).toEqual([snapshot]);
+  });
+
   it("publishes the assistant summary before auto-opening the follow-up popover after character generation", async () => {
     const snapshot = createSnapshot();
     const nextQuestion = createQuestion();
@@ -97,6 +248,121 @@ describe("runWorkflowShortcut", () => {
       events.indexOf("popover"),
     );
     expect(events).not.toContain(`suggest:${nextQuestion.id}`);
+  });
+
+  it("keeps reference-image QA feedback out of chat when images are shown inline", async () => {
+    const snapshot = createSnapshot();
+    const runtime = createRuntime(snapshot);
+    const events: string[] = [];
+
+    await runWorkflowShortcut({
+      action: "generate_video_reference_assets",
+      input: { projectId: snapshot.projectId },
+      runtime,
+      runAction: async () => ({
+        summary: "已补齐 1 个参考资产。\n\n参考图 QA：通过 1 张，拦截并重试 1 张候选图。",
+        projectSnapshot: snapshot,
+        data: {
+          projectSnapshot: snapshot,
+        },
+        imageUrls: ["https://media.storyforge.test/hero-ref.jpg"],
+      }),
+      ui: {
+        activateConversation: () => events.push("activate"),
+        clearChoiceUi: () => events.push("clear"),
+        commitRuntime: () => events.push("commit"),
+        getSuggestedQuestion: () => null,
+        pushAssistant: (content) => events.push(`assistant:${content}`),
+        pushUser: (content) => events.push(`user:${content}`),
+        resetComposerDraft: () => events.push("reset"),
+        setPopoverQuestion: () => events.push("popover"),
+        setStreaming: (value) => events.push(`stream:${String(value)}`),
+        setSuggested: () => events.push("suggest"),
+      },
+      userBubble: "补齐参考图",
+    });
+
+    expect(events.some((event) => event.startsWith("assistant:"))).toBe(false);
+  });
+
+  it("keeps segment QA feedback out of chat when videos are shown inline", async () => {
+    const snapshot = createSnapshot();
+    const runtime = createRuntime(snapshot);
+    const events: string[] = [];
+
+    await runWorkflowShortcut({
+      action: "generate_segment_video",
+      input: { projectId: snapshot.projectId, segmentLabel: "segment-1" },
+      runtime,
+      runAction: async () => ({
+        summary: "Generated segment 1 video.\n\nQA: total 90, continuity 91, identity 89, semantic 90, visual 88, route pass.",
+        projectSnapshot: snapshot,
+        data: {
+          projectSnapshot: snapshot,
+        },
+        videoUrls: ["https://media.storyforge.test/segment-1.mp4"],
+      }),
+      ui: {
+        activateConversation: () => events.push("activate"),
+        clearChoiceUi: () => events.push("clear"),
+        commitRuntime: () => events.push("commit"),
+        getSuggestedQuestion: () => null,
+        pushAssistant: (content) => events.push(`assistant:${content}`),
+        pushUser: (content) => events.push(`user:${content}`),
+        resetComposerDraft: () => events.push("reset"),
+        setPopoverQuestion: () => events.push("popover"),
+        setStreaming: (value) => events.push(`stream:${String(value)}`),
+        setSuggested: () => events.push("suggest"),
+      },
+      userBubble: "Generate segment video",
+    });
+
+    expect(events.some((event) => event.startsWith("assistant:"))).toBe(false);
+  });
+
+  it("keeps refreshed segment QA feedback out of chat for chained shortcuts with inline videos", async () => {
+    const snapshot = createSnapshot();
+    const runtime = createRuntime(snapshot);
+    const events: string[] = [];
+
+    await runWorkflowShortcutChain({
+      runtime,
+      runAction: async (action) => ({
+        summary:
+          action === "refresh_segment_video"
+            ? "Refreshed segment 1.\n\nQA: total 86, continuity 85, identity 87, semantic 84, visual 86, route local repair."
+            : "noop",
+        projectSnapshot: snapshot,
+        data: {
+          projectSnapshot: snapshot,
+        },
+        videoUrls:
+          action === "refresh_segment_video"
+            ? ["https://media.storyforge.test/segment-1-refresh.mp4"]
+            : [],
+      }),
+      steps: [
+        {
+          action: "refresh_segment_video",
+          input: { projectId: snapshot.projectId, segmentLabel: "segment-1" },
+        },
+      ],
+      ui: {
+        activateConversation: () => events.push("activate"),
+        clearChoiceUi: () => events.push("clear"),
+        commitRuntime: () => events.push("commit"),
+        getSuggestedQuestion: () => null,
+        pushAssistant: (content) => events.push(`assistant:${content}`),
+        pushUser: (content) => events.push(`user:${content}`),
+        resetComposerDraft: () => events.push("reset"),
+        setPopoverQuestion: () => events.push("popover"),
+        setStreaming: (value) => events.push(`stream:${String(value)}`),
+        setSuggested: () => events.push("suggest"),
+      },
+      userBubble: "Refresh segment video",
+    });
+
+    expect(events.some((event) => event.startsWith("assistant:"))).toBe(false);
   });
 
   it("auto-opens the follow-up popover after episode batch writing completes", async () => {
@@ -152,7 +418,7 @@ describe("runWorkflowShortcut", () => {
         setStreaming: (value) => events.push(`stream:${String(value)}`),
         setSuggested: (question) => events.push(`suggest:${question?.id ?? "null"}`),
       },
-      userBubble: "批量自动撰写",
+      userBubble: "自动批量续写/补齐",
     });
 
     expect(events).toContain("popover");
@@ -280,6 +546,67 @@ describe("runWorkflowShortcut", () => {
     expect(events).not.toContain(`suggest:${nextQuestion.id}`);
   });
 
+  it("auto-opens the follow-up popover after video script breakdown completes", async () => {
+    const snapshot: ConversationProjectSnapshot = {
+      ...createSnapshot(),
+      projectId: "video-project-1",
+      projectKind: "video",
+      derivedStage: "脚本拆解",
+      currentObjective: "继续提取角色与场景",
+      recommendedActions: ["继续提取角色与场景"],
+    };
+    const nextQuestion: ComposerQuestion = {
+      id: "video-bridge-panel-video-project-1",
+      title: "继续视频工作流",
+      description: "继续提取角色与场景。",
+      options: [
+        {
+          id: "video-bridge-entities",
+          label: "提取角色与场景",
+          value: "video:bridge:entities",
+        },
+      ],
+      allowCustomInput: true,
+      submissionMode: "immediate",
+      multiSelect: false,
+      stepIndex: 0,
+      totalSteps: 5,
+      answerKey: "video-bridge-panel",
+    };
+    const runtime = createRuntime(snapshot);
+    const events: string[] = [];
+
+    await runWorkflowShortcut({
+      action: "analyze_script_for_video",
+      input: { projectId: snapshot.projectId, episodeDuration: 90, videoPace: "medium" },
+      runtime,
+      runAction: async () => ({
+        summary: "已完成剧本拆解。",
+        projectSnapshot: snapshot,
+        data: {
+          projectSnapshot: snapshot,
+        },
+      }),
+      ui: {
+        activateConversation: () => events.push("activate"),
+        clearChoiceUi: () => events.push("clear"),
+        commitRuntime: () => events.push("commit"),
+        getSuggestedQuestion: () => nextQuestion,
+        pushAssistant: (content) => events.push(`assistant:${content}`),
+        pushUser: (content) => events.push(`user:${content}`),
+        resetComposerDraft: () => events.push("reset"),
+        setPopoverQuestion: () => events.push("popover"),
+        setStreaming: (value) => events.push(`stream:${String(value)}`),
+        setSuggested: (question) => events.push(`suggest:${question?.id ?? "null"}`),
+      },
+      userBubble: "完成剧本拆解",
+    });
+
+    expect(events).toContain("assistant:已完成剧本拆解。");
+    expect(events).toContain("popover");
+    expect(events).not.toContain(`suggest:${nextQuestion.id}`);
+  });
+
   it("scopes enter-drama-step assistant artifacts to the target step", async () => {
     const previousSnapshot: ConversationProjectSnapshot = {
       ...createSnapshot(),
@@ -368,7 +695,7 @@ describe("runWorkflowShortcut", () => {
       input: { projectId: nextSnapshot.projectId, durationSeconds: 90 },
       runtime,
       runAction: async () => ({
-        summary: "已将单集时长设为 90 秒。现在可以继续选择要生成的集数或直接批量生成。",
+        summary: "已将单集时长设为 90 秒。现在可以继续选择要生成的集数或直接自动批量续写。",
         projectSnapshot: nextSnapshot,
         data: {
           projectSnapshot: nextSnapshot,
@@ -439,6 +766,73 @@ describe("runWorkflowShortcut", () => {
     });
 
     expect(events).toContain("assistant-artifacts:outline");
+  });
+
+  it("auto-opens the script follow-up popover after entering the outlines step", async () => {
+    const nextQuestion: ComposerQuestion = {
+      id: "script-outlines-script-project-1",
+      title: "单集细纲预览已创建，选择生成方式",
+      options: [
+        {
+          id: "outline-all",
+          label: "生成全部细纲",
+          value: "script:outline-generate-all",
+        },
+      ],
+      allowCustomInput: true,
+      submissionMode: "immediate",
+      multiSelect: false,
+      stepIndex: 0,
+      totalSteps: 1,
+      answerKey: "script-outlines",
+    };
+    const nextSnapshot: ConversationProjectSnapshot = {
+      ...createSnapshot(),
+      derivedStage: "单集细纲",
+      artifacts: [
+        { id: "directory", kind: "directory", label: "分集目录", summary: "directory", updatedAt: "2026-04-08T00:00:00.000Z" },
+        { id: "outline", kind: "outline", label: "单集细纲", summary: "0% preview", updatedAt: "2026-04-08T00:00:00.000Z" },
+      ],
+    };
+    const runtime = createRuntime({
+      ...nextSnapshot,
+      derivedStage: "分集目录",
+      artifacts: [nextSnapshot.artifacts[0]],
+    });
+    const events: string[] = [];
+
+    await runWorkflowShortcut({
+      action: "enter_drama_step",
+      input: { projectId: nextSnapshot.projectId, step: "outlines" },
+      runtime,
+      runAction: async () => ({
+        summary: "已进入单集细纲步骤，预览卡已经就绪。",
+        projectSnapshot: nextSnapshot,
+        data: {
+          projectSnapshot: nextSnapshot,
+        },
+      }),
+      ui: {
+        activateConversation: () => events.push("activate"),
+        clearChoiceUi: () => events.push("clear"),
+        commitRuntime: () => events.push("commit"),
+        getSuggestedQuestion: () => nextQuestion,
+        pushAssistant: (content) => events.push(`assistant:${content}`),
+        pushUser: (content) => events.push(`user:${content}`),
+        resetComposerDraft: () => events.push("reset"),
+        setPopoverQuestion: () => events.push("popover"),
+        setStreaming: (value) => events.push(`stream:${String(value)}`),
+        setSuggested: (question) => events.push(`suggest:${question?.id ?? "null"}`),
+      },
+      userBubble: "进入单集细纲",
+    });
+
+    expect(events).toContain("assistant:已进入单集细纲步骤，预览卡已经就绪。");
+    expect(events).toContain("popover");
+    expect(events.indexOf("assistant:已进入单集细纲步骤，预览卡已经就绪。")).toBeLessThan(
+      events.indexOf("popover"),
+    );
+    expect(events).not.toContain(`suggest:${nextQuestion.id}`);
   });
 
   it("auto-opens the next video workflow popover after preparing a storyboard batch", async () => {
@@ -514,7 +908,7 @@ describe("runWorkflowShortcut", () => {
       options: [
         {
           id: "prepare-video-prompt-batch",
-          label: "准备视频提示词批次",
+          label: "视频提示词生成方式",
           value: "video:bridge:prompts",
         },
       ],
@@ -532,7 +926,7 @@ describe("runWorkflowShortcut", () => {
       currentObjective: "Compile shot packets",
       derivedStage: "视频生成",
       agentSummary: "summary",
-      recommendedActions: ["准备视频提示词批次"],
+      recommendedActions: ["视频提示词生成方式"],
       artifacts: [],
       updatedAt: "2026-04-08T00:00:00.000Z",
     };
@@ -705,7 +1099,80 @@ describe("runWorkflowShortcut", () => {
     expect(artifactPayloads).toEqual([["directory-1"]]);
   });
 
-  it("trims entity extraction chat summaries down to the lead plus name prefixes", async () => {
+  it("keeps auto-adjust compliance summaries scoped to the compliance artifact", async () => {
+    const previousSnapshot: ConversationProjectSnapshot = {
+      ...createSnapshot(),
+      derivedStage: "compliance",
+      artifacts: [
+        {
+          id: "episode-1",
+          kind: "episode",
+          label: "Episode 1",
+          summary: "Original episode",
+          content: "Original episode",
+          updatedAt: "2026-04-08T00:00:00.000Z",
+        },
+        {
+          id: "compliance-1",
+          kind: "compliance",
+          label: "Compliance Workspace",
+          summary: "Original compliance",
+          content: "Original compliance",
+          updatedAt: "2026-04-08T00:00:00.000Z",
+        },
+      ],
+    };
+    const nextSnapshot: ConversationProjectSnapshot = {
+      ...previousSnapshot,
+      updatedAt: "2026-04-08T00:05:00.000Z",
+      artifacts: [
+        {
+          ...previousSnapshot.artifacts[0],
+          summary: "Updated episode",
+          content: "Updated episode",
+          updatedAt: "2026-04-08T00:05:00.000Z",
+        },
+        {
+          ...previousSnapshot.artifacts[1],
+          summary: "Updated compliance",
+          content: "Updated compliance",
+          updatedAt: "2026-04-08T00:05:00.000Z",
+        },
+      ],
+    };
+    const runtime = createRuntime(previousSnapshot);
+    const artifactPayloads: Array<string[] | undefined> = [];
+
+    await runWorkflowShortcut({
+      action: "auto_adjust_compliance",
+      input: { projectId: previousSnapshot.projectId },
+      runtime,
+      runAction: async () => ({
+        summary: "Auto adjusted compliance.",
+        projectSnapshot: nextSnapshot,
+        data: {
+          projectSnapshot: nextSnapshot,
+        },
+      }),
+      ui: {
+        activateConversation: () => undefined,
+        clearChoiceUi: () => undefined,
+        commitRuntime: () => undefined,
+        getSuggestedQuestion: () => null,
+        pushAssistant: (_content, artifactIds) => artifactPayloads.push(artifactIds),
+        pushUser: () => undefined,
+        resetComposerDraft: () => undefined,
+        setPopoverQuestion: () => undefined,
+        setStreaming: () => undefined,
+        setSuggested: () => undefined,
+      },
+      userBubble: "Auto adjust compliance",
+    });
+
+    expect(artifactPayloads).toEqual([["compliance-1"]]);
+  });
+
+  it("preserves the full entity extraction summary when pushing the chat message", async () => {
     const runtime = createRuntime(createSnapshot());
     const nextSnapshot: ConversationProjectSnapshot = {
       ...createSnapshot(),
@@ -760,7 +1227,7 @@ describe("runWorkflowShortcut", () => {
     });
 
     expect(assistantPayloads).toEqual([
-      "已从脚本中提取 2 个角色与 2 个场景设定。另外识别出 1 个角色变体与 1 个场景变体。\n\n角色：\n1. 苏念\n   角色变体：\n   - 厨师服\n   - 职场装\n2. 高利贷头目\n\n场景：\n1. 家庭厨房\n   场景变体：\n   - 暴雨夜\n2. CBD 写字楼",
+      "已从脚本中提取 2 个角色与 2 个场景设定。另外识别出 1 个角色变体与 1 个场景变体。\n\n角色：\n1. 苏念\n   昔日天才厨师，现阶段情绪紧绷。\n\n场景：\n1. 家庭厨房\n   空间凌乱，灯光昏黄。",
     ]);
   });
 
@@ -824,6 +1291,75 @@ describe("runWorkflowShortcut", () => {
     expect(events).toContain("assistant:Generated creative plan.");
     expect(events).toContain("popover");
     expect(events.indexOf("assistant:Generated creative plan.")).toBeLessThan(
+      events.indexOf("popover"),
+    );
+    expect(events).not.toContain(`suggest:${nextQuestion.id}`);
+  });
+
+  it("auto-opens the generate-creative-plan follow-up after setup is saved", async () => {
+    const snapshot: ConversationProjectSnapshot = {
+      ...createSnapshot(),
+      derivedStage: "创作方案",
+      recommendedActions: ["生成创作方案"],
+      artifacts: [
+        {
+          id: "setup",
+          kind: "setup",
+          label: "项目设定",
+          summary: "已确认项目设定",
+          updatedAt: "2026-04-08T00:00:00.000Z",
+        },
+      ],
+    };
+    const nextQuestion: ComposerQuestion = {
+      id: "script-creative-plan-script-project-1",
+      title: "下一步：生成创作方案",
+      options: [
+        {
+          id: "generate-plan",
+          label: "生成创作方案",
+          value: "script:generate-creative-plan",
+        },
+      ],
+      allowCustomInput: true,
+      submissionMode: "confirm",
+      multiSelect: false,
+      stepIndex: 0,
+      totalSteps: 1,
+      answerKey: "script-creative-plan",
+    };
+    const runtime = createRuntime(snapshot);
+    const events: string[] = [];
+
+    await runWorkflowShortcut({
+      action: "save_setup",
+      input: { projectId: snapshot.projectId },
+      runtime,
+      runAction: async () => ({
+        summary: "Saved setup.",
+        projectSnapshot: snapshot,
+        data: {
+          projectSnapshot: snapshot,
+        },
+      }),
+      ui: {
+        activateConversation: () => events.push("activate"),
+        clearChoiceUi: () => events.push("clear"),
+        commitRuntime: () => events.push("commit"),
+        getSuggestedQuestion: () => nextQuestion,
+        pushAssistant: (content) => events.push(`assistant:${content}`),
+        pushUser: (content) => events.push(`user:${content}`),
+        resetComposerDraft: () => events.push("reset"),
+        setPopoverQuestion: () => events.push("popover"),
+        setStreaming: (value) => events.push(`stream:${String(value)}`),
+        setSuggested: (question) => events.push(`suggest:${question?.id ?? "null"}`),
+      },
+      userBubble: "确认项目设定",
+    });
+
+    expect(events).toContain("assistant:Saved setup.");
+    expect(events).toContain("popover");
+    expect(events.indexOf("assistant:Saved setup.")).toBeLessThan(
       events.indexOf("popover"),
     );
     expect(events).not.toContain(`suggest:${nextQuestion.id}`);
@@ -1019,6 +1555,49 @@ describe("runWorkflowShortcut", () => {
     expect(events).toContain("assistant:Video project prepared.");
     expect(events).toContain("popover");
     expect(events).not.toContain(`suggest:${nextQuestion.id}`);
+  });
+
+  it("suppresses abort-like shortcut errors instead of rendering them as assistant failures", async () => {
+    const snapshot: ConversationProjectSnapshot = {
+      ...createSnapshot(),
+      projectId: "video-project-1",
+      projectKind: "video",
+    };
+    const runtime = createRuntime(snapshot);
+    const events: string[] = [];
+    let errorCount = 0;
+
+    const completion = await runWorkflowShortcut({
+      action: "prepare_segment_video_prompt",
+      input: { projectId: snapshot.projectId },
+      runtime,
+      runAction: async () => {
+        throw new Error("Aborted");
+      },
+      ui: {
+        activateConversation: () => events.push("activate"),
+        clearChoiceUi: () => events.push("clear"),
+        commitRuntime: () => events.push("commit"),
+        getSuggestedQuestion: () => null,
+        pushAssistant: (content) => events.push(`assistant:${content}`),
+        pushUser: (content) => events.push(`user:${content}`),
+        resetComposerDraft: () => events.push("reset"),
+        setPopoverQuestion: () => events.push("popover"),
+        setStreaming: (value) => events.push(`stream:${String(value)}`),
+        setSuggested: (question) => events.push(`suggest:${question?.id ?? "null"}`),
+      },
+      userBubble: "补齐剩余片段",
+      onError: () => {
+        errorCount += 1;
+      },
+    });
+
+    expect(completion).toBeNull();
+    expect(errorCount).toBe(1);
+    expect(events).not.toContain("assistant:Aborted");
+    expect(events).not.toContain("popover");
+    expect(events).not.toContain("suggest:null");
+    expect(events.at(-1)).toBe("stream:false");
   });
 
   it("auto-opens the follow-up popover after media generation in creative mode", async () => {

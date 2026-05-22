@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createScriptProjectChoiceHandler } from "./home-agent-script-choice-handlers";
 import type { ComposerQuestion, ConversationProjectSnapshot } from "@/lib/home-agent/types";
+import { createEmptyComplianceWorkspace } from "@/types/drama";
 
 function createSnapshot(
   overrides: Partial<ConversationProjectSnapshot> = {},
@@ -341,7 +342,7 @@ describe("createScriptProjectChoiceHandler", () => {
     handler(createSnapshot(), "script:episode-generate-range:1-3%2C5", "按范围生成");
     handler(createSnapshot(), "script:episode-review:count:custom:7", "审查 7 集");
     handler(createSnapshot(), "script:episode-review:episodes:5-3%2C8", "按集号审查");
-    handler(createSnapshot(), "script:episode-fill-missing", "批量自动撰写补齐");
+    handler(createSnapshot(), "script:episode-fill-missing", "自动批量补齐", { durationSeconds: 90 });
 
     expect(deps.runWorkflowActionShortcut).toHaveBeenNthCalledWith(
       1,
@@ -364,8 +365,8 @@ describe("createScriptProjectChoiceHandler", () => {
     expect(deps.runWorkflowActionShortcut).toHaveBeenNthCalledWith(
       4,
       "generate_episode_batch",
-      { projectId: "script-project-1", fillMissingEpisodes: true },
-      "批量自动撰写补齐",
+      { projectId: "script-project-1", fillMissingEpisodes: true, durationSeconds: 90 },
+      "自动批量补齐",
     );
     expect(deps.send).not.toHaveBeenCalled();
   });
@@ -380,14 +381,115 @@ describe("createScriptProjectChoiceHandler", () => {
     expect(deps.runWorkflowActionShortcut).toHaveBeenNthCalledWith(
       1,
       "run_compliance_review",
-      { projectId: "script-project-1", reviewMode: "text" },
+      { projectId: "script-project-1", sourceStrategy: "project-script", reviewMode: "text" },
       "文字审查",
     );
     expect(deps.runWorkflowActionShortcut).toHaveBeenNthCalledWith(
       2,
       "run_compliance_review",
-      { projectId: "script-project-1", reviewMode: "script" },
+      { projectId: "script-project-1", sourceStrategy: "project-script", reviewMode: "script" },
       "剧情审查",
+    );
+  });
+
+  it.skip("passes the current compliance settings explicitly when rerunning from the compliance stage", () => {
+    const deps = createDeps();
+    const handler = createScriptProjectChoiceHandler(deps);
+
+    handler(
+      createSnapshot({
+        derivedStage: "鍚堣瀹℃煡",
+        artifacts: [
+          {
+            id: "compliance",
+            kind: "compliance",
+            label: "Compliance",
+            summary: "Compliance summary",
+            updatedAt: "2026-04-02T00:00:00.000Z",
+            presentation: "script-rich",
+            payload: {
+              type: "complianceSummary",
+              mode: "script",
+              strictness: "strict",
+              report: "report",
+              packets: [],
+              workspace: {
+                ...createEmptyComplianceWorkspace(),
+                model: "gemini-3-pro-preview",
+                dialogueReviewEnabled: true,
+              },
+              counts: { redLine: 0, highRisk: 0, suggestion: 0, pendingPackets: 0 },
+            },
+          },
+        ],
+      }),
+      "script:compliance-rerun",
+      "重新完整审查",
+    );
+
+    expect(deps.runWorkflowActionShortcut).toHaveBeenCalledWith(
+      "run_compliance_review",
+      {
+        projectId: "script-project-1",
+        sourceStrategy: "project-script",
+        reviewMode: "script",
+        strictness: "strict",
+        model: "gemini-3-pro-preview",
+        dialogueReviewEnabled: true,
+        smartRerun: true,
+      },
+      "重新完整审查",
+    );
+  });
+
+  it("passes explicit compliance settings on rerun from a compliance snapshot", () => {
+    const deps = createDeps();
+    const handler = createScriptProjectChoiceHandler(deps);
+
+    const handled = handler(
+      createSnapshot({
+        derivedStage: "\u5408\u89c4\u5ba1\u67e5",
+        artifacts: [
+          {
+            id: "compliance",
+            kind: "compliance",
+            label: "Compliance",
+            summary: "Compliance summary",
+            updatedAt: "2026-04-02T00:00:00.000Z",
+            presentation: "script-rich",
+            payload: {
+              type: "complianceSummary",
+              mode: "script",
+              strictness: "strict",
+              report: "report",
+              packets: [],
+              workspace: {
+                ...createEmptyComplianceWorkspace(),
+                model: "gemini-3-pro-preview",
+                dialogueReviewEnabled: true,
+              },
+              counts: { redLine: 0, highRisk: 0, suggestion: 0, pendingPackets: 0 },
+            },
+          },
+        ],
+      }),
+      "script:compliance-rerun",
+      "重新完整审查",
+    );
+
+    expect(handled).toBe(true);
+    expect(deps.runWorkflowActionShortcut).toHaveBeenCalledWith(
+      "run_compliance_review",
+      {
+        projectId: "script-project-1",
+        sourceStrategy: "project-script",
+        reviewMode: "script",
+        strictness: "strict",
+        model: "gemini-3-pro-preview",
+        dialogueReviewEnabled: true,
+        smartRerun: true,
+      },
+      "重新完整审查",
     );
   });
 
@@ -402,13 +504,13 @@ describe("createScriptProjectChoiceHandler", () => {
     expect(deps.runWorkflowActionShortcut).toHaveBeenNthCalledWith(
       1,
       "run_compliance_review",
-      { projectId: "script-project-1", reviewMode: "text" },
+      { projectId: "script-project-1", sourceStrategy: "project-script", reviewMode: "text" },
       "文字审核",
     );
     expect(deps.runWorkflowActionShortcut).toHaveBeenNthCalledWith(
       2,
       "run_compliance_review",
-      { projectId: "script-project-1", reviewMode: "script" },
+      { projectId: "script-project-1", sourceStrategy: "project-script", reviewMode: "script" },
       "情节审核",
     );
     expect(deps.runWorkflowActionShortcut).toHaveBeenNthCalledWith(
@@ -416,6 +518,71 @@ describe("createScriptProjectChoiceHandler", () => {
       "skip_compliance_review",
       { projectId: "script-project-1" },
       "直接跳过审核",
+    );
+  });
+
+  it("toggles dialogue review as a silent shortcut without homepage messages", () => {
+    const deps = createDeps();
+    const handler = createScriptProjectChoiceHandler(deps);
+
+    const handled = handler(
+      createSnapshot({ derivedStage: "合规审查" }),
+      "script:compliance-toggle-dialogue:on",
+      "开启对话审查",
+    );
+
+    expect(handled).toBe(true);
+    expect(deps.runWorkflowActionShortcut).toHaveBeenCalledWith(
+      "update_compliance_workspace",
+      {
+        projectId: "script-project-1",
+        dialogueReviewEnabled: true,
+      },
+      "开启对话审查",
+      { skipUserBubble: true, skipAssistantSummary: true },
+    );
+  });
+
+  it("exports the compliance palette as a silent shortcut without homepage messages", () => {
+    const deps = createDeps();
+    const handler = createScriptProjectChoiceHandler(deps);
+
+    const handled = handler(
+      createSnapshot({ derivedStage: "合规审查" }),
+      "script:compliance-export:xlsx",
+      "导出调色盘",
+    );
+
+    expect(handled).toBe(true);
+    expect(deps.runWorkflowActionShortcut).toHaveBeenCalledWith(
+      "export_compliance_palette",
+      {
+        projectId: "script-project-1",
+        format: "xlsx",
+      },
+      "导出调色盘",
+      { skipUserBubble: true, skipAssistantSummary: true },
+    );
+  });
+
+  it("routes compliance auto-adjust with the project script source strategy", () => {
+    const deps = createDeps();
+    const handler = createScriptProjectChoiceHandler(deps);
+
+    const handled = handler(
+      createSnapshot({ derivedStage: "合规审查" }),
+      "script:compliance-auto-adjust",
+      "批量自动改写",
+    );
+
+    expect(handled).toBe(true);
+    expect(deps.runWorkflowActionShortcut).toHaveBeenCalledWith(
+      "auto_adjust_compliance",
+      {
+        projectId: "script-project-1",
+        sourceStrategy: "project-script",
+      },
+      "批量自动改写",
     );
   });
 
@@ -458,7 +625,11 @@ describe("createScriptProjectChoiceHandler", () => {
     expect(handled).toBe(true);
     expect(deps.runWorkflowActionShortcut).toHaveBeenCalledWith(
       "prepare_video_generation",
-      { projectId: "script-project-1" },
+      {
+        projectId: "script-project-1",
+        sourceProjectId: "script-project-1",
+        title: "Test Project",
+      },
       "video export",
     );
     expect(deps.send).not.toHaveBeenCalled();

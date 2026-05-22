@@ -8,8 +8,9 @@ import {
   isArkJimengEndpoint,
   resolveConfiguredModelName,
   resolveJimengApiKey,
+  syncApiConfigToServerProxy,
 } from "@/lib/api-config";
-import { isServerProxyEndpoint } from "@/lib/server-proxy";
+import { getServerProxyEndpoint, isServerProxyEndpoint } from "@/lib/server-proxy";
 import { getNetworkRetrySettings } from "@/lib/network-retry-settings";
 import { getResolvedFilesStoragePath } from "@/lib/storage-path";
 import {
@@ -17,6 +18,7 @@ import {
   persistAssetToProjectCache,
   safeCacheName,
 } from "@/lib/upload-base64-to-storage";
+import { uploadBase64ToCloudMedia } from "@/lib/home-agent/cloud-media-storage";
 
 export const DEFAULT_GEMINI_BASE_URL = "https://api.tu-zi.com/v1beta";
 export const DEFAULT_GEMINI_RETRY_COUNT = 1;
@@ -157,7 +159,15 @@ function releaseGeminiSlot() {
 }
 
 // ===== 服务名称映射 =====
-export type AiService = "gemini" | "gpt" | "claude" | "grok" | "seedream" | "jimeng" | "tuzi";
+export type AiService = "gemini" | "gpt" | "claude" | "grok" | "seedream" | "jimeng" | "aliyun" | "runninghub" | "tuzi";
+
+function shouldUseLocalImageDevProxy(): boolean {
+  if (typeof window === "undefined") return false;
+  if (typeof window.electronAPI?.invoke === "function") return false;
+  const { protocol, hostname } = window.location;
+  if (protocol !== "http:" && protocol !== "https:") return false;
+  return /^(localhost|127\.0\.0\.1|\[::1\]|::1)$/i.test(hostname);
+}
 
 // ===== 按服务解析密钥 =====
 
@@ -176,6 +186,16 @@ export function resolveDirectApiKey(service: AiService | null): string {
       }
       throw new Error("请先在设置中配置 Seedance API Key，或与 Gemini 共用同一密钥");
     }
+    return k;
+  }
+  if (service === "aliyun") {
+    const k = c.aliyunKey?.trim();
+    if (!k) throw new Error("璇峰厛鍦ㄨ缃腑閰嶇疆阿里云 HappyHorse API Key");
+    return k;
+  }
+  if (service === "runninghub") {
+    const k = c.runninghubKey?.trim();
+    if (!k) throw new Error("璇峰厛鍦ㄨ缃腑閰嶇疆 RunningHub API Key");
     return k;
   }
   if (service === "gpt") {
@@ -218,6 +238,9 @@ export async function directFetch(
   signal?: AbortSignal,
   serviceHint: AiService | null = null,
 ): Promise<Response> {
+  if (isServerProxyEndpoint(targetUrl)) {
+    await syncApiConfigToServerProxy();
+  }
   const apiKey = isServerProxyEndpoint(targetUrl) ? "" : resolveDirectApiKey(serviceHint);
 
   const { maxRetries: MAX_RETRIES, delayMs: BASE_DELAY_MS } =
@@ -282,6 +305,9 @@ export async function geminiFetch(
 ): Promise<Response> {
   await waitForGeminiSlot();
   try {
+    if (isServerProxyEndpoint(targetUrl)) {
+      await syncApiConfigToServerProxy();
+    }
     const apiKey = isServerProxyEndpoint(targetUrl) ? "" : resolveDirectApiKey("gemini");
     const { maxRetries: MAX_RETRIES, delayMs: BASE_DELAY_MS } =
       getNetworkRetrySettings();
@@ -380,6 +406,71 @@ function convertContentsToChatMessages(contents: any[]): Array<{
     .filter((message) => !!message.content);
 }
 
+function buildStructuredJsonResponseFormat(
+  generationConfig?: Record<string, any>,
+): Record<string, unknown> | undefined {
+  if (generationConfig?.responseMimeType !== "application/json") return undefined;
+
+  const schema =
+    generationConfig?.responseSchema &&
+    typeof generationConfig.responseSchema === "object"
+      ? generationConfig.responseSchema
+      : null;
+
+  if (schema) {
+    return {
+      type: "json_schema",
+      json_schema: {
+        name: "structured_output",
+        schema,
+        strict: true,
+      },
+    };
+  }
+
+  return { type: "json_object" };
+}
+
+function splitSystemInstructions(contents: any[]): {
+  systemPrompt: string | undefined;
+  contents: any[];
+} {
+  const messages = convertContentsToChatMessages(contents);
+  const systemPrompt = messages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content)
+    .join("\n\n")
+    .trim() || undefined;
+
+  return {
+    systemPrompt,
+    contents: (Array.isArray(contents) ? contents : []).filter((entry) => entry?.role !== "system"),
+  };
+}
+
+function buildGeminiGenerateContentBody(
+  contents: any[],
+  generationConfig?: Record<string, any>,
+): Record<string, unknown> {
+  const { systemPrompt, contents: userContents } = splitSystemInstructions(contents);
+  const body: Record<string, unknown> = {
+    contents:
+      userContents.length > 0
+        ? userContents
+        : [{ role: "user", parts: [{ text: "" }] }],
+  };
+  if (systemPrompt) {
+    body.systemInstruction = {
+      role: "system",
+      parts: [{ text: systemPrompt }],
+    };
+  }
+  if (generationConfig && Object.keys(generationConfig).length > 0) {
+    body.generationConfig = generationConfig;
+  }
+  return body;
+}
+
 function buildChatCompletionsBody(
   resolvedModel: string,
   contents: any[],
@@ -399,6 +490,10 @@ function buildChatCompletionsBody(
   }
   if (typeof generationConfig?.maxOutputTokens === "number") {
     body.max_tokens = generationConfig.maxOutputTokens;
+  }
+  const responseFormat = buildStructuredJsonResponseFormat(generationConfig);
+  if (responseFormat) {
+    body.response_format = responseFormat;
   }
   return body;
 }
@@ -487,10 +582,7 @@ export async function callGemini(
     .replace(/\/v1beta(\/.*)?$/, "")
     .replace(/\/v1(\/.*)?$/, "");
   const url = `${baseUrl}/v1beta/models/${resolvedModel}:generateContent`;
-  const body: any = { contents };
-  if (generationConfig && Object.keys(generationConfig).length > 0) {
-    body.generationConfig = generationConfig;
-  }
+  const body = buildGeminiGenerateContentBody(contents, generationConfig);
   const jsonBody = JSON.stringify(body);
   if (signal?.aborted) throw new Error("请求已取消");
 
@@ -523,6 +615,36 @@ export function explainGeminiNoText(data: unknown): string | null {
   const err = d.error as { message?: string } | string | undefined;
   if (typeof err === "string") return err;
   if (err && typeof err === "object" && err.message) return String(err.message);
+
+  const chatChoice = (d.choices as unknown[] | undefined)?.[0] as
+    | {
+        finish_reason?: string;
+        message?: {
+          content?: unknown;
+          refusal?: string;
+          reasoning_content?: string;
+        };
+      }
+    | undefined;
+  if (chatChoice) {
+    const refusal = String(chatChoice.message?.refusal || "").trim();
+    if (refusal) {
+      return `模型拒绝返回正文：${refusal}`;
+    }
+    const reasoningContent = String(chatChoice.message?.reasoning_content || "").trim();
+    if (reasoningContent) {
+      return "模型只返回了 reasoning_content，没有可见正文。请关闭思维链模型或改用更稳定的拆解模型后重试。";
+    }
+    const finishReason = String(chatChoice.finish_reason || "").trim();
+    if (finishReason && finishReason !== "stop") {
+      const finishReasonMap: Record<string, string> = {
+        length: "输出被长度上限截断，未能返回完整正文。",
+        content_filter: "输出被内容安全过滤截断，未能返回正文。",
+        tool_calls: "模型返回了工具调用而不是正文，请改用纯文本拆解模型。",
+      };
+      return finishReasonMap[finishReason] ?? `模型结束原因：${finishReason}`;
+    }
+  }
 
   const pf = d.promptFeedback as
     | { blockReason?: string; blockReasonMessage?: string }
@@ -558,6 +680,20 @@ export function explainGeminiNoText(data: unknown): string | null {
     if (onlyThought) {
       return "模型只返回了内部推理，没有可见文本。请稍后重试，或检查网关是否支持当前模型。";
     }
+  }
+
+  const anthropicStopReason = String(d.stop_reason || "").trim();
+  const anthropicContent = d.content as unknown[];
+  if (Array.isArray(anthropicContent) && anthropicContent.length > 0) {
+    const onlyThinkingBlocks = anthropicContent.every(
+      (part) => String((part as { type?: unknown }).type || "") === "thinking",
+    );
+    if (onlyThinkingBlocks) {
+      return "Claude 只返回了 thinking blocks，没有可见正文。请关闭 thinking 模型或改用稳定的拆解模型。";
+    }
+  }
+  if (anthropicStopReason && anthropicStopReason !== "end_turn") {
+    return `Claude 结束原因：${anthropicStopReason}`;
   }
 
   return null;
@@ -694,10 +830,7 @@ export async function callGeminiStream(
     .replace(/\/v1beta(\/.*)?$/, "")
     .replace(/\/v1(\/.*)?$/, "");
   const url = `${baseUrl}/v1beta/models/${resolvedModel}:streamGenerateContent?alt=sse`;
-  const body: any = { contents };
-  if (generationConfig && Object.keys(generationConfig).length > 0) {
-    body.generationConfig = generationConfig;
-  }
+  const body = buildGeminiGenerateContentBody(contents, generationConfig);
   if (signal?.aborted) throw new Error("请求已取消");
 
   const jsonBody = JSON.stringify(body);
@@ -764,19 +897,34 @@ export function extractText(data: any): string {
     return stripThinkingBlocks(
       anthropicContent
         .filter((part: any) => part?.type !== "thinking")
-        .map((part: any) => (typeof part?.text === "string" ? part.text : ""))
+        .map((part: any) =>
+          typeof part?.text === "string"
+            ? part.text
+            : typeof part?.content === "string"
+              ? part.content
+              : "",
+        )
         .join("")
         .trim()
     );
   }
   const chatContent = data?.choices?.[0]?.message?.content;
+  if (chatContent && typeof chatContent === "object" && typeof chatContent.text === "string") {
+    return stripThinkingBlocks(chatContent.text.trim());
+  }
   if (typeof chatContent === "string") {
     return stripThinkingBlocks(chatContent.trim());
   }
   if (Array.isArray(chatContent)) {
     return stripThinkingBlocks(
       chatContent
-        .map((part: any) => (typeof part?.text === "string" ? part.text : ""))
+        .map((part: any) =>
+          typeof part?.text === "string"
+            ? part.text
+            : typeof part?.content === "string"
+              ? part.content
+              : "",
+        )
         .join("")
         .trim()
     );
@@ -967,8 +1115,20 @@ export async function uploadImageToStorage(
   // 🛡️ 检查是否在 Electron 环境中
   const electronAPI = (window as any).electronAPI;
   if (!electronAPI?.jimeng?.writeFile || !electronAPI?.storage?.getDefaultPath) {
-    // 非 Electron 环境，返回 data URL（浏览器环境）
-    console.warn("Not in Electron environment, returning data URL");
+    const projectId = localStorage.getItem("storyforge_current_project");
+    const ext = safeMimeType.includes("png") ? ".png" : safeMimeType.includes("webp") ? ".webp" : ".jpg";
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const semanticStem = suggestedFileStem?.trim() ? safeCacheName(suggestedFileStem.trim()) : "generated-image";
+    const cloudUrl = await uploadBase64ToCloudMedia({
+      base64,
+      mimeType: safeMimeType,
+      folder: `projects/${projectId || "shared"}/images/generated/${folder}`,
+      fileName: `${semanticStem}_${timestamp}${ext}`,
+    });
+    if (cloudUrl) return cloudUrl;
+
+    // 非 Electron 且云端保存失败时才回退 data URL，避免生成流程直接中断。
+    console.warn("Not in Electron environment and cloud media upload failed, returning data URL");
     return `data:${safeMimeType};base64,${base64}`;
   }
 
@@ -1054,18 +1214,24 @@ export async function callSeedreamImage(
   } = {},
 ): Promise<{ base64: string; mimeType: string }> {
   const config = getApiConfig();
-  const baseUrl = (config.seedreamEndpoint || DEFAULT_GEMINI_BASE_URL)
+  const seedreamEndpoint = config.seedreamEndpoint || DEFAULT_GEMINI_BASE_URL;
+  const baseUrl = seedreamEndpoint
     .replace(/\/v1beta(\/.*)?$/, "")
     .replace(/\/v1(\/.*)?$/, "");
+  const resolvedModel = resolveConfiguredModelName(options.model || "doubao-seedream-3-0");
+  const targetUrl = shouldUseLocalImageDevProxy()
+    ? `${getServerProxyEndpoint("seedream")}/v1beta/models/${resolvedModel}:generateImages`
+    : isServerProxyEndpoint(seedreamEndpoint)
+      ? `${seedreamEndpoint}/v1beta/models/${resolvedModel}:generateImages`
+      : `${baseUrl}/v1beta/models/${resolvedModel}:generateImages`;
 
-  const payload: any = {
-    model: resolveConfiguredModelName(options.model || "doubao-seedream-3-0"),
+  const legacyPayload: any = {
     prompt,
     size: options.size || "2560x1440",
     watermark: false,
   };
+  const processedImages: string[] = [];
   if (options.image && options.image.length > 0) {
-    const processedImages: string[] = [];
     for (const img of options.image) {
       if (img.startsWith("data:")) {
         processedImages.push(img);
@@ -1073,68 +1239,111 @@ export async function callSeedreamImage(
         try {
           const fetched = await fetchImageAsBase64(img);
           if (fetched) {
-            processedImages.push(
-              `data:${fetched.mimeType};base64,${fetched.data}`,
-            );
+            processedImages.push(`data:${fetched.mimeType};base64,${fetched.data}`);
           } else if (normalizeLocalImagePath(img)) {
-            throw new Error(`无法读取本地参考图：${img}`);
+            throw new Error(`无法读取本地参考图: ${img}`);
           } else {
             processedImages.push(img);
           }
         } catch {
           if (normalizeLocalImagePath(img)) {
-            throw new Error(`无法读取本地参考图：${img}`);
+            throw new Error(`无法读取本地参考图: ${img}`);
           }
           processedImages.push(img);
         }
       }
     }
-    payload.image = processedImages;
-    payload.sequential_image_generation = "disabled";
+    legacyPayload.image = processedImages;
+    legacyPayload.sequential_image_generation = "disabled";
   }
 
-  const resp = await smartDirectOrProxyFetch(
-    `${baseUrl}/v1/images/generations/`,
-    {
-      "Content-Type": "application/json",
-    },
-    JSON.stringify(payload),
-    options.signal,
-    "seedream",
-  );
-
-  if (!resp.ok) {
-    const errText = await resp.text();
-    throw new Error(
-      `Seedream 生成失败 (${resp.status}): ${errText.slice(0, 200)}`,
-    );
-  }
-
-  const data = await resp.json();
-  const imgItem = data.data?.[0];
-  if (imgItem?.b64_json) {
-    return { base64: imgItem.b64_json, mimeType: "image/png" };
-  }
-  if (imgItem?.url) {
-    // 下载图片（直连模式下直接 fetch，代理模式下通过代理）
-    const imgResp = await fetch(imgItem.url);
-    if (!imgResp.ok) throw new Error("Seedream 图片下载失败");
-    const buf = await imgResp.arrayBuffer();
-    const bytes = new Uint8Array(buf);
-    let binary = "";
-    const chunkSize = 8192;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  const seedreamParts: Array<Record<string, unknown>> = [{ text: prompt }];
+  for (const image of processedImages) {
+    const inlineData = await getInlineData(image);
+    if (inlineData?.data) {
+      seedreamParts.push({ inlineData });
+      continue;
     }
-    const ct = imgResp.headers.get("content-type") || "";
-    return {
-      base64: btoa(binary),
-      mimeType: ct.includes("png") ? "image/png" : "image/jpeg",
-    };
+    if (/^https?:\/\//i.test(image)) {
+      seedreamParts.push({ fileData: { fileUri: image } });
+    }
   }
-  throw new Error("Seedream 未返回图片");
-}
 
+  const contentsPayload: any = {
+    contents: [{ role: "user", parts: seedreamParts }],
+    size: options.size || "2560x1440",
+    watermark: false,
+  };
+  if (processedImages.length > 0) {
+    contentsPayload.sequential_image_generation = "disabled";
+  }
+
+  const prefersContentsPayload =
+    isServerProxyEndpoint(seedreamEndpoint) || /api\.tu-zi\.com/i.test(seedreamEndpoint);
+  const requestBodies = prefersContentsPayload
+    ? [contentsPayload, legacyPayload]
+    : [legacyPayload, contentsPayload];
+
+  let lastError: Error | null = null;
+
+  for (let index = 0; index < requestBodies.length; index += 1) {
+    const candidateBody = requestBodies[index];
+    const usingContentsPayload = Object.prototype.hasOwnProperty.call(candidateBody, "contents");
+    const resp = await smartDirectOrProxyFetch(
+      targetUrl,
+      {
+        "Content-Type": "application/json",
+      },
+      JSON.stringify(candidateBody),
+      options.signal,
+      "seedream",
+    );
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      lastError = new Error(`Seedream 生成失败 (${resp.status}): ${errText.slice(0, 200)}`);
+      const shouldRetryWithAlternateContract =
+        index + 1 < requestBodies.length &&
+        ((!usingContentsPayload && /contents is required/i.test(errText)) ||
+          (usingContentsPayload && /prompt is required/i.test(errText)));
+      if (shouldRetryWithAlternateContract) {
+        continue;
+      }
+      throw lastError;
+    }
+
+    const data = await resp.json();
+    const imgItem = data.data?.[0];
+    if (imgItem?.b64_json) {
+      return { base64: imgItem.b64_json, mimeType: "image/png" };
+    }
+    if (imgItem?.url) {
+      const imgResp = await fetch(imgItem.url);
+      if (!imgResp.ok) throw new Error("Seedream 图片下载失败");
+      const buf = await imgResp.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let binary = "";
+      const chunkSize = 8192;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+      }
+      const ct = imgResp.headers.get("content-type") || "";
+      return {
+        base64: btoa(binary),
+        mimeType: ct.includes("png") ? "image/png" : "image/jpeg",
+      };
+    }
+
+    const extracted = await extractImageBase64(data);
+    if (extracted?.base64?.trim()) {
+      return extracted;
+    }
+
+    lastError = new Error("Seedream did not return an image.");
+  }
+
+  throw lastError || new Error("Seedream did not return an image.");
+}
 export async function callTuziImageGeneration(
   prompt: string,
   options: {
@@ -1148,13 +1357,20 @@ export async function callTuziImageGeneration(
 ): Promise<{ base64: string; mimeType: string }> {
   const config = getApiConfig();
   const resolvedModel = resolveConfiguredModelName(options.model || "nano-banana-pro");
+  const usesLocalImageDevProxy = shouldUseLocalImageDevProxy();
+  const prefersProxyImageGenerations =
+    usesLocalImageDevProxy || isServerProxyEndpoint(config.gptEndpoint || "");
   const imageService: AiService = resolvedModel.startsWith("gpt-image-")
     ? "gpt"
-    : config.geminiKey?.trim()
-      ? "gemini"
-      : "tuzi";
+    : prefersProxyImageGenerations
+      ? "gpt"
+      : config.geminiKey?.trim()
+        ? "gemini"
+        : "tuzi";
   const imageEndpoint =
-    imageService === "gpt"
+    usesLocalImageDevProxy
+      ? getServerProxyEndpoint("gpt")
+      : imageService === "gpt"
       ? config.gptEndpoint || config.tuziEndpoint || config.geminiEndpoint || DEFAULT_GEMINI_BASE_URL
       : config.geminiEndpoint || config.tuziEndpoint || DEFAULT_GEMINI_BASE_URL;
   const baseUrl = imageEndpoint

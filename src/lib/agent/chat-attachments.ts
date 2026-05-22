@@ -138,6 +138,44 @@ function truncate(value: string, max = 12_000): string {
   return `${trimmed.slice(0, Math.max(0, max - 1))}…`;
 }
 
+function isLocalAttachmentPreviewPath(value: string | undefined): boolean {
+  if (typeof value !== "string" || !value.trim()) return false;
+  return value.startsWith("file://") || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value);
+}
+
+function toRenderableLocalAttachmentPreviewUrl(localPath: string | undefined): string | undefined {
+  if (!isLocalAttachmentPreviewPath(localPath)) return undefined;
+  if (!localPath) return undefined;
+  if (localPath.startsWith("file://")) return localPath;
+  if (/^\\\\/.test(localPath)) {
+    return `file:${localPath.replace(/\\/g, "/")}`;
+  }
+  return `file:///${localPath.replace(/\\/g, "/")}`;
+}
+
+export function resolvePersistedAttachmentPreviewUrl(
+  attachment: Pick<ChatAttachment, "kind" | "localPath" | "previewUrl">,
+): string | undefined {
+  const previewUrl =
+    typeof attachment.previewUrl === "string" && attachment.previewUrl.trim()
+      ? attachment.previewUrl
+      : undefined;
+  const localPreviewUrl =
+    attachment.kind === "image" || attachment.kind === "video"
+      ? toRenderableLocalAttachmentPreviewUrl(attachment.localPath)
+      : undefined;
+
+  if (!previewUrl) {
+    return localPreviewUrl;
+  }
+
+  if (previewUrl.startsWith("data:")) {
+    return localPreviewUrl ?? previewUrl;
+  }
+
+  return previewUrl;
+}
+
 export function inferModelInputCapabilities(params: {
   provider?: string;
   model?: string;
@@ -214,8 +252,9 @@ async function extractTextContent(file: File, kind: ChatAttachmentKind): Promise
 export async function prepareChatAttachment(file: File): Promise<ChatAttachment> {
   const kind = classifyAttachmentKind(file);
   const localPath = maybeGetFilePath(file);
+  const mimeType = String(file.type || "").toLowerCase();
   const previewUrl =
-    kind === "image" || kind === "video"
+    kind === "image" || kind === "video" || mimeType.startsWith("audio/")
       ? URL.createObjectURL(file)
       : undefined;
 
@@ -258,7 +297,7 @@ export function stripAttachmentPayloadForHistory(attachment: ChatAttachment): Ch
     size: attachment.size,
     kind: attachment.kind,
     localPath: attachment.localPath,
-    previewUrl: attachment.previewUrl,
+    previewUrl: resolvePersistedAttachmentPreviewUrl(attachment),
     extractedText: attachment.extractedText ? truncate(attachment.extractedText, 4_000) : undefined,
     fallbackDigest: attachment.fallbackDigest,
     history: attachment.history?.map((entry) => ({
@@ -266,7 +305,11 @@ export function stripAttachmentPayloadForHistory(attachment: ChatAttachment): Ch
       fileName: entry.fileName,
       label: entry.label,
       localPath: entry.localPath,
-      previewUrl: entry.previewUrl,
+      previewUrl: resolvePersistedAttachmentPreviewUrl({
+        kind: attachment.kind,
+        localPath: entry.localPath,
+        previewUrl: entry.previewUrl,
+      }),
       createdAt: entry.createdAt,
     })),
     generationContext: attachment.generationContext

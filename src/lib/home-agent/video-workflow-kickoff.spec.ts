@@ -7,6 +7,8 @@ vi.mock("@/lib/invoke-with-key", () => ({
 }));
 
 import {
+  buildVideoWorkflowKickoffRequest,
+  buildVideoWorkflowStartPrompt,
   buildVideoUploadExtractionSummary,
   countEpisodes,
   extractVideoWorkflowUploadScript,
@@ -263,5 +265,23 @@ describe("buildVideoUploadExtractionSummary", () => {
     });
     expect(summary).not.toContain("识别到");
     expect(summary).toContain("正在进入视频工作流");
+  });
+});
+
+describe("buildVideoWorkflowStartPrompt", () => {
+  it("offers only document upload kickoff when there is no current script project", () => {
+    const request = buildVideoWorkflowKickoffRequest(false);
+
+    expect(request.questions[0]?.options.map((option) => option.value)).toEqual([
+      "upload-document",
+    ]);
+  });
+
+  it("requires zero-based guidance before entering the workflow for fresh starts", () => {
+    const prompt = buildVideoWorkflowStartPrompt("start-fresh");
+
+    expect(prompt).toContain("请从零开始引导");
+    expect(prompt).toContain("不要默认我已经准备好剧本、素材或熟悉流程");
+    expect(prompt).toContain("当前进入了哪个工作流步骤");
   });
 });

@@ -34,21 +34,6 @@ export interface JimengAPI {
   ) => Promise<{ ok: boolean; error?: string }>;
 }
 
-export interface DreaminaCliAPI {
-  exec: (
-    args: string[],
-    stdin?: string,
-  ) => Promise<{
-    ok: boolean;
-    installed?: boolean;
-    path?: string;
-    code?: number;
-    stdout?: string;
-    stderr?: string;
-    error?: string;
-  }>;
-}
-
 export interface StorageAPI {
   getDefaultPath: () => Promise<{ files: string; db: string }>;
   selectFolder: () => Promise<string | null>;
@@ -67,6 +52,13 @@ export interface StorageAPI {
     | { ok: true; cancelled: false; filePath: string }
     | { ok: true; cancelled: true; filePath: null }
     | { ok: false; cancelled: false; filePath: null; error?: string }
+  >;
+  writeBase64File: (params: {
+    filePath: string;
+    base64: string;
+  }) => Promise<
+    | { ok: true; filePath: string; error?: string }
+    | { ok: false; filePath: null; error?: string }
   >;
   copyFile: (
     sourcePath: string,
@@ -150,7 +142,7 @@ function getEmbeddedBuiltinApiBundlePath(): string {
   if (process.defaultApp) {
     return path.resolve(__dirname, "..", "config", "builtin-api.json");
   }
-  return path.join(process.resourcesPath, "config", "builtin-api.json");
+  return path.join(path.dirname(process.execPath), "config", "builtin-api.json");
 }
 
 function getPortableBuiltinApiBundlePath(): string | null {
@@ -166,7 +158,8 @@ function getBuiltinApiBundlePath(): string {
 function getBuiltinApiBundleCandidatePaths(): string[] {
   const portablePath = getPortableBuiltinApiBundlePath();
   const embeddedPath = getEmbeddedBuiltinApiBundlePath();
-  return portablePath ? [portablePath, embeddedPath] : [embeddedPath];
+  const resourcesPath = path.join(process.resourcesPath, "config", "builtin-api.json");
+  return portablePath ? [portablePath, embeddedPath, resourcesPath] : [embeddedPath, resourcesPath];
 }
 
 function readBuiltinApiBundle(): BuiltinApiBundle | null {
@@ -196,14 +189,8 @@ const jimengAPI: JimengAPI = {
     ipcRenderer.invoke("jimeng:writeFile", { filePath, content }),
 };
 
-const dreaminaCliAPI: DreaminaCliAPI = {
-  exec: (args, stdin) =>
-    ipcRenderer.invoke("dreamina:exec", { args, stdin }),
-};
-
 contextBridge.exposeInMainWorld("electronAPI", {
   jimeng: jimengAPI,
-  dreaminaCli: dreaminaCliAPI,
   runtime: runtimeAPI,
   storage: {
     getDefaultPath: () => ipcRenderer.invoke("storage:getDefaultPath"),
@@ -226,6 +213,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
       filters?: { name: string; extensions: string[] }[];
       base64: string;
     }) => ipcRenderer.invoke("storage:saveBinaryFile", params),
+    writeBase64File: (params: { filePath: string; base64: string }) =>
+      ipcRenderer.invoke("storage:writeBase64File", params),
     copyFile: (sourcePath: string, destPath: string) =>
       ipcRenderer.invoke("storage:copyFile", { sourcePath, destPath }),
     readText: (filePath: string) =>

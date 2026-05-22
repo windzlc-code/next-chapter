@@ -8,6 +8,14 @@ type WorkflowShortcutRunner = (
   action: string,
   input: Record<string, unknown>,
   label: string,
+  options?: {
+    restoreQuestionOnInterrupt?: ComposerQuestion | null;
+    restoreQuestionOnCancel?: ComposerQuestion | null;
+    restoreQuestionOnError?: ComposerQuestion | null;
+    restoreQuestionAfterRun?: ComposerQuestion | null;
+    skipUserBubble?: boolean;
+    skipAssistantSummary?: boolean;
+  },
 ) => void | Promise<void>;
 
 type ShowChoicePopover = (
@@ -33,6 +41,14 @@ type CompliancePacket = {
   recommendation: string;
 };
 
+type ComplianceRunSettings = {
+  reviewMode?: "text" | "script";
+  strictness?: string;
+  model?: string;
+  dialogueReviewEnabled?: boolean;
+  smartRerun?: boolean;
+};
+
 type BeatPacket = {
   id: string;
   title: string;
@@ -46,6 +62,38 @@ type ScriptChoiceHandler = (
   label: string,
   input?: Record<string, unknown>,
 ) => boolean;
+
+function readComplianceRunSettings(snapshot: ConversationProjectSnapshot): ComplianceRunSettings {
+  const complianceArtifact = snapshot.artifacts.find(
+    (artifact) => artifact.kind === "compliance" && artifact.payload?.type === "complianceSummary",
+  );
+  const payload = complianceArtifact?.payload?.type === "complianceSummary" ? complianceArtifact.payload : null;
+  if (!payload) return {};
+  return {
+    reviewMode: payload.mode === "script" ? "script" : "text",
+    strictness: payload.strictness,
+    model: payload.workspace.model,
+    dialogueReviewEnabled: payload.workspace.dialogueReviewEnabled,
+  };
+}
+
+function buildComplianceRunInput(
+  snapshot: ConversationProjectSnapshot,
+  overrides: Partial<ComplianceRunSettings> = {},
+): Record<string, unknown> {
+  const settings = { ...readComplianceRunSettings(snapshot), ...overrides };
+  return {
+    projectId: snapshot.projectId,
+    sourceStrategy: "project-script",
+    ...(settings.reviewMode ? { reviewMode: settings.reviewMode } : {}),
+    ...(typeof settings.strictness === "string" ? { strictness: settings.strictness } : {}),
+    ...(typeof settings.model === "string" ? { model: settings.model } : {}),
+    ...(typeof settings.dialogueReviewEnabled === "boolean"
+      ? { dialogueReviewEnabled: settings.dialogueReviewEnabled }
+      : {}),
+    ...(typeof settings.smartRerun === "boolean" ? { smartRerun: settings.smartRerun } : {}),
+  };
+}
 
 type ScriptChoiceHandlerDeps = {
   runWorkflowActionShortcut: WorkflowShortcutRunner;
@@ -527,11 +575,7 @@ export function createScriptProjectChoiceHandler(deps: ScriptChoiceHandlerDeps):
     }
 
     if (value.includes("合规审查")) {
-      void deps.runWorkflowActionShortcut(
-        "run_compliance_review",
-        { projectId: snapshot.projectId },
-        label,
-      );
+      void deps.runWorkflowActionShortcut("run_compliance_review", buildComplianceRunInput(snapshot), label);
       return true;
     }
 
@@ -547,10 +591,9 @@ export function createScriptProjectChoiceHandler(deps: ScriptChoiceHandlerDeps):
     if (value === "script:compliance-run:text" || value === "script:compliance-run:script") {
       void deps.runWorkflowActionShortcut(
         "run_compliance_review",
-        {
-          projectId: snapshot.projectId,
+        buildComplianceRunInput(snapshot, {
           reviewMode: value.endsWith(":script") ? "script" : "text",
-        },
+        }),
         label,
       );
       return true;
@@ -592,7 +635,7 @@ export function createScriptProjectChoiceHandler(deps: ScriptChoiceHandlerDeps):
     if (value === "script:compliance-auto-adjust") {
       void deps.runWorkflowActionShortcut(
         "auto_adjust_compliance",
-        { projectId: snapshot.projectId },
+        { projectId: snapshot.projectId, sourceStrategy: "project-script" },
         label,
       );
       return true;
@@ -618,6 +661,7 @@ export function createScriptProjectChoiceHandler(deps: ScriptChoiceHandlerDeps):
           dialogueReviewEnabled: value.endsWith(":on"),
         },
         label,
+        { skipUserBubble: true, skipAssistantSummary: true },
       );
       return true;
     }
@@ -630,6 +674,7 @@ export function createScriptProjectChoiceHandler(deps: ScriptChoiceHandlerDeps):
           format: value.endsWith(":xlsx") ? "xlsx" : "docx",
         },
         label,
+        { skipUserBubble: true, skipAssistantSummary: true },
       );
       return true;
     }
@@ -753,7 +798,11 @@ export function createScriptProjectChoiceHandler(deps: ScriptChoiceHandlerDeps):
 
     if (value === "script:compliance-rerun") {
       if (!isComplianceStage) return true;
-      void deps.runWorkflowActionShortcut("run_compliance_review", { projectId: snapshot.projectId }, label);
+      void deps.runWorkflowActionShortcut(
+        "run_compliance_review",
+        buildComplianceRunInput(snapshot, { smartRerun: true }),
+        label,
+      );
       return true;
     }
 
@@ -1025,24 +1074,12 @@ export function createScriptProjectChoiceHandler(deps: ScriptChoiceHandlerDeps):
       return true;
     }
 
-    if (value === "script:episode-generate-batch") {
+    if (value === "script:episode-generate-batch" || value === "script:episode-fill-missing") {
       void deps.runWorkflowActionShortcut(
         "generate_episode_batch",
         {
           projectId: snapshot.projectId,
-          ...(typeof input?.durationSeconds === "number" ? { durationSeconds: input.durationSeconds } : {}),
-        },
-        label,
-      );
-      return true;
-    }
-
-    if (value === "script:episode-fill-missing") {
-      void deps.runWorkflowActionShortcut(
-        "generate_episode_batch",
-        {
-          projectId: snapshot.projectId,
-          fillMissingEpisodes: true,
+          ...(value === "script:episode-fill-missing" ? { fillMissingEpisodes: true } : {}),
           ...(typeof input?.durationSeconds === "number" ? { durationSeconds: input.durationSeconds } : {}),
         },
         label,
@@ -1095,14 +1132,13 @@ export function createScriptProjectChoiceHandler(deps: ScriptChoiceHandlerDeps):
     ) {
       void deps.runWorkflowActionShortcut(
         "run_compliance_review",
-        {
-          projectId: snapshot.projectId,
+        buildComplianceRunInput(snapshot, {
           ...(value.endsWith(":text")
-            ? { reviewMode: "text" }
+            ? { reviewMode: "text" as const }
             : value.endsWith(":script")
-              ? { reviewMode: "script" }
+              ? { reviewMode: "script" as const }
               : {}),
-        },
+        }),
         label,
       );
       return true;
@@ -1117,10 +1153,9 @@ export function createScriptProjectChoiceHandler(deps: ScriptChoiceHandlerDeps):
       if (!isComplianceStage) return true;
       void deps.runWorkflowActionShortcut(
         "run_compliance_review",
-        {
-          projectId: snapshot.projectId,
+        buildComplianceRunInput(snapshot, {
           reviewMode: value.endsWith(":script") ? "script" : "text",
-        },
+        }),
         label,
       );
       return true;
@@ -1155,7 +1190,11 @@ export function createScriptProjectChoiceHandler(deps: ScriptChoiceHandlerDeps):
       } else {
         void deps.runWorkflowActionShortcut(
           "prepare_video_generation",
-          { projectId: snapshot.projectId },
+          {
+            projectId: snapshot.projectId,
+            sourceProjectId: snapshot.projectId,
+            title: snapshot.title,
+          },
           label,
         );
       }

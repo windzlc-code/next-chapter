@@ -2,10 +2,6 @@
  * 浏览器端文档解析
  * 支持 PDF、DOCX（.doc/.docx）、纯文本
  */
-import * as pdfjsLib from "pdfjs-dist";
-import mammoth from "mammoth";
-
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
 
 export async function parseDocument(file: File): Promise<string> {
   const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
@@ -26,15 +22,23 @@ export async function parseDocument(file: File): Promise<string> {
 }
 
 async function parsePdf(file: File): Promise<string> {
+  const pdfjsLib = await import("pdfjs-dist");
+  pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   const parts: string[] = [];
+  type PdfTextItemLike = {
+    str?: string;
+  };
 
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
     const text = content.items
-      .map((item: any) => ("str" in item ? item.str : ""))
+      .map((item) => {
+        const candidate = item as PdfTextItemLike;
+        return typeof candidate.str === "string" ? candidate.str : "";
+      })
       .join(" ");
     parts.push(text);
   }
@@ -47,6 +51,7 @@ async function parsePdf(file: File): Promise<string> {
 }
 
 async function parseDocx(file: File): Promise<string> {
+  const mammoth = await import("mammoth");
   const arrayBuffer = await file.arrayBuffer();
   const result = await mammoth.extractRawText({ arrayBuffer });
   return result.value;

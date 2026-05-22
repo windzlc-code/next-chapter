@@ -30,9 +30,32 @@ release/win-unpacked/locales/fa.pak
 release/win-unpacked/locales/fi.pak
 /release
 .gstack/
+.agent-memory/
+.agent-sessions/
+.agent-worktrees/
+.codex-logs/
+.codex-temp/
+.codex-docx-*/
+.codex-docx-review/
+.contract-attachment-edit/
+.playwright-cli/
+.playwright-mcp/
+.serena/
+test-results/
+old-tgz-unpack/
+*.tgz
+*.zip
+*.tsbuildinfo
 
 # 运行时生成的项目数据（AI 图片、视频等）
+server-data/
 files/projects/
+files/conversations/
+db/sessions/
+sessionData/
+userData/
+crashDumps/
+temp/
 
 # 调试/临时产物
 tmp-*
@@ -40,3 +63,20 @@ temp-*
 output/
 artifacts/
 vendor/ffmpeg/
+.vite-dev*.log
+dev-server.full-auto*.log
+electron-dev*.log
+vite-*.log
+tmp-home-agent-dev*.log
+server-data/
+fs-upload-*.txt
+network-upload.txt
+upload-*.txt
+smoke-video-log*.txt
+terminal-*.json
+workbench-*.json
+workbench-*.txt
+push-*-to-workbench*.js
+push-home-agent-studio-hotfix.js
+runninghub-*.html
+public/_debug_last_session.json

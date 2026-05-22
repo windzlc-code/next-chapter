@@ -92,14 +92,22 @@ describe("StudioWorkflowTool", () => {
     expect(runWorkflowActionMock).toHaveBeenCalledWith(
       "generate_video_assets",
       expect.objectContaining({
+        action: "generate_video_assets",
         videoGenerationPrefs: {
           modelKey: "doubao-seedance-1-5-pro",
           resolution: "1080p",
         },
       }),
       expect.objectContaining({
+        currentDramaProject: null,
         currentProjectSnapshot: null,
+        currentVideoProject: null,
+        maintenanceReports: [],
+        recentMessageSummary: "",
+        recentProjects: [],
+        skillDrafts: [],
       }),
+      expect.any(Function),
     );
 
     expect(progress).toHaveBeenNthCalledWith(
@@ -147,5 +155,58 @@ describe("StudioWorkflowTool", () => {
     });
 
     window.removeEventListener("agent:video-generated", eventHandler as EventListener);
+  });
+
+  it("passes abortSignal through to workflow actions without adding a client-side delay", async () => {
+    runWorkflowActionMock.mockResolvedValue({
+      summary: "done",
+      recommendedActions: [],
+      projectSnapshot: null,
+      data: undefined,
+      videoUrls: [],
+    });
+
+    const tool = new StudioWorkflowTool();
+    const progress = vi.fn();
+    const abortController = new AbortController();
+    const context = new ToolUseContext({
+      options: {
+        model: "claude-sonnet-4-6",
+        tools: [],
+      },
+      abortSignal: abortController.signal,
+      getAppState: () => ({
+        currentDramaProject: null,
+        currentVideoProject: null,
+        currentProjectSnapshot: null,
+        skillDrafts: [],
+        maintenanceReports: [],
+        recentProjects: [],
+        recentMessageSummary: "",
+      }),
+    });
+
+    await tool.call(
+      {
+        action: "generate_video_assets",
+        videoGenerationPrefs: {
+          modelKey: "doubao-seedance-1-5-pro",
+          resolution: "1080p",
+        },
+      },
+      context,
+      vi.fn(),
+      parentMessage,
+      progress,
+    );
+
+    expect(runWorkflowActionMock).toHaveBeenCalledTimes(1);
+    expect(progress.mock.calls[0]?.[0]).toEqual(expect.objectContaining({ status: "start" }));
+    expect(runWorkflowActionMock.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({
+        action: "generate_video_assets",
+        abortSignal: expect.any(AbortSignal),
+      }),
+    );
   });
 });

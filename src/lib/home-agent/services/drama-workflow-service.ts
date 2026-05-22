@@ -9,7 +9,6 @@ import {
   buildReviewPrompt,
   buildStructureTransformPrompt,
 } from "@/lib/drama-prompts";
-import { mapWithConcurrency } from "@/lib/async";
 import { callGeminiStream } from "@/lib/gemini-client";
 import { readStoredDecomposeModel } from "@/lib/gemini-text-models";
 import { readStoredLlmParams } from "@/lib/home-agent/llm-params";
@@ -31,6 +30,7 @@ export function isOutlineGenerationActive(): boolean {
 }
 
 const OUTLINE_TIMEOUT_MS = 120_000;
+const COMPLIANCE_REVIEW_TEMPERATURE = 0.1;
 /** 每 1000 个 token 额外给 15 秒，最少 120 秒，最多 600 秒 */
 function calcTimeoutMs(maxOutputTokens: number): number {
   return Math.min(600_000, Math.max(OUTLINE_TIMEOUT_MS, Math.ceil(maxOutputTokens / 1000) * 15_000));
@@ -42,6 +42,7 @@ import {
   type ComplianceStrictness,
   type ComplianceWorkspace,
   type ComplianceWorkspaceModel,
+  type ComplianceWorkspaceRiskPhrase,
   type DramaProject,
   type DramaSetup,
   type DramaStep,
@@ -55,6 +56,7 @@ import {
 } from "@/types/drama";
 import {
   createDramaSnapshot,
+  loadStoredDramaProjectById,
   upsertStoredDramaProject,
 } from "@/lib/home-agent/project-store";
 import type {
@@ -74,6 +76,7 @@ import {
   summariseEpisodeReviewPackets,
 } from "@/lib/home-agent/script-artifact-helpers";
 import {
+  applyDialogueReviewMarkers,
   applyComplianceRedo,
   applyComplianceReplacement,
   applyComplianceUndo,
@@ -82,6 +85,8 @@ import {
   executeComplianceReview,
   exportCompliancePaletteAsDocx,
   exportCompliancePaletteAsXlsx,
+  findRiskRanges,
+  locateComplianceRiskSpans,
   normalizeComplianceWorkspace,
   parseComplianceImportFile,
 } from "@/lib/home-agent/compliance-workspace";
@@ -129,12 +134,35 @@ export function extractDramaTitle(plan: string): string {
 export function ensureDramaProject(
   runtime: StudioRuntimeState,
   mode: DramaProject["mode"] = "traditional",
-  options?: { forceNew?: boolean },
+  options?: { forceNew?: boolean; projectId?: string },
 ): DramaProject {
-  if (!options?.forceNew && runtime.currentDramaProject) {
+  const requestedProjectId =
+    typeof options?.projectId === "string" && options.projectId.trim()
+      ? options.projectId.trim()
+      : null;
+
+  if (
+    !options?.forceNew &&
+    runtime.currentDramaProject &&
+    (!requestedProjectId || runtime.currentDramaProject.id === requestedProjectId)
+  ) {
     return { ...runtime.currentDramaProject };
   }
-  return { ...createEmptyDramaProject(mode), mode };
+  if (!options?.forceNew && requestedProjectId) {
+    const storedProject = loadStoredDramaProjectById(requestedProjectId);
+    if (storedProject) {
+      return { ...storedProject };
+    }
+  }
+  const seededProjectId =
+    requestedProjectId
+      ? requestedProjectId
+      : runtime.currentProjectSnapshot?.projectId?.trim() || "";
+  return {
+    ...createEmptyDramaProject(mode),
+    ...(seededProjectId ? { id: seededProjectId } : {}),
+    mode,
+  };
 }
 
 export function buildDramaSetup(
@@ -171,6 +199,21 @@ export function buildDramaSetup(
   };
 }
 
+function hasMeaningfulOriginalSetupSeed(
+  input: Record<string, unknown>,
+  existing: DramaSetup | null,
+): boolean {
+  const genres = Array.isArray(input.genres)
+    ? input.genres.filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
+    : existing?.genres ?? [];
+  const customTopic =
+    typeof input.customTopic === "string" ? input.customTopic : existing?.customTopic ?? "";
+  const creativeInput =
+    typeof input.creativeInput === "string" ? input.creativeInput : existing?.creativeInput ?? "";
+
+  return genres.length > 0 || Boolean(customTopic.trim()) || Boolean(creativeInput.trim());
+}
+
 const DRAMA_SETUP_INPUT_KEYS = [
   "title",
   "genres",
@@ -200,7 +243,17 @@ function buildPlanningDramaProject(
   input: Record<string, unknown>,
 ): DramaProject {
   const mode = resolveDramaMode(runtime, input);
-  const project = ensureDramaProject(runtime, mode);
+  const requestedProjectId =
+    typeof input.projectId === "string" && input.projectId.trim()
+      ? input.projectId.trim()
+      : undefined;
+  const project = ensureDramaProject(runtime, mode, { projectId: requestedProjectId });
+  const snapshotTitle =
+    runtime.currentProjectSnapshot &&
+    runtime.currentProjectSnapshot.projectKind !== "video" &&
+    (!requestedProjectId || runtime.currentProjectSnapshot.projectId === requestedProjectId)
+      ? runtime.currentProjectSnapshot.title?.trim()
+      : "";
 
   return {
     ...project,
@@ -209,7 +262,7 @@ function buildPlanningDramaProject(
     dramaTitle:
       typeof input.title === "string" && input.title.trim()
         ? input.title.trim()
-        : project.dramaTitle,
+        : project.dramaTitle || snapshotTitle,
     referenceScript:
       typeof input.referenceScript === "string"
         ? input.referenceScript
@@ -515,6 +568,343 @@ function parseDirectory(raw: string): EpisodeEntry[] {
   return parseDramaDirectoryText(raw);
 }
 
+function parseEpisodesFromProjectScriptText(
+  text: string,
+  fallbackEpisodes: EpisodeScript[],
+): EpisodeScript[] | null {
+  const normalized = applyDialogueReviewMarkers(text, false).paletteText.replace(/\r/g, "").trim();
+  if (!normalized) return null;
+  const sections = normalized.split(/\n\n---\n\n/).map((section) => section.trim()).filter(Boolean);
+  if (!sections.length) return null;
+  const fallbackByNumber = new Map(fallbackEpisodes.map((episode) => [episode.number, episode]));
+  const parsedEpisodes: EpisodeScript[] = [];
+
+  for (const section of sections) {
+    const [header = "", ...bodyLines] = section.split("\n");
+    const match = header.match(/^第\s*(\d+)\s*集(?:\s+(.*))?$/);
+    if (!match) return null;
+    const episodeNumber = Number(match[1]);
+    if (!Number.isFinite(episodeNumber)) return null;
+    const fallback = fallbackByNumber.get(episodeNumber);
+    const content = bodyLines.join("\n").trim();
+    parsedEpisodes.push({
+      number: episodeNumber,
+      title: match[2]?.trim() || fallback?.title || `第${episodeNumber}集`,
+      content,
+      wordCount: content.length,
+    });
+  }
+
+  return parsedEpisodes.sort((a, b) => a.number - b.number);
+}
+
+function syncComplianceWorkspaceToProjectScript(
+  project: DramaProject,
+  workspace: ComplianceWorkspace,
+): { episodes: EpisodeScript[]; workspace: ComplianceWorkspace } | null {
+  const parsedEpisodes = parseEpisodesFromProjectScriptText(
+    workspace.paletteText || workspace.sourceText,
+    project.episodes,
+  );
+  if (!parsedEpisodes?.length) return null;
+
+  const syncedSourceText = buildComplianceSourceText(
+    {
+      ...project,
+      episodes: parsedEpisodes,
+    },
+    { sourceStrategy: "project-script" },
+  ).trim();
+  const dialogueReview = applyDialogueReviewMarkers(syncedSourceText, workspace.dialogueReviewEnabled);
+
+  return {
+    episodes: parsedEpisodes,
+    workspace: normalizeComplianceWorkspace({
+      ...workspace,
+      sourceText: syncedSourceText,
+      paletteText: dialogueReview.paletteText,
+      dialogueOverLimitLineIndexes: dialogueReview.lineIndexes,
+    }),
+  };
+}
+
+const SMART_COMPLIANCE_FULL_REVIEW_THRESHOLD = 0.4;
+
+type SmartComplianceRerunPlan =
+  | { mode: "reuse"; sourceText: string; carriedRiskPhrases: ComplianceWorkspaceRiskPhrase[]; repairedCount: number }
+  | { mode: "full"; sourceText: string; changeRatio: number }
+  | {
+      mode: "incremental";
+      sourceText: string;
+      incrementalSourceText: string;
+      carriedRiskPhrases: ComplianceWorkspaceRiskPhrase[];
+      repairedCount: number;
+      changeRatio: number;
+    };
+
+function normalizeComplianceComparisonText(text: string): string {
+  return applyDialogueReviewMarkers(text, false).paletteText.replace(/\s+/g, "").trim().toLowerCase();
+}
+
+function anchorComplianceRiskPhrases(
+  sourceText: string,
+  riskPhrases: ComplianceWorkspaceRiskPhrase[],
+): ComplianceWorkspaceRiskPhrase[] {
+  return riskPhrases.map((phrase) => {
+    const [firstRange] = findRiskRanges(sourceText, phrase.text);
+    return {
+      ...phrase,
+      normalizedText: phrase.normalizedText || normalizeComplianceComparisonText(phrase.text),
+      sourceStart: firstRange?.[0] ?? phrase.sourceStart,
+      sourceEnd: firstRange?.[1] ?? phrase.sourceEnd,
+    };
+  });
+}
+
+function estimateComplianceSourceChangeRatio(previousSourceText: string, nextSourceText: string): number {
+  const previousLines = previousSourceText
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const nextLines = nextSourceText
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!previousLines.length && !nextLines.length) return 0;
+
+  const previousCounts = new Map<string, number>();
+  previousLines.forEach((line) => previousCounts.set(line, (previousCounts.get(line) ?? 0) + 1));
+  let sharedCount = 0;
+  nextLines.forEach((line) => {
+    const count = previousCounts.get(line) ?? 0;
+    if (count > 0) {
+      sharedCount += 1;
+      previousCounts.set(line, count - 1);
+    }
+  });
+
+  return 1 - sharedCount / Math.max(previousLines.length, nextLines.length, 1);
+}
+
+function collectChangedLineWindows(previousSourceText: string, nextSourceText: string): Array<[number, number]> {
+  const previousLines = previousSourceText.replace(/\r/g, "").split("\n");
+  const nextLines = nextSourceText.replace(/\r/g, "").split("\n");
+  const previousCounts = new Map<string, number>();
+  previousLines.forEach((line) => {
+    const key = line.trim();
+    if (!key) return;
+    previousCounts.set(key, (previousCounts.get(key) ?? 0) + 1);
+  });
+
+  const changedIndexes: number[] = [];
+  nextLines.forEach((line, index) => {
+    const key = line.trim();
+    if (!key) return;
+    const count = previousCounts.get(key) ?? 0;
+    if (count > 0) {
+      previousCounts.set(key, count - 1);
+      return;
+    }
+    changedIndexes.push(index);
+  });
+  if (!changedIndexes.length) return [];
+
+  const offsets: number[] = [];
+  let cursor = 0;
+  nextLines.forEach((line) => {
+    offsets.push(cursor);
+    cursor += line.length + 1;
+  });
+
+  const windows: Array<[number, number]> = [];
+  let groupStart = changedIndexes[0];
+  let groupEnd = changedIndexes[0];
+  for (let index = 1; index < changedIndexes.length; index += 1) {
+    const currentIndex = changedIndexes[index];
+    if (currentIndex <= groupEnd + 2) {
+      groupEnd = currentIndex;
+      continue;
+    }
+    windows.push([Math.max(groupStart - 1, 0), Math.min(groupEnd + 1, nextLines.length - 1)]);
+    groupStart = currentIndex;
+    groupEnd = currentIndex;
+  }
+  windows.push([Math.max(groupStart - 1, 0), Math.min(groupEnd + 1, nextLines.length - 1)]);
+
+  return windows.map(([startLine, endLine]) => [
+    offsets[startLine] ?? 0,
+    (offsets[endLine] ?? 0) + (nextLines[endLine]?.length ?? 0),
+  ]);
+}
+
+function buildIncrementalComplianceSourceText(sourceText: string, windows: Array<[number, number]>): string {
+  return windows
+    .map(([start, end]) => sourceText.slice(start, end).trim())
+    .filter(Boolean)
+    .join("\n\n---\n\n");
+}
+
+function buildSmartComplianceRerunPlan(
+  currentSourceText: string,
+  workspace: ComplianceWorkspace,
+): SmartComplianceRerunPlan {
+  const currentComparable = normalizeComplianceComparisonText(currentSourceText);
+  const syncedWorkspaceSourceText = workspace.sourceText.trim();
+  const syncedWorkspaceComparable = syncedWorkspaceSourceText
+    ? normalizeComplianceComparisonText(syncedWorkspaceSourceText)
+    : "";
+  if (syncedWorkspaceComparable && syncedWorkspaceComparable === currentComparable) {
+    const anchoredWorkspaceRiskPhrases = anchorComplianceRiskPhrases(currentSourceText, workspace.riskPhrases);
+    const carriedRiskPhrases: ComplianceWorkspaceRiskPhrase[] = [];
+    let repairedCount = 0;
+
+    anchoredWorkspaceRiskPhrases.forEach((phrase) => {
+      const phraseComparable = phrase.normalizedText || normalizeComplianceComparisonText(phrase.text);
+      if (phraseComparable && currentComparable.includes(phraseComparable)) {
+        carriedRiskPhrases.push({ ...phrase, status: "pending" });
+        return;
+      }
+      const replacementComparable = phrase.replacement
+        ? normalizeComplianceComparisonText(phrase.replacement)
+        : "";
+      if (replacementComparable && currentComparable.includes(replacementComparable)) {
+        repairedCount += 1;
+        return;
+      }
+      if (phrase.status === "resolved") {
+        repairedCount += 1;
+      }
+    });
+
+    return { mode: "reuse", sourceText: currentSourceText, carriedRiskPhrases, repairedCount };
+  }
+  const storedBaselineSourceText = (workspace.reviewBaselineSourceText || workspace.sourceText).trim();
+  const baselineSourceText =
+    syncedWorkspaceSourceText &&
+    normalizeComplianceComparisonText(syncedWorkspaceSourceText) === currentComparable
+      ? syncedWorkspaceSourceText
+      : storedBaselineSourceText;
+  const anchoredRiskPhrases = anchorComplianceRiskPhrases(baselineSourceText, workspace.riskPhrases);
+  if (!baselineSourceText || !anchoredRiskPhrases.length) {
+    return { mode: "full", sourceText: currentSourceText, changeRatio: 1 };
+  }
+
+  const changeRatio = estimateComplianceSourceChangeRatio(baselineSourceText, currentSourceText);
+  if (changeRatio >= SMART_COMPLIANCE_FULL_REVIEW_THRESHOLD) {
+    return { mode: "full", sourceText: currentSourceText, changeRatio };
+  }
+
+  const carriedRiskPhrases: ComplianceWorkspaceRiskPhrase[] = [];
+  let repairedCount = 0;
+
+  anchoredRiskPhrases.forEach((phrase) => {
+    const phraseComparable = phrase.normalizedText || normalizeComplianceComparisonText(phrase.text);
+    if (phraseComparable && currentComparable.includes(phraseComparable)) {
+      carriedRiskPhrases.push({ ...phrase, status: "pending" });
+      return;
+    }
+    const replacementComparable = phrase.replacement
+      ? normalizeComplianceComparisonText(phrase.replacement)
+      : "";
+    if (replacementComparable && currentComparable.includes(replacementComparable)) {
+      repairedCount += 1;
+      return;
+    }
+    if (phrase.status === "resolved") {
+      repairedCount += 1;
+    }
+  });
+
+  const changedWindows = collectChangedLineWindows(baselineSourceText, currentSourceText);
+  if (!changedWindows.length) {
+    return { mode: "reuse", sourceText: currentSourceText, carriedRiskPhrases, repairedCount };
+  }
+
+  return {
+    mode: "incremental",
+    sourceText: currentSourceText,
+    incrementalSourceText: buildIncrementalComplianceSourceText(currentSourceText, changedWindows),
+    carriedRiskPhrases,
+    repairedCount,
+    changeRatio,
+  };
+}
+
+function pushComplianceHistory(workspace: ComplianceWorkspace, value: string): Pick<ComplianceWorkspace, "history" | "historyIndex"> {
+  const nextHistory = workspace.history.slice(0, Math.max(workspace.historyIndex + 1, 0));
+  if (!nextHistory.length || nextHistory[nextHistory.length - 1] !== value) nextHistory.push(value);
+  return {
+    history: nextHistory.slice(-20),
+    historyIndex: Math.min(nextHistory.length - 1, 19),
+  };
+}
+
+function buildComplianceWorkspaceFromReview(
+  workspace: ComplianceWorkspace,
+  sourceText: string,
+  riskPhrases: ComplianceWorkspaceRiskPhrase[],
+  report: string,
+  segmentCount: number,
+): ComplianceWorkspace {
+  const anchoredRiskPhrases = anchorComplianceRiskPhrases(sourceText, riskPhrases);
+  const dialogueReview = applyDialogueReviewMarkers(sourceText, workspace.dialogueReviewEnabled);
+  const history = pushComplianceHistory(workspace, dialogueReview.paletteText);
+  return normalizeComplianceWorkspace({
+    ...workspace,
+    sourceText,
+    paletteText: dialogueReview.paletteText,
+    reviewBaselineSourceText: sourceText,
+    reviewBaselineReviewedAt: new Date().toISOString(),
+    riskPhrases: anchoredRiskPhrases,
+    riskSpans: locateComplianceRiskSpans(sourceText, anchoredRiskPhrases),
+    segments: workspace.segments,
+    progress: workspace.progress,
+    latestReview: {
+      reviewedAt: new Date().toISOString(),
+      segmentCount,
+      sourceLength: sourceText.length,
+      reportLength: report.length,
+      skippedAt: null,
+    },
+    history: history.history,
+    historyIndex: history.historyIndex,
+    dialogueOverLimitLineIndexes: dialogueReview.lineIndexes,
+  });
+}
+
+function mergeComplianceRiskPhrases(
+  carriedRiskPhrases: ComplianceWorkspaceRiskPhrase[],
+  incrementalRiskPhrases: ComplianceWorkspaceRiskPhrase[],
+): ComplianceWorkspaceRiskPhrase[] {
+  const merged = new Map<string, ComplianceWorkspaceRiskPhrase>();
+  carriedRiskPhrases.forEach((phrase) => {
+    const key = phrase.normalizedText || normalizeComplianceComparisonText(phrase.text) || phrase.id;
+    merged.set(key, phrase);
+  });
+  incrementalRiskPhrases.forEach((phrase) => {
+    const key = phrase.normalizedText || normalizeComplianceComparisonText(phrase.text) || phrase.id;
+    merged.set(key, phrase);
+  });
+  return [...merged.values()];
+}
+
+function buildSmartComplianceReport(
+  repairedCount: number,
+  carriedRiskPhrases: ComplianceWorkspaceRiskPhrase[],
+  incrementalRiskCount: number,
+  incrementalReport: string,
+): string {
+  const header = [
+    "# 智能重审摘要",
+    `- 已确认修复：${repairedCount}`,
+    `- 继续保留：${carriedRiskPhrases.length}`,
+    `- 增量新增：${incrementalRiskCount}`,
+  ].join("\n");
+  return incrementalReport.trim() ? `${header}\n\n## 增量复核\n${incrementalReport}` : header;
+}
+
 /**
  * 去掉 AI 误在对话/旁白行前加的 △ 符号。
  * 判断依据：行以 △ 开头，去掉 △ 后紧跟"角色名："格式（中文/英文/数字 + 全角或半角冒号）。
@@ -817,6 +1207,7 @@ function buildOutlineBatchTargets(
   const existing = resolveOutlineBatchStatuses(project);
   const regenerateAll = input.regenerateAll === true;
   const fillMissingOutlines = input.fillMissingOutlines === true;
+  const hasRequestedEpisodeNumbers = Array.isArray(input.episodeNumbers);
   const requestedEpisodeNumbers = Array.isArray(input.episodeNumbers)
     ? [...new Set(input.episodeNumbers.filter((value): value is number => typeof value === "number" && Number.isFinite(value)))]
         .sort((a, b) => a - b)
@@ -830,7 +1221,15 @@ function buildOutlineBatchTargets(
       ? input.rangeEnd
       : null;
 
-  if (fillMissingOutlines) {
+  const autoFillMissingOutlines =
+    !fillMissingOutlines &&
+    !regenerateAll &&
+    !hasRequestedEpisodeNumbers &&
+    rangeStart == null &&
+    rangeEnd == null &&
+    project.directory.some((entry) => entry.outline?.trim());
+
+  if (fillMissingOutlines || autoFillMissingOutlines) {
     const missingEpisodeNumbers = project.directory
       .filter((entry) => !entry.outline?.trim())
       .map((entry) => entry.number);
@@ -940,6 +1339,7 @@ async function generateDramaText(
   maxOutputTokens?: number,
   modelOverride?: string,
   onChunk?: (text: string) => void,
+  temperatureOverride?: number,
 ): Promise<string> {
   const storedParams = readStoredLlmParams();
   const resolvedMaxTokens = maxOutputTokens ?? storedParams.maxOutputTokens;
@@ -961,7 +1361,10 @@ async function generateDramaText(
       model,
       [{ role: "user", parts: [{ text: prompt }] }],
       onChunk ?? (() => {}),
-      { maxOutputTokens: resolvedMaxTokens, temperature: storedParams.temperature },
+      {
+        maxOutputTokens: resolvedMaxTokens,
+        temperature: temperatureOverride ?? storedParams.temperature,
+      },
       timeoutAbort.signal,
     );
   } catch (error) {
@@ -1327,7 +1730,7 @@ function resolveCustomInstruction(input: Record<string, unknown>): string | unde
   const customInstruction = typeof input.customInstruction === "string" ? input.customInstruction.trim() : "";
   const fillMissingInstruction =
     input.fillMissingEpisodes === true
-      ? "这是批量自动撰写补齐任务：只生成当前目标集正文，严格承接已完成前文和后续目录/细纲，避免重复已写内容，保持人物动机、伏笔回收、情绪节奏和结尾钩子的连续性。"
+      ? "这是自动批量补齐任务：只生成当前目标集正文，严格承接已完成前文和后续目录/细纲，避免重复已写内容，保持人物动机、伏笔回收、情绪节奏和结尾钩子的连续性。"
       : "";
 
   return [fillMissingInstruction, customInstruction].filter(Boolean).join("\n\n") || undefined;
@@ -1503,7 +1906,7 @@ export async function setEpisodeDurationPreferenceAction(
   return {
     ...saved,
     summary: durationSeconds
-      ? `已将单集时长设为 ${durationSeconds} 秒。现在可以继续选择要生成的集数或直接批量生成。`
+      ? `已将单集时长设为 ${durationSeconds} 秒。现在可以继续选择要生成的集数或直接${project.episodes.some(isEpisodeContentComplete) ? "自动批量补齐" : "自动批量续写"}。`
       : "已清除单集时长设置。",
   };
 }
@@ -1525,19 +1928,45 @@ export async function saveDramaSetupAction(
   runtime: StudioRuntimeState,
 ): Promise<WorkflowActionResult> {
   const forceNewProject = input.forceNewProject === true;
+  const targetProjectId = typeof input.projectId === "string" ? input.projectId.trim() : "";
   const mode =
     input.projectKind === "adaptation"
       ? "adaptation"
       : runtime.currentProjectSnapshot?.projectKind === "adaptation"
         ? "adaptation"
         : "traditional";
-  const project = ensureDramaProject(runtime, mode, { forceNew: forceNewProject });
+  const project = ensureDramaProject(runtime, mode, {
+    forceNew: forceNewProject,
+    ...(targetProjectId ? { projectId: targetProjectId } : {}),
+  });
   const setup = buildDramaSetup(input, project.setup);
   const title = typeof input.title === "string" ? input.title : project.dramaTitle;
   const referenceScript =
     typeof input.referenceScript === "string"
       ? input.referenceScript
       : project.referenceScript;
+  const hasExistingSetup = Boolean(project.setup);
+  const hasSetupSeed = hasMeaningfulOriginalSetupSeed(input, project.setup);
+
+  if (mode !== "adaptation" && !hasExistingSetup && !hasSetupSeed) {
+    const saved = upsertStoredDramaProject({
+      ...project,
+      mode,
+      dramaTitle: title,
+      referenceScript,
+      currentStep: "setup",
+    });
+    const snapshot = createDramaSnapshot(saved);
+    return {
+      summary: `已记录《${saved.dramaTitle || "未命名项目"}》的会话入口，接下来先确认原创立项方向，再进入创作方案。`,
+      projectSnapshot: snapshot,
+      data: {
+        dramaProject: saved,
+        projectSnapshot: snapshot,
+      },
+    };
+  }
+
   return saveDramaProject({
     ...project,
     mode,
@@ -2281,9 +2710,15 @@ export async function generateEpisodeBatchAction(
   const project = ensureDramaProject(runtime, mode);
   const setup = buildDramaSetup(input, project.setup);
   const durationSeconds = resolveEpisodeDurationSeconds(input, project);
-  const fillMissingEpisodes = input.fillMissingEpisodes === true;
   const requestedEpisodeNumbers = normalizeEpisodeNumberList(input.episodeNumbers);
   const hasRequestedEpisodeNumbers = Array.isArray(input.episodeNumbers);
+  const autoFillMissingEpisodes =
+    !hasRequestedEpisodeNumbers && project.episodes.some(isEpisodeContentComplete);
+  const fillMissingEpisodes = input.fillMissingEpisodes === true || autoFillMissingEpisodes;
+  const generationInput =
+    fillMissingEpisodes && input.fillMissingEpisodes !== true
+      ? { ...input, fillMissingEpisodes: true }
+      : input;
   const targetEpisodeNumbers = (
     requestedEpisodeNumbers.length ? requestedEpisodeNumbers : listPendingEpisodeNumbers(project)
   ).sort((a, b) => a - b);
@@ -2331,7 +2766,7 @@ export async function generateEpisodeBatchAction(
         project,
         episodeNumber,
         nextEpisodes,
-        input,
+        generationInput,
         durationSeconds,
         abortSignal,
       );
@@ -2416,50 +2851,100 @@ export async function reviewEpisodeQualityAction(
   const { batch, targetEpisodes } = resolveEpisodeReviewTargets(project, input);
   const batchReviewedAt = batch.reviewedAt;
 
-  const packets = (
-    await mapWithConcurrency(targetEpisodes, 2, async (episode) => {
-      const previousEpisode = project.episodes.find((item) => item.number === episode.number - 1);
-      const nextEpisode = project.episodes.find((item) => item.number === episode.number + 1);
-      const reviewText = await generateDramaText(
-        buildReviewPrompt(
-          setup,
-          project.characters,
-          project.directory,
-          episode.number,
-          episode.content,
-          previousEpisode?.content,
-          nextEpisode?.content,
-        ),
-        undefined,
-        3072,
-      );
-      const reviewResult = parseReviewResult(reviewText);
-      if (!reviewResult) return null;
-      const packet: EpisodeQualityReviewPacket = {
-        id: `${project.id}-episode-review-${episode.number}`,
-        episodeNumber: episode.number,
-        title: episode.title,
-        reviewedAt: batchReviewedAt,
-        result: reviewResult,
-        rewriteInstruction: "",
-      };
-      packet.rewriteInstruction = buildEpisodeReviewRewriteInstruction(packet);
-      return packet;
-    })
-  ).filter((packet): packet is EpisodeQualityReviewPacket => Boolean(packet));
+  const packetMap = new Map(
+    (project.episodeQualityReviewPackets ?? []).map((packet) => [packet.episodeNumber, packet] as const),
+  );
+  const completedPackets: EpisodeQualityReviewPacket[] = [];
+  let workingProject: DramaProject = {
+    ...project,
+    setup,
+    currentStep: "episodes",
+  };
+  let nextEpisodeIndex = 0;
+  let firstError: unknown = null;
 
-  if (!packets.length) {
+  const persistCompletedReviewPacket = (packet: EpisodeQualityReviewPacket) => {
+    packetMap.set(packet.episodeNumber, packet);
+    completedPackets.push(packet);
+    const reviewedEpisodeNumbers = completedPackets
+      .map((item) => item.episodeNumber)
+      .sort((left, right) => left - right);
+    workingProject = emitDramaRuntimeDelta(
+      "review_episode_quality",
+      {
+        ...workingProject,
+        setup,
+        episodeQualityReviewPackets: [...packetMap.values()].sort((a, b) => a.episodeNumber - b.episodeNumber),
+        lastEpisodeQualityReviewBatch: {
+          ...batch,
+          reviewedAt: batchReviewedAt,
+          episodeNumbers: reviewedEpisodeNumbers,
+          requestedCount:
+            batch.mode === "episodes" ? reviewedEpisodeNumbers.length : batch.requestedCount ?? null,
+        },
+        currentStep: "episodes",
+      },
+      `Episode ${packet.episodeNumber} reviewed`,
+    );
+  };
+
+  const workerCount = Math.min(2, targetEpisodes.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (firstError == null) {
+        const currentIndex = nextEpisodeIndex;
+        nextEpisodeIndex += 1;
+        if (currentIndex >= targetEpisodes.length) return;
+
+        const episode = targetEpisodes[currentIndex];
+        const previousEpisode = project.episodes.find((item) => item.number === episode.number - 1);
+        const nextEpisode = project.episodes.find((item) => item.number === episode.number + 1);
+
+        try {
+          const reviewText = await generateDramaText(
+            buildReviewPrompt(
+              setup,
+              project.characters,
+              project.directory,
+              episode.number,
+              episode.content,
+              previousEpisode?.content,
+              nextEpisode?.content,
+            ),
+            undefined,
+            3072,
+          );
+          const reviewResult = parseReviewResult(reviewText);
+          if (!reviewResult) continue;
+          const packet: EpisodeQualityReviewPacket = {
+            id: `${project.id}-episode-review-${episode.number}`,
+            episodeNumber: episode.number,
+            title: episode.title,
+            reviewedAt: batchReviewedAt,
+            result: reviewResult,
+            rewriteInstruction: "",
+          };
+          packet.rewriteInstruction = buildEpisodeReviewRewriteInstruction(packet);
+          persistCompletedReviewPacket(packet);
+        } catch (error) {
+          firstError ??= error;
+          return;
+        }
+      }
+    }),
+  );
+
+  if (!completedPackets.length) {
+    if (firstError) throw firstError;
     throw new Error("本轮质检没有拿到可解析的结构化结果。");
   }
 
-  const packetMap = new Map(
-    (project.episodeQualityReviewPackets ?? []).map((packet) => [packet.episodeNumber, packet]),
-  );
-  packets.forEach((packet) => packetMap.set(packet.episodeNumber, packet));
   const mergedPackets = [...packetMap.values()].sort((a, b) => a.episodeNumber - b.episodeNumber);
-  const reviewedEpisodeNumbers = packets.map((packet) => packet.episodeNumber);
+  const reviewedEpisodeNumbers = completedPackets
+    .map((packet) => packet.episodeNumber)
+    .sort((left, right) => left - right);
   const saved = saveDramaProject({
-    ...project,
+    ...workingProject,
     setup,
     episodeQualityReviewPackets: mergedPackets,
     lastEpisodeQualityReviewBatch: {
@@ -2475,14 +2960,16 @@ export async function reviewEpisodeQualityAction(
   // 将质检结果写入学习存储，供后续同类项目参考
   try {
     const { recordQualityPattern } = await import("@/lib/home-agent/agent-learning-store");
-    packets.forEach((packet) => recordQualityPattern(project, packet));
+    completedPackets.forEach((packet) => recordQualityPattern(project, packet));
   } catch {
     /* 学习存储写入失败不影响主流程 */
   }
 
+  if (firstError) throw firstError;
+
   return {
     ...saved,
-    summary: buildEpisodeReviewBatchSummary(packets),
+    summary: buildEpisodeReviewBatchSummary(completedPackets),
   };
 }
 
@@ -2586,28 +3073,84 @@ export async function runComplianceReviewAction(
   const strictness = resolveComplianceStrictness(input, workspace);
   const model = resolveComplianceModel(input, workspace);
   const sourceText = buildComplianceSourceText(project, input).trim();
+  const dialogueReviewEnabled =
+    typeof input.dialogueReviewEnabled === "boolean"
+      ? input.dialogueReviewEnabled
+      : workspace.dialogueReviewEnabled;
 
   if (!sourceText) {
     throw new Error("缺少待审文本，无法启动完整版合规审查。");
   }
 
+  const smartRerunPlan = input.smartRerun === true ? buildSmartComplianceRerunPlan(sourceText, workspace) : null;
+  if (smartRerunPlan?.mode === "reuse") {
+    const carriedRiskPhrases = anchorComplianceRiskPhrases(sourceText, smartRerunPlan.carriedRiskPhrases);
+    const report = buildSmartComplianceReport(
+      smartRerunPlan.repairedCount,
+      carriedRiskPhrases,
+      0,
+      "",
+    );
+    const finalWorkspace = buildComplianceWorkspaceFromReview(
+      normalizeComplianceWorkspace({
+        ...workspace,
+        sourceText,
+        reviewMode,
+        strictness,
+        model,
+        dialogueReviewEnabled,
+        segments: [],
+        progress: null,
+      }),
+      sourceText,
+      carriedRiskPhrases,
+      report,
+      0,
+    );
+    return saveDramaProject({
+      ...project,
+      complianceReport: report,
+      complianceWorkspace: finalWorkspace,
+      complianceReviewMode: reviewMode,
+      complianceRevisionPackets: deriveComplianceRevisionPackets(
+        finalWorkspace.riskPhrases,
+        finalWorkspace.phraseReplacements,
+      ),
+      complianceSkippedAt: null,
+      currentStep: "compliance",
+    });
+  }
+
+  const reviewSourceText =
+    smartRerunPlan?.mode === "incremental" ? smartRerunPlan.incrementalSourceText : sourceText;
+
+  const freshWorkspace = normalizeComplianceWorkspace({
+    ...workspace,
+    sourceText: reviewSourceText,
+    reviewMode,
+    strictness,
+    model,
+    paletteText: reviewSourceText,
+    riskPhrases: [],
+    riskSpans: [],
+    phraseReplacements: {},
+    segments: [],
+    progress: null,
+    latestReview: null,
+    history: [],
+    historyIndex: -1,
+    dialogueReviewEnabled,
+    dialogueOverLimitLineIndexes: [],
+  });
+
   let workingProject: DramaProject = {
     ...project,
+    complianceReport: "",
+    complianceRevisionPackets: [],
     complianceReviewMode: reviewMode,
     complianceSkippedAt: null,
     currentStep: "compliance" as const,
-    complianceWorkspace: normalizeComplianceWorkspace({
-      ...workspace,
-      sourceText,
-      reviewMode,
-      strictness,
-      model,
-      paletteText: workspace.paletteText.trim() || sourceText,
-      dialogueReviewEnabled:
-        typeof input.dialogueReviewEnabled === "boolean"
-          ? input.dialogueReviewEnabled
-          : workspace.dialogueReviewEnabled,
-    }),
+    complianceWorkspace: freshWorkspace,
   };
 
   workingProject = emitDramaRuntimeDelta(
@@ -2617,12 +3160,13 @@ export async function runComplianceReviewAction(
   );
 
   const result = await executeComplianceReview({
-    sourceText,
+    sourceText: reviewSourceText,
     workspace: normalizeComplianceWorkspace(workingProject.complianceWorkspace),
     reviewMode,
     strictness,
     model,
-    generateSegment: (prompt) => generateDramaText(prompt, undefined, 6144, model),
+    generateSegment: (prompt) =>
+      generateDramaText(prompt, undefined, 6144, model, undefined, COMPLIANCE_REVIEW_TEMPERATURE),
     onProgress: (nextWorkspace) => {
       workingProject = emitDramaRuntimeDelta(
         "run_compliance_review",
@@ -2637,13 +3181,59 @@ export async function runComplianceReviewAction(
       );
     },
   });
+  const finalReport =
+    smartRerunPlan?.mode === "incremental"
+      ? buildSmartComplianceReport(
+          smartRerunPlan.repairedCount,
+          smartRerunPlan.carriedRiskPhrases,
+          result.workspace.riskPhrases.length,
+          result.report,
+        )
+      : result.report;
+  const finalWorkspace =
+    smartRerunPlan?.mode === "incremental"
+      ? buildComplianceWorkspaceFromReview(
+          normalizeComplianceWorkspace({
+            ...result.workspace,
+            sourceText,
+            reviewMode,
+            strictness,
+            model,
+            dialogueReviewEnabled,
+          }),
+          sourceText,
+          mergeComplianceRiskPhrases(
+            anchorComplianceRiskPhrases(sourceText, smartRerunPlan.carriedRiskPhrases),
+            anchorComplianceRiskPhrases(sourceText, result.workspace.riskPhrases),
+          ),
+          finalReport,
+          result.workspace.latestReview?.segmentCount ?? result.workspace.segments.length,
+        )
+      : buildComplianceWorkspaceFromReview(
+          normalizeComplianceWorkspace({
+            ...result.workspace,
+            sourceText,
+            reviewMode,
+            strictness,
+            model,
+            dialogueReviewEnabled,
+          }),
+          sourceText,
+          result.workspace.riskPhrases,
+          finalReport,
+          result.workspace.latestReview?.segmentCount ?? result.workspace.segments.length,
+        );
+  const finalPackets = deriveComplianceRevisionPackets(
+    finalWorkspace.riskPhrases,
+    finalWorkspace.phraseReplacements,
+  );
 
   return saveDramaProject({
     ...workingProject,
-    complianceReport: result.report,
-    complianceWorkspace: result.workspace,
+    complianceReport: finalReport,
+    complianceWorkspace: finalWorkspace,
     complianceReviewMode: reviewMode,
-    complianceRevisionPackets: result.revisionPackets,
+    complianceRevisionPackets: finalPackets,
     complianceSkippedAt: null,
     currentStep: "compliance",
   });
@@ -2761,6 +3351,21 @@ export async function updateComplianceWorkspaceAction(
     });
   }
 
+  const dialogueReview = applyDialogueReviewMarkers(
+    workspace.paletteText || workspace.sourceText,
+    workspace.dialogueReviewEnabled,
+  );
+  workspace = normalizeComplianceWorkspace({
+    ...workspace,
+    paletteText: dialogueReview.paletteText,
+    dialogueOverLimitLineIndexes: dialogueReview.lineIndexes,
+    history: workspace.history.length
+      ? workspace.history.map((entry, index) =>
+          index === workspace.historyIndex ? dialogueReview.paletteText : entry,
+        )
+      : workspace.history,
+  });
+
   const nextProject = syncCompliancePacketsWithWorkspace(
     {
       ...project,
@@ -2874,17 +3479,22 @@ export async function autoAdjustComplianceAction(
   });
 
   // 将所有仍处于 pending 状态的风险片段标记为已解决（一键修复）
-  workspace = normalizeComplianceWorkspace({
-    ...workspace,
-    riskPhrases: workspace.riskPhrases.map((phrase) =>
-      phrase.status === "pending" ? { ...phrase, status: "resolved" as const } : phrase,
-    ),
-  });
+  let nextProject = project;
+  if (input.sourceStrategy === "project-script") {
+    const synced = syncComplianceWorkspaceToProjectScript(project, workspace);
+    if (synced) {
+      workspace = synced.workspace;
+      nextProject = {
+        ...project,
+        episodes: synced.episodes,
+      };
+    }
+  }
 
   return saveDramaProject(
     syncCompliancePacketsWithWorkspace(
       {
-        ...project,
+        ...nextProject,
         complianceWorkspace: workspace,
         complianceReviewMode: workspace.reviewMode,
         currentStep: "compliance",

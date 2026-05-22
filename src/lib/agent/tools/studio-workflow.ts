@@ -253,7 +253,10 @@ export class StudioWorkflowTool extends ToolBase {
         },
         batchSize: {
           type: "number",
-          description: "How many scenes to submit in one homepage generation batch",
+          minimum: 1,
+          maximum: 3,
+          description:
+            "How many scenes to submit in one homepage generation batch. Defaults to the selected video model's supported limit and never exceeds 3.",
         },
         maxSteps: {
           type: "number",
@@ -265,7 +268,8 @@ export class StudioWorkflowTool extends ToolBase {
         },
         videoModelKey: {
           type: "string",
-          description: "Optional video model key override, currently doubao-seedance-1-5-pro.",
+          description:
+            "Optional video model key override, such as doubao-seedance-1-5-pro, doubao-seedance-2-0-260128, or doubao-seedance-2-0-fast-260128.",
         },
         selectedVideoModelKey: {
           type: "string",
@@ -274,7 +278,7 @@ export class StudioWorkflowTool extends ToolBase {
         videoGenerationPrefs: {
           type: "object",
           description:
-            "Optional video generation preferences. Currently supports { modelKey: 'doubao-seedance-1-5-pro', resolution: '1080p' } and resolves to doubao-seedance-1-5-pro_1080p.",
+            "Optional video generation preferences. For Seedance 1.5 Pro, resolution resolves to aliases like doubao-seedance-1-5-pro_1080p; Seedance 2.0 family keeps the official model id such as doubao-seedance-2-0-260128.",
           properties: {
             modelKey: { type: "string" },
             resolution: { type: "string" },
@@ -286,7 +290,7 @@ export class StudioWorkflowTool extends ToolBase {
         },
         provider: {
           type: "string",
-          description: "Optional provider override such as dreamina-cli, jimeng, or tuzi",
+          description: "Optional provider override such as jimeng or tuzi",
         },
         forceRegenerate: {
           type: "boolean",
@@ -385,6 +389,7 @@ export class StudioWorkflowTool extends ToolBase {
     ]);
     const VIDEO_GENERATING_ACTIONS = new Set([
       "generate_video_assets",
+      "generate_segment_video",
     ]);
     const targetIds = Array.isArray(args.targetIds) ? args.targetIds.map(String) : undefined;
     const imageContentSummary = buildMediaContentSummary({
@@ -400,7 +405,11 @@ export class StudioWorkflowTool extends ToolBase {
       runtime,
       targetIds,
     });
-    if (IMAGE_GENERATING_ACTIONS.has(actionName) && typeof window !== "undefined") {
+    const shouldDispatchImageGeneratingState =
+      IMAGE_GENERATING_ACTIONS.has(actionName) && typeof window !== "undefined";
+    const shouldDispatchVideoGeneratingState =
+      VIDEO_GENERATING_ACTIONS.has(actionName) && typeof window !== "undefined";
+    if (shouldDispatchImageGeneratingState) {
       // 估算图片数量：generate_project_image 固定 1 张，其余默认 1 张（实际数量未知）
       const estimatedCount = actionName === "generate_project_image" ? 1 : 1;
       window.dispatchEvent(
@@ -430,7 +439,7 @@ export class StudioWorkflowTool extends ToolBase {
         }),
       );
     }
-    if (VIDEO_GENERATING_ACTIONS.has(actionName) && typeof window !== "undefined") {
+    if (shouldDispatchVideoGeneratingState) {
       const estimatedCount =
         Array.isArray(args.targetIds) && args.targetIds.length ? args.targetIds.length : 1;
       window.dispatchEvent(
@@ -483,12 +492,21 @@ export class StudioWorkflowTool extends ToolBase {
 
     let result: Awaited<ReturnType<typeof runWorkflowAction>>;
     try {
-      result = await runWorkflowAction(actionName, args, runtime, (partial) => {
+      const actionInput = context.abortSignal
+        ? { ...args, abortSignal: context.abortSignal }
+        : args;
+      result = await runWorkflowAction(actionName, actionInput, runtime, (partial) => {
         if (partial.summary?.trim()) {
           emitWorkflowProgress(progressId, "progress", partial.summary.trim(), onProgress);
         }
       });
     } catch (error) {
+      if (shouldDispatchImageGeneratingState) {
+        window.dispatchEvent(new CustomEvent("agent:image-generating-cancelled"));
+      }
+      if (shouldDispatchVideoGeneratingState) {
+        window.dispatchEvent(new CustomEvent("agent:video-generating-cancelled"));
+      }
       emitWorkflowProgress(
         progressId,
         "error",

@@ -1,6 +1,5 @@
 import * as React from "react";
 import * as apiConfigModule from "@/lib/api-config";
-import * as dreaminaCliModule from "@/lib/dreamina-cli";
 import type { HomeAgentApiConfigModule, HomeAgentEngineDeps } from "./home-agent-engine-runtime";
 
 const { useCallback, useRef } = React;
@@ -11,7 +10,6 @@ export type StructuredQuestionParserModule = typeof import("./structured-questio
 export type WorkflowActionsModule = typeof import("@/lib/home-agent/workflow-actions");
 export type SemanticSummaryModule = typeof import("@/lib/home-agent/conversation-semantic-summary");
 export type ConversationMemoryModule = typeof import("@/lib/home-agent/conversation-memory");
-export type DreaminaCliModule = typeof import("@/lib/dreamina-cli");
 
 export function useHomeAgentModuleLoaders() {
   const engineDepsRef = useRef<Promise<HomeAgentEngineDeps> | null>(null);
@@ -22,7 +20,6 @@ export function useHomeAgentModuleLoaders() {
   const workflowActionsRef = useRef<Promise<WorkflowActionsModule> | null>(null);
   const semanticSummaryRef = useRef<Promise<SemanticSummaryModule> | null>(null);
   const conversationMemoryRef = useRef<Promise<ConversationMemoryModule> | null>(null);
-  const dreaminaCliRef = useRef<Promise<DreaminaCliModule> | null>(null);
 
   const loadEngineDeps = useCallback(async () => {
     if (!engineDepsRef.current) {
@@ -82,13 +79,6 @@ export function useHomeAgentModuleLoaders() {
     return conversationMemoryRef.current;
   }, []);
 
-  const loadDreaminaCliModule = useCallback(async () => {
-    if (!dreaminaCliRef.current) {
-      dreaminaCliRef.current = Promise.resolve(dreaminaCliModule);
-    }
-    return dreaminaCliRef.current;
-  }, []);
-
   return {
     loadEngineDeps,
     loadProjectStore,
@@ -98,6 +88,5 @@ export function useHomeAgentModuleLoaders() {
     loadWorkflowActionsModule,
     loadSemanticSummaryModule,
     loadConversationMemoryModule,
-    loadDreaminaCliModule,
   };
 }

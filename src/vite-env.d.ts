@@ -7,6 +7,8 @@
 interface BuiltinApiBundle {
   geminiEndpoint?: string;
   geminiKey?: string;
+  aliyunEndpoint?: string;
+  aliyunKey?: string;
   jimengEndpoint?: string;
   jimengKey?: string;
   viduEndpoint?: string;
@@ -17,20 +19,6 @@ interface BuiltinApiBundle {
 }
 
 interface ElectronAPI {
-  dreaminaCli?: {
-    exec: (
-      args: string[],
-      stdin?: string,
-    ) => Promise<{
-      ok: boolean;
-      installed?: boolean;
-      path?: string;
-      code?: number;
-      stdout?: string;
-      stderr?: string;
-      error?: string;
-    }>;
-  };
   jimeng?: {
     writeFile: (
       filePath: string,
@@ -55,6 +43,13 @@ interface ElectronAPI {
       | { ok: true; cancelled: false; filePath: string; error?: string }
       | { ok: true; cancelled: true; filePath: null; error?: string }
       | { ok: false; cancelled: false; filePath: null; error?: string }
+    >;
+    writeBase64File?: (params: {
+      filePath: string;
+      base64: string;
+    }) => Promise<
+      | { ok: true; filePath: string; error?: string }
+      | { ok: false; filePath: null; error?: string }
     >;
     copyFile?: (
       sourcePath: string,

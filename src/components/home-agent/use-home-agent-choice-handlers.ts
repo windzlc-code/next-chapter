@@ -8,6 +8,7 @@ import type {
   StudioRuntimeState,
 } from "@/lib/home-agent/types";
 import type { HomeAgentImageStyleRecognitionResult } from "@/lib/home-agent/image-style-analysis";
+import type { CharacterAudioPresetBindSelection } from "@/lib/home-agent/character-audio-preset-library";
 import type { VideoGenerationPrefs, VideoImageGenerationPrefs } from "@/types/project";
 import { createScriptProjectChoiceHandler, type ExportLocalAction } from "./home-agent-script-choice-handlers";
 import {
@@ -17,6 +18,8 @@ import {
 import { showChoiceNoticeMessage, showChoicePopoverMessage } from "./home-agent-workflow-ui";
 
 type PushMessage = (role: HomeAgentMessage["role"], content: string) => void;
+type SubmittedStyleReferenceResult =
+  HomeAgentImageStyleRecognitionResult & { handledLocally?: boolean };
 type ChoiceHandler = (
   snapshot: ConversationProjectSnapshot,
   value: string,
@@ -30,6 +33,10 @@ type WorkflowShortcutRunner = (
   options?: {
     restoreQuestionOnInterrupt?: ComposerQuestion | null;
     restoreQuestionOnCancel?: ComposerQuestion | null;
+    restoreQuestionOnError?: ComposerQuestion | null;
+    restoreQuestionAfterRun?: ComposerQuestion | null;
+    skipUserBubble?: boolean;
+    skipAssistantSummary?: boolean;
   },
 ) => void | Promise<void>;
 type WorkflowShortcutChainRunner = (
@@ -38,13 +45,23 @@ type WorkflowShortcutChainRunner = (
   options?: {
     restoreQuestionOnInterrupt?: ComposerQuestion | null;
     restoreQuestionOnCancel?: ComposerQuestion | null;
+    restoreQuestionOnError?: ComposerQuestion | null;
+    restoreQuestionAfterRun?: ComposerQuestion | null;
+    skipUserBubble?: boolean;
   },
 ) => void | Promise<void>;
 type BackgroundVideoBridgeResearchRunner = (
   userBubble: string,
   mode?: "all" | "targetPlatform" | "shotStyle" | "outputGoal",
 ) => void | Promise<void>;
-type MediaPrefsCommitter<TPrefs> = (prefs: Partial<TPrefs>) => void | Promise<void>;
+type MediaPrefsCommitter<TPrefs> = (
+  prefs: Partial<TPrefs>,
+  options?: {
+    referenceStyleSummary?: string | null;
+    projectPatch?: Partial<PersistedVideoProject>;
+  },
+) => void | Promise<unknown>;
+type VideoProjectPatcher = (patch: Partial<PersistedVideoProject>) => void | Promise<void>;
 type SceneLike = { id: string };
 type CharacterCard = {
   id: string;
@@ -74,18 +91,41 @@ export function useHomeAgentChoiceHandlers(params: {
   rememberInterruptRestoreQuestion: (question: ComposerQuestion | null) => void;
   push: PushMessage;
   setPopoverOverride: React.Dispatch<React.SetStateAction<ComposerQuestion | null>>;
+  openPopoverQuestion?: (question: ComposerQuestion | null) => void | boolean;
   setSuggested: React.Dispatch<React.SetStateAction<ComposerQuestion | null>>;
   setMode: React.Dispatch<React.SetStateAction<AgentConversationMode>>;
   resetComposerDraft: (value?: string) => void;
   send: (prompt: string, shown?: string) => Promise<void>;
   runBackgroundVideoBridgeResearch: BackgroundVideoBridgeResearchRunner;
+  commitVideoProjectPatch?: VideoProjectPatcher;
   commitImageGenerationPrefs?: MediaPrefsCommitter<VideoImageGenerationPrefs>;
   commitVideoGenerationPrefs?: MediaPrefsCommitter<VideoGenerationPrefs>;
   getImageGenerationPrefs?: () => VideoImageGenerationPrefs;
   getVideoGenerationPrefs?: () => VideoGenerationPrefs;
   getAttachedImageCount?: () => number;
+  clearAttachedFiles?: () => void;
   recognizeImageStyle?: () => Promise<HomeAgentImageStyleRecognitionResult | null>;
+  submitAttachedStyleReference?: (label: string) => Promise<SubmittedStyleReferenceResult | null>;
   onAwaitVideoKickoffStyleReferenceUpload?: (label: string) => void;
+  onAwaitCharacterAudioReferenceUpload?: (
+    label: string,
+    characterId: string,
+    characterName?: string,
+    restoreQuestion?: ComposerQuestion | null,
+  ) => void;
+  onOpenCharacterAudioReferencePresetPicker?: (
+    label: string,
+    characterId: string,
+    characterName?: string,
+    restoreQuestion?: ComposerQuestion | null,
+  ) => void | Promise<void>;
+  onBindCharacterAudioReferencePreset?: (
+    selection: CharacterAudioPresetBindSelection & {
+      label: string;
+      characterName?: string;
+      restoreQuestion?: ComposerQuestion | null;
+    },
+  ) => void | Promise<void>;
   onClearVideoKickoffStyleReferenceUploadWait?: () => void;
   runWorkflowActionShortcut: WorkflowShortcutRunner;
   runWorkflowActionShortcutChain: WorkflowShortcutChainRunner;
@@ -137,18 +177,25 @@ export function useHomeAgentChoiceHandlers(params: {
     rememberInterruptRestoreQuestion,
     push,
     setPopoverOverride,
+    openPopoverQuestion,
     setSuggested,
     setMode,
     resetComposerDraft,
     send,
     runBackgroundVideoBridgeResearch,
+    commitVideoProjectPatch,
     commitImageGenerationPrefs,
     commitVideoGenerationPrefs,
     getImageGenerationPrefs,
     getVideoGenerationPrefs,
     getAttachedImageCount,
+    clearAttachedFiles,
     recognizeImageStyle,
+    submitAttachedStyleReference,
     onAwaitVideoKickoffStyleReferenceUpload,
+    onAwaitCharacterAudioReferenceUpload,
+    onOpenCharacterAudioReferencePresetPicker,
+    onBindCharacterAudioReferencePreset,
     onClearVideoKickoffStyleReferenceUploadWait,
     runWorkflowActionShortcut,
     runWorkflowActionShortcutChain,
@@ -188,20 +235,27 @@ export function useHomeAgentChoiceHandlers(params: {
         nextQuestion,
         push,
         setPopoverOverride,
+        openPopoverQuestion,
         setSuggested,
         setMode,
         resetComposerDraft,
       });
     },
-    [push, resetComposerDraft, setMode, setPopoverOverride, setSuggested],
+    [openPopoverQuestion, push, resetComposerDraft, setMode, setPopoverOverride, setSuggested],
   );
 
   const showChoiceNotice = useCallback(
-    (label: string, assistantMessage: string, nextSuggestion: ComposerQuestion | null = null) => {
+    (
+      label: string,
+      assistantMessage: string,
+      nextSuggestion: ComposerQuestion | null = null,
+      options?: { preservePopover?: boolean },
+    ) => {
       showChoiceNoticeMessage({
         label,
         assistantMessage,
         nextSuggestion,
+        preservePopover: options?.preservePopover,
         push,
         setPopoverOverride,
         setSuggested,
@@ -253,7 +307,7 @@ export function useHomeAgentChoiceHandlers(params: {
       onAwaitVideoKickoffStyleReferenceUpload?.(label);
       showChoiceNotice(
         label,
-        "请先上传一张参考图。发送后我会先识别画面风格并给出摘要，然后自动继续补平台与镜头偏好。",
+        "请先上传一张参考图。发送后我会先识别画面风格并给出摘要，然后停在“补齐平台与镜头偏好”这一步等你确认。",
       );
     },
     [onAwaitVideoKickoffStyleReferenceUpload, showChoiceNotice],
@@ -263,18 +317,90 @@ export function useHomeAgentChoiceHandlers(params: {
     onClearVideoKickoffStyleReferenceUploadWait?.();
   }, [onClearVideoKickoffStyleReferenceUploadWait]);
 
+  const awaitCharacterAudioReferenceUpload = useCallback(
+    (label: string, characterId: string, characterName?: string) => {
+      const restoreQuestion = getCurrentQuestion();
+      rememberInterruptRestoreQuestion(restoreQuestion);
+      onAwaitCharacterAudioReferenceUpload?.(
+        label,
+        characterId,
+        characterName,
+        restoreQuestion,
+      );
+      const notice = characterName
+        ? `请上传角色《${characterName}》的音频参考。一次只能绑定 1 个音色；如果重新上传，我会用最新这条覆盖当前角色的声音参考。`
+        : "请上传角色音频参考。一次只能绑定 1 个音色；如果重新上传，我会用最新这条覆盖当前角色的声音参考。";
+      showChoiceNotice(label, notice, null, { preservePopover: true });
+    },
+    [
+      getCurrentQuestion,
+      onAwaitCharacterAudioReferenceUpload,
+      rememberInterruptRestoreQuestion,
+      showChoiceNotice,
+    ],
+  );
+
+  const openCharacterAudioReferencePresetPicker = useCallback(
+    (
+      label: string,
+      characterId: string,
+      characterName?: string,
+    ) => {
+      const restoreQuestion = getCurrentQuestion();
+      rememberInterruptRestoreQuestion(restoreQuestion);
+      return onOpenCharacterAudioReferencePresetPicker?.(
+        label,
+        characterId,
+        characterName,
+        restoreQuestion,
+      );
+    },
+    [
+      getCurrentQuestion,
+      onOpenCharacterAudioReferencePresetPicker,
+      rememberInterruptRestoreQuestion,
+    ],
+  );
+
+  const bindCharacterAudioReferencePreset = useCallback(
+    (
+      selection: CharacterAudioPresetBindSelection & {
+        label: string;
+        characterName?: string;
+      },
+    ) => {
+      const restoreQuestion = getCurrentQuestion();
+      rememberInterruptRestoreQuestion(restoreQuestion);
+      return onBindCharacterAudioReferencePreset?.({
+        ...selection,
+        restoreQuestion,
+      });
+    },
+    [
+      getCurrentQuestion,
+      onBindCharacterAudioReferencePreset,
+      rememberInterruptRestoreQuestion,
+    ],
+  );
+
   const videoProjectChoiceHandler = useMemo<ChoiceHandler>(
     () =>
       createVideoProjectChoiceHandler({
         getCurrentVideoProject: () => runtimeRef.current.currentVideoProject,
         runBackgroundVideoBridgeResearch,
+        commitVideoProjectPatch,
         commitImageGenerationPrefs,
         commitVideoGenerationPrefs,
         getImageGenerationPrefs,
         getVideoGenerationPrefs,
         getAttachedImageCount,
+        clearAttachedFiles,
         recognizeImageStyle,
+        submitAttachedStyleReference,
         awaitImageStyleReferenceUpload: awaitVideoKickoffStyleReferenceUpload,
+        awaitCharacterAudioReferenceUpload,
+        openCharacterAudioReferencePresetPicker,
+        bindCharacterAudioReferencePreset,
         clearAwaitImageStyleReferenceUpload: clearAwaitVideoKickoffStyleReferenceUpload,
         runWorkflowActionShortcut: runWorkflowActionShortcutWithRestore,
         switchVideoStep,
@@ -290,15 +416,21 @@ export function useHomeAgentChoiceHandlers(params: {
       listGeneratableVideoScenes,
       listRunningVideoScenes,
       commitImageGenerationPrefs,
+      commitVideoProjectPatch,
       commitVideoGenerationPrefs,
+      clearAttachedFiles,
       getAttachedImageCount,
       getImageGenerationPrefs,
       getVideoGenerationPrefs,
       awaitVideoKickoffStyleReferenceUpload,
+      awaitCharacterAudioReferenceUpload,
+      openCharacterAudioReferencePresetPicker,
+      bindCharacterAudioReferencePreset,
       clearAwaitVideoKickoffStyleReferenceUpload,
       recognizeImageStyle,
       runBackgroundVideoBridgeResearch,
       runWorkflowActionShortcutWithRestore,
+      submitAttachedStyleReference,
       switchVideoStep,
       runtimeRef,
       sendWithRestore,
@@ -380,6 +512,7 @@ export function useHomeAgentChoiceHandlers(params: {
       onVideoKickoff,
       runWorkflowActionShortcutWithRestore,
       sendWithRestore,
+      setPopoverOverride,
       showChoicePopover,
     ],
   );
