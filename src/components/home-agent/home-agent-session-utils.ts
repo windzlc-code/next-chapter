@@ -484,18 +484,19 @@ function mergeProjectSessionFallback(
 ): Pick<StudioSessionState, "projectId" | "automationMode" | "currentProjectSnapshot"> {
   const fallbackIsNewer =
     timestampOfProjectSession(fallback) >= timestampOfProjectSession(existing);
+  const fallbackHasExplicitMode = Boolean(fallback.automationMode);
+  const fallbackModeDiffers =
+    fallbackHasExplicitMode &&
+    normalizeAutomationMode(fallback.automationMode) !== normalizeAutomationMode(existing.automationMode);
   const shouldPreferFallbackSnapshot =
     Boolean(fallback.currentProjectSnapshot) &&
-    (!existing.currentProjectSnapshot || fallbackIsNewer);
-  const shouldPreferFallbackMode =
-    Boolean(fallback.automationMode) &&
-    (!existing.automationMode || fallbackIsNewer);
+    (!existing.currentProjectSnapshot || fallbackIsNewer || fallbackModeDiffers);
 
   return {
     ...existing,
     ...fallback,
     projectId: existing.projectId || fallback.projectId,
-    automationMode: shouldPreferFallbackMode
+    automationMode: fallbackHasExplicitMode
       ? fallback.automationMode
       : existing.automationMode ?? fallback.automationMode,
     currentProjectSnapshot: shouldPreferFallbackSnapshot
