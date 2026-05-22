@@ -198,6 +198,7 @@ import {
 } from "@/lib/home-agent/chat-history-io";
 import {
   hasSessionResetMarkerForProject,
+  listStudioProjectSessions,
   readStudioSession,
   readProjectSessionFromFile,
   readStudioProjectSession,
@@ -6979,13 +6980,27 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
         await store.listRecentConversationSnapshots(HOME_RECENT_PROJECTS_LIMIT, { fast: true }),
       );
       const projectIdSet = new Set(items.map((snapshot) => snapshot.projectId));
+      const storedProjectSessions = listStudioProjectSessions().filter((session) => {
+        const sessionProjectId = resolveSessionProjectIdForSnapshot({
+          currentSessionProjectId: session.projectId,
+          snapshot: session.currentProjectSnapshot,
+          fallbackProjectId: session.projectId,
+        });
+        return Boolean(
+          (sessionProjectId && projectIdSet.has(sessionProjectId)) ||
+            (session.currentProjectSnapshot?.projectId &&
+              projectIdSet.has(session.currentProjectSnapshot.projectId)),
+        );
+      });
       React.startTransition(() => {
         setRuntime((prev) => ({
           ...prev,
           recentProjects: reconcileRecentProjectsWithStableOrder(prev.recentProjects, items),
-          recentProjectSessions: (prev.recentProjectSessions ?? []).filter(
-            (session) => session.projectId && projectIdSet.has(session.projectId),
-          ),
+          recentProjectSessions: storedProjectSessions.length
+            ? storedProjectSessions
+            : (prev.recentProjectSessions ?? []).filter(
+                (session) => session.projectId && projectIdSet.has(session.projectId),
+              ),
         }));
         setRecentProjectsReady(true);
       });

@@ -64,6 +64,7 @@ import {
   readProjectSessionFromFile,
   readStudioProjectSession,
   readStudioSession,
+  listStudioProjectSessions,
   removeProjectStudioSession,
   sessionHasFullAutoLineage,
   writeStudioSession,
@@ -396,7 +397,47 @@ async function listSessionBackedConversationSnapshots(
   existingProjectIds: Set<string>,
 ): Promise<ConversationProjectSnapshot[]> {
   if (typeof window === "undefined") return [];
-  if (!window.electronAPI?.storage?.getDefaultPath || !window.electronAPI?.storage?.listDir) return [];
+
+  const snapshotsById = new Map<string, ConversationProjectSnapshot>();
+  const addSessionSnapshot = (session: StudioSessionState | null | undefined) => {
+    const snapshot = session?.currentProjectSnapshot;
+    if (!snapshot?.projectId) return;
+
+    const sessionProjectId =
+      typeof session?.projectId === "string" && session.projectId.trim()
+        ? session.projectId.trim()
+        : "";
+    const shouldProjectVideoOntoSessionShell =
+      snapshot.projectKind === "video" &&
+      sessionProjectId &&
+      snapshot.sourceProjectId === sessionProjectId;
+    const projectId = shouldProjectVideoOntoSessionShell ? sessionProjectId : snapshot.projectId;
+    if (!projectId || existingProjectIds.has(projectId) || hasSessionResetMarkerForProject(projectId)) {
+      return;
+    }
+
+    const normalizedSnapshot: ConversationProjectSnapshot = {
+      ...snapshot,
+      projectId,
+      automationMode: normalizeAutomationMode(session?.automationMode ?? snapshot.automationMode),
+    };
+    const previous = snapshotsById.get(projectId);
+    if (
+      !previous ||
+      new Date(getSnapshotUpdatedAt(normalizedSnapshot)).getTime() >=
+        new Date(getSnapshotUpdatedAt(previous)).getTime()
+    ) {
+      snapshotsById.set(projectId, normalizedSnapshot);
+    }
+  };
+
+  for (const session of listStudioProjectSessions()) {
+    addSessionSnapshot(session);
+  }
+
+  if (!window.electronAPI?.storage?.getDefaultPath || !window.electronAPI?.storage?.listDir) {
+    return [...snapshotsById.values()];
+  }
 
   try {
     const paths = await window.electronAPI.storage.getDefaultPath();
@@ -412,21 +453,16 @@ async function listSessionBackedConversationSnapshots(
         !existingProjectIds.has(projectId) &&
         !hasSessionResetMarkerForProject(projectId),
       );
-    if (!projectIds.length) return [];
+    if (!projectIds.length) return [...snapshotsById.values()];
 
-    const seen = new Set<string>();
-    const snapshots: ConversationProjectSnapshot[] = [];
     const sessions = await Promise.all(projectIds.map((projectId) => readProjectSessionFromFile(projectId)));
     for (const session of sessions) {
-      const snapshot = session?.currentProjectSnapshot;
-      if (!snapshot?.projectId || existingProjectIds.has(snapshot.projectId) || seen.has(snapshot.projectId)) continue;
-      seen.add(snapshot.projectId);
-      snapshots.push(snapshot);
+      addSessionSnapshot(session);
     }
 
-    return snapshots;
+    return [...snapshotsById.values()];
   } catch {
-    return [];
+    return [...snapshotsById.values()];
   }
 }
 

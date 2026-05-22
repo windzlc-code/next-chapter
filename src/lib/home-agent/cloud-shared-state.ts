@@ -114,6 +114,150 @@ function collectLocalSharedStorage(): Partial<Record<SharedStorageKey, string>> 
   return storage;
 }
 
+function safeParseJson(value: string | null | undefined): unknown {
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function stringifyJson(value: unknown): string | undefined {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function readJsonRecord(value: string | null | undefined): Record<string, unknown> {
+  const parsed = safeParseJson(value);
+  return isPlainRecord(parsed) ? parsed : {};
+}
+
+function readJsonArray(value: string | null | undefined): unknown[] {
+  const parsed = safeParseJson(value);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function getRecordTimestamp(value: unknown): number {
+  if (!isPlainRecord(value)) return 0;
+  const snapshot = isPlainRecord(value.currentProjectSnapshot) ? value.currentProjectSnapshot : null;
+  const messages = Array.isArray(value.messages) ? value.messages : [];
+  const lastMessage = messages[messages.length - 1];
+  const candidates = [
+    value.updatedAt,
+    snapshot?.updatedAt,
+    isPlainRecord(lastMessage) ? lastMessage.createdAt : null,
+  ];
+  return Math.max(...candidates.map((candidate) => timestampOf(typeof candidate === "string" ? candidate : null)));
+}
+
+function getRecordRichness(value: unknown): number {
+  if (!isPlainRecord(value)) return 0;
+  const messages = Array.isArray(value.messages) ? value.messages.length : 0;
+  const artifacts = Array.isArray((value.currentProjectSnapshot as Record<string, unknown> | undefined)?.artifacts)
+    ? ((value.currentProjectSnapshot as Record<string, unknown>).artifacts as unknown[]).length
+    : 0;
+  const hasSnapshot = isPlainRecord(value.currentProjectSnapshot) ? 1 : 0;
+  return messages * 2 + artifacts + hasSnapshot;
+}
+
+function chooseRicherRecord(localValue: unknown, remoteValue: unknown): unknown {
+  if (!remoteValue) return localValue;
+  if (!localValue) return remoteValue;
+  const localTime = getRecordTimestamp(localValue);
+  const remoteTime = getRecordTimestamp(remoteValue);
+  if (localTime !== remoteTime) return localTime > remoteTime ? localValue : remoteValue;
+  return getRecordRichness(localValue) >= getRecordRichness(remoteValue) ? localValue : remoteValue;
+}
+
+function mergeJsonRecordStorage(
+  localRaw: string | null | undefined,
+  remoteRaw: string | null | undefined,
+): string | undefined {
+  const local = readJsonRecord(localRaw);
+  const remote = readJsonRecord(remoteRaw);
+  const merged: Record<string, unknown> = { ...remote };
+  for (const [key, value] of Object.entries(local)) {
+    merged[key] = chooseRicherRecord(value, merged[key]);
+  }
+  return Object.keys(merged).length ? stringifyJson(merged) : undefined;
+}
+
+function getEntityId(value: unknown): string {
+  if (!isPlainRecord(value)) return "";
+  const id = typeof value.id === "string" ? value.id.trim() : "";
+  const projectId = typeof value.projectId === "string" ? value.projectId.trim() : "";
+  return projectId || id;
+}
+
+function mergeJsonArrayStorage(
+  localRaw: string | null | undefined,
+  remoteRaw: string | null | undefined,
+): string | undefined {
+  const merged = new Map<string, unknown>();
+  for (const value of readJsonArray(remoteRaw)) {
+    const id = getEntityId(value);
+    if (id) merged.set(id, value);
+  }
+  for (const value of readJsonArray(localRaw)) {
+    const id = getEntityId(value);
+    if (!id) continue;
+    merged.set(id, chooseRicherRecord(value, merged.get(id)));
+  }
+  return merged.size ? stringifyJson([...merged.values()]) : undefined;
+}
+
+function mergeHomeAgentSharedStorage(
+  localStorageState: Partial<Record<SharedStorageKey, string>>,
+  remoteStorageState: Partial<Record<SharedStorageKey, string>> = {},
+): Partial<Record<SharedStorageKey, string>> {
+  const merged: Partial<Record<SharedStorageKey, string>> = {
+    ...remoteStorageState,
+    ...localStorageState,
+  };
+
+  const projectSessions = mergeJsonRecordStorage(
+    localStorageState["storyforge-home-agent-project-sessions-v1"],
+    remoteStorageState["storyforge-home-agent-project-sessions-v1"],
+  );
+  if (projectSessions) {
+    merged["storyforge-home-agent-project-sessions-v1"] = projectSessions;
+  }
+
+  const projectMeta = mergeJsonRecordStorage(
+    localStorageState["storyforge-home-agent-project-meta-v1"],
+    remoteStorageState["storyforge-home-agent-project-meta-v1"],
+  );
+  if (projectMeta) {
+    merged["storyforge-home-agent-project-meta-v1"] = projectMeta;
+  }
+
+  const videoProjects = mergeJsonArrayStorage(
+    localStorageState.storyforge_projects,
+    remoteStorageState.storyforge_projects,
+  );
+  if (videoProjects) {
+    merged.storyforge_projects = videoProjects;
+  }
+
+  const dramaProjects = mergeJsonArrayStorage(
+    localStorageState.storyforge_drama_projects,
+    remoteStorageState.storyforge_drama_projects,
+  );
+  if (dramaProjects) {
+    merged.storyforge_drama_projects = dramaProjects;
+  }
+
+  return merged;
+}
+
 function hasMeaningfulState(storage: Partial<Record<SharedStorageKey, string>>): boolean {
   return Boolean(
     storage["storyforge-home-agent-session-v1"] ||
@@ -161,6 +305,15 @@ async function fetchRemoteSharedState(): Promise<HomeAgentCloudSharedState | nul
 
 async function pushRemoteSharedState(storage: Partial<Record<SharedStorageKey, string>>): Promise<string | null> {
   const updatedAt = new Date().toISOString();
+  let mergedStorage = storage;
+  try {
+    const remote = await fetchRemoteSharedState();
+    if (remote?.storage && hasMeaningfulState(remote.storage)) {
+      mergedStorage = mergeHomeAgentSharedStorage(storage, remote.storage);
+    }
+  } catch {
+    mergedStorage = storage;
+  }
   const response = await fetch(resolveHomeAgentSyncEndpoint(SHARED_STATE_ENDPOINT), {
     method: "PUT",
     headers: {
@@ -171,7 +324,7 @@ async function pushRemoteSharedState(storage: Partial<Record<SharedStorageKey, s
       version: 1,
       updatedAt,
       clientId: getClientId(),
-      storage,
+      storage: mergedStorage,
     }),
   });
   if (!response.ok) return null;
@@ -266,3 +419,5 @@ export function startHomeAgentCloudSharedStateSync(): () => void {
     window.removeEventListener("pagehide", handlePageHide);
   };
 }
+
+export const __mergeHomeAgentSharedStorageForTests = mergeHomeAgentSharedStorage;

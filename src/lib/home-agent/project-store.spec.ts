@@ -190,6 +190,60 @@ describe("project-store", () => {
     expect(snapshot?.currentObjective).toBe("确认创作方案后进入角色开发，并保持首页单链路推进。");
   });
 
+  it("includes web localStorage project-session snapshots in recent conversation history", async () => {
+    const sessionOnlySnapshot = {
+      ...createDramaSnapshot(
+        createDramaFixture({
+          id: "session-only-full-auto",
+          dramaTitle: "Session Only Full Auto",
+          updatedAt: "2026-05-22T10:00:00.000Z",
+        }),
+      ),
+      automationMode: "full-auto" as const,
+    };
+
+    await writeProjectStudioSession({
+      sessionId: "session-only-full-auto-session",
+      projectId: "session-only-full-auto",
+      mode: "active",
+      creationMode: "fast",
+      automationMode: "full-auto",
+      devMode: false,
+      suppressHistoricalMemory: true,
+      messages: [
+        {
+          id: "m-session-only-full-auto",
+          role: "assistant",
+          content: "full auto session should remain visible",
+          createdAt: "2026-05-22T10:01:00.000Z",
+        },
+      ],
+      currentProjectSnapshot: sessionOnlySnapshot,
+      recentMessageSummary: "full auto session should remain visible",
+      draft: "",
+      compactedMessageCount: 0,
+      qState: null,
+      deferredQuestionState: null,
+      pendingWorkflowUploadKind: null,
+      pendingChoiceQuestion: null,
+      interruptedChoiceQuestion: null,
+      selectedValues: [],
+      deferredSelectedValues: [],
+      deferredDraft: "",
+      surfacedTaskIds: [],
+      surfacedTaskFollowupKeys: [],
+      surfacedProjectSuggestionKeys: [],
+      fullAutoRun: null,
+    });
+
+    const snapshots = await listRecentConversationSnapshots(20, { fast: true });
+
+    expect(snapshots.map((snapshot) => snapshot.projectId)).toContain("session-only-full-auto");
+    expect(snapshots.find((snapshot) => snapshot.projectId === "session-only-full-auto")?.automationMode).toBe(
+      "full-auto",
+    );
+  });
+
   it("falls back to later string fields when derived world-model sources contain non-string values", () => {
     const saved = upsertStoredDramaProject(
       createDramaFixture({
