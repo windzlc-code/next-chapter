@@ -2248,8 +2248,18 @@ const SidebarProjectHistory = memo(function SidebarProjectHistory({
     historySwitchSettleUntilRef.current,
     readGlobalHistorySwitchSettleUntil(),
   );
+  const [, setHistorySettleEpoch] = useState(0);
   const isHistorySwitchSettling = Date.now() < historySwitchSettleUntil;
   const stableHistoryContextSnapshot = isHistorySwitchSettling ? null : currentProjectSnapshot;
+
+  useEffect(() => {
+    if (!isHistorySwitchSettling) return undefined;
+    const delay = Math.max(0, historySwitchSettleUntil - Date.now()) + 32;
+    const timer = window.setTimeout(() => {
+      setHistorySettleEpoch((value) => value + 1);
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [historySwitchSettleUntil, isHistorySwitchSettling]);
 
   useEffect(() => {
     setIsSelectMode(false);
