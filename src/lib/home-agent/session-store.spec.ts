@@ -124,6 +124,10 @@ describe("session-store", () => {
     localStorage.clear();
     __resetSessionStoreCachesForTests();
     delete (window as typeof window & { electronAPI?: unknown }).electronAPI;
+    vi.unstubAllGlobals();
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new Error("network disabled in session-store tests");
+    }));
   });
 
   it("writes the homepage session to both global and project-scoped storage", () => {

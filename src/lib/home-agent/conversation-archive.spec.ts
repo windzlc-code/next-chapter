@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   deleteConversationArchive,
+  hydrateConversationArchivesFromCloud,
   invalidateConversationArchiveScanCache,
+  readConversationArchiveFull,
   scanConversationArchives,
   writeConversationArchiveFull,
 } from "./conversation-archive";
@@ -101,11 +103,49 @@ function installStorageMock(initialFiles: Record<string, string> = {}) {
   return { files, deletedDirs, getDefaultPath, writeText, readText, listDir, copyFile, deleteDir };
 }
 
+function createRemoteEntry(overrides?: Partial<{
+  projectId: string;
+  title: string;
+  session: StudioSessionState;
+  project: unknown;
+  updatedAt: string;
+}>) {
+  const session = overrides?.session ?? createSession(5);
+  const projectId = overrides?.projectId ?? session.projectId ?? "project-1";
+  const title = overrides?.title ?? session.currentProjectSnapshot?.title ?? "Contract Marriage";
+  const updatedAt = overrides?.updatedAt ?? "2026-04-03T01:00:00.000Z";
+  return {
+    entry: {
+      projectId,
+      dirName: "Contract-Marriage--project-1",
+      manifest: {
+        archiveVersion: 1,
+        projectId,
+        title,
+        projectKind: "script",
+        updatedAt,
+        messageCount: session.messages.length,
+        artifactCount: 0,
+        currentObjective: session.currentProjectSnapshot?.currentObjective ?? "",
+        derivedStage: session.currentProjectSnapshot?.derivedStage ?? "",
+        agentSummary: session.currentProjectSnapshot?.agentSummary ?? "",
+        recommendedActions: session.currentProjectSnapshot?.recommendedActions ?? [],
+        dirName: "Contract-Marriage--project-1",
+        hasFullHistory: true,
+      },
+      session,
+      project: overrides?.project ?? { dramaTitle: title },
+      updatedAt,
+    },
+  };
+}
+
 describe("conversation archive", () => {
   beforeEach(() => {
     localStorage.clear();
     invalidateConversationArchiveScanCache();
     delete (window as typeof window & { electronAPI?: unknown }).electronAPI;
+    vi.unstubAllGlobals();
   });
 
   it("writes a full untruncated session under a project-title archive folder", async () => {
@@ -184,5 +224,81 @@ describe("conversation archive", () => {
 
     expect(storage.deletedDirs).toEqual(["C:/Storyforge/files/conversations/Old-Name--project-1"]);
     expect(storage.files.has("C:/Storyforge/files/conversations/Other--project-2/chat-history.full.json")).toBe(true);
+  });
+
+  it("writes archive data to the remote sync store when Electron storage is unavailable", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => createRemoteEntry(),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(writeConversationArchiveFull(createSession(6))).resolves.toBe(true);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toContain("/api/home-agent/archive-state/project-1");
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)?.method).toBe("PUT");
+  });
+
+  it("reads archive data from the remote sync store when local files are unavailable", async () => {
+    const remoteEntry = createRemoteEntry({
+      updatedAt: "2026-04-03T05:00:00.000Z",
+    });
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => remoteEntry,
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const archive = await readConversationArchiveFull("project-1");
+
+    expect(archive?.manifest?.projectId).toBe("project-1");
+    expect(archive?.session?.messages).toHaveLength(5);
+    expect(archive?.project).toEqual({ dramaTitle: "Contract Marriage" });
+  });
+
+  it("hydrates remote archive entries back into local files on Electron startup", async () => {
+    const storage = installStorageMock();
+    const remoteEntry = createRemoteEntry();
+    const fetchMock = vi.fn(async (input: string) => {
+      if (input.endsWith("/api/home-agent/archive-state")) {
+        return {
+          ok: true,
+          json: async () => ({
+            state: {
+              version: 1,
+              updatedAt: "2026-04-03T01:00:00.000Z",
+              savedAt: "2026-04-03T01:00:00.000Z",
+              projects: [
+                {
+                  projectId: "project-1",
+                  dirName: "Contract-Marriage--project-1",
+                  manifest: remoteEntry.entry.manifest,
+                  updatedAt: "2026-04-03T01:00:00.000Z",
+                },
+              ],
+            },
+          }),
+        };
+      }
+
+      return {
+        ok: true,
+        json: async () => remoteEntry,
+      };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(hydrateConversationArchivesFromCloud()).resolves.toBe(1);
+
+    expect(
+      storage.files.get("C:/Storyforge/files/conversations/Contract-Marriage--project-1/chat-history.full.json"),
+    ).toContain("\"projectId\": \"project-1\"");
+    expect(
+      storage.files.get("C:/Storyforge/files/conversations/Contract-Marriage--project-1/project.json"),
+    ).toContain("\"dramaTitle\": \"Contract Marriage\"");
+    expect(storage.files.get("C:/Storyforge/db/sessions/project-1.json")).toContain(
+      "\"projectId\":\"project-1\"",
+    );
   });
 });

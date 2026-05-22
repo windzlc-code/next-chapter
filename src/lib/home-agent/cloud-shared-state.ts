@@ -1,3 +1,8 @@
+import {
+  canUseHomeAgentSyncFetch,
+  resolveHomeAgentSyncEndpoint,
+} from "./cloud-sync-endpoint";
+
 const SHARED_STATE_ENDPOINT = "/api/home-agent/shared-state";
 const SHARED_STATE_MARKER_KEY = "storyforge-home-agent-cloud-shared-state-marker-v1";
 const SHARED_STATE_CLIENT_ID_KEY = "storyforge-home-agent-cloud-shared-state-client-id-v1";
@@ -33,12 +38,7 @@ type HydrateResult = {
 };
 
 function canUseCloudSharedState(): boolean {
-  if (typeof window === "undefined") return false;
-  if (window.location.protocol === "file:") return false;
-  if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
-    return false;
-  }
-  return typeof window.fetch === "function" && typeof window.localStorage !== "undefined";
+  return canUseHomeAgentSyncFetch();
 }
 
 function safeGetItem(key: string): string | null {
@@ -150,7 +150,7 @@ function normalizeRemoteState(payload: unknown): HomeAgentCloudSharedState | nul
 }
 
 async function fetchRemoteSharedState(): Promise<HomeAgentCloudSharedState | null> {
-  const response = await fetch(SHARED_STATE_ENDPOINT, {
+  const response = await fetch(resolveHomeAgentSyncEndpoint(SHARED_STATE_ENDPOINT), {
     method: "GET",
     cache: "no-store",
     headers: { accept: "application/json" },
@@ -161,7 +161,7 @@ async function fetchRemoteSharedState(): Promise<HomeAgentCloudSharedState | nul
 
 async function pushRemoteSharedState(storage: Partial<Record<SharedStorageKey, string>>): Promise<string | null> {
   const updatedAt = new Date().toISOString();
-  const response = await fetch(SHARED_STATE_ENDPOINT, {
+  const response = await fetch(resolveHomeAgentSyncEndpoint(SHARED_STATE_ENDPOINT), {
     method: "PUT",
     headers: {
       "content-type": "application/json",
