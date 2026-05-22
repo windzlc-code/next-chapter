@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>紧急修复 - 清理所有缓存</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 600px;
+      margin: 50px auto;
+      padding: 20px;
+      background: #1a1a1a;
+      color: #fff;
+    }
+    h1 { color: #ff6b6b; }
+    button {
+      background: #4CAF50;
+      color: white;
+      border: none;
+      padding: 15px 30px;
+      font-size: 16px;
+      cursor: pointer;
+      border-radius: 5px;
+      margin: 10px 5px;
+    }
+    button:hover { background: #45a049; }
+    button.danger { background: #f44336; }
+    button.danger:hover { background: #da190b; }
+    .log {
+      background: #2a2a2a;
+      padding: 15px;
+      border-radius: 5px;
+      margin-top: 20px;
+      font-family: monospace;
+      white-space: pre-wrap;
+      max-height: 400px;
+      overflow-y: auto;
+    }
+  </style>
+</head>
+<body>
+  <h1>🔧 紧急修复工具</h1>
+  <p>如果应用崩溃，点击下面的按钮清理缓存：</p>
+
+  <button onclick="cleanAll()">🗑️ 清理所有缓存（推荐）</button>
+  <button onclick="cleanImages()" class="danger">🖼️ 只清理图片相关</button>
+  <button onclick="viewStorage()">👁️ 查看当前缓存</button>
+
+  <div class="log" id="log"></div>
+
+  <script>
+    function log(msg) {
+      const logEl = document.getElementById('log');
+      logEl.textContent += msg + '\n';
+      console.log(msg);
+    }
+
+    function cleanAll() {
+      log('=== 开始清理所有缓存 ===');
+
+      // 1. 清理 localStorage
+      const allKeys = Object.keys(localStorage);
+      log(`发现 ${allKeys.length} 个 localStorage 键`);
+
+      allKeys.forEach(key => {
+        try {
+          localStorage.removeItem(key);
+          log(`✅ 已清理: ${key}`);
+        } catch (err) {
+          log(`❌ 清理失败: ${key} - ${err.message}`);
+        }
+      });
+
+      // 2. 清理 sessionStorage
+      sessionStorage.clear();
+      log('✅ 已清理 sessionStorage');
+
+      // 3. 清理 IndexedDB
+      if (window.indexedDB) {
+        indexedDB.databases().then(dbs => {
+          dbs.forEach(db => {
+            if (db.name) {
+              indexedDB.deleteDatabase(db.name);
+              log(`✅ 已删除数据库: ${db.name}`);
+            }
+          });
+        }).catch(err => {
+          log(`⚠️ 无法列出数据库: ${err.message}`);
+        });
+      }
+
+      log('\n=== 清理完成 ===');
+      log('请关闭此页面并重启应用');
+    }
+
+    function cleanImages() {
+      log('=== 清理图片相关缓存 ===');
+
+      const imageKeys = [
+        'char-image-model',
+        'char-view-mode',
+        'custom-art-style-prompt',
+        'generating-tasks',
+        'generating-storyboard-tasks',
+        'charImg-generating',
+        'sceneImg-generating',
+        'charDesc-generating',
+        'sceneDesc-generating',
+      ];
+
+      imageKeys.forEach(key => {
+        try {
+          const value = localStorage.getItem(key);
+          if (value) {
+            localStorage.removeItem(key);
+            log(`✅ 已清理: ${key} (${value.length} 字符)`);
+          } else {
+            log(`⚪ 不存在: ${key}`);
+          }
+        } catch (err) {
+          log(`❌ 清理失败: ${key} - ${err.message}`);
+        }
+      });
+
+      // 清理图片缓存数据库
+      if (window.indexedDB) {
+        indexedDB.deleteDatabase('thumb-cache');
+        log('✅ 已删除图片缓存数据库');
+      }
+
+      log('\n=== 清理完成 ===');
+      log('请关闭此页面并重启应用');
+    }
+
+    function viewStorage() {
+      log('=== 当前 localStorage 内容 ===');
+
+      const allKeys = Object.keys(localStorage);
+      log(`共 ${allKeys.length} 个键\n`);
+
+      if (allKeys.length === 0) {
+        log('✅ localStorage 为空');
+        return;
+      }
+
+      allKeys.forEach(key => {
+        try {
+          const value = localStorage.getItem(key);
+          const size = value ? value.length : 0;
+          const preview = value ? value.substring(0, 100) : '';
+
+          log(`📦 ${key}:`);
+          log(`   大小: ${size} 字符`);
+          log(`   预览: ${preview}${size > 100 ? '...' : ''}`);
+
+          // 尝试解析 JSON
+          try {
+            JSON.parse(value);
+            log(`   格式: ✅ 有效 JSON`);
+          } catch {
+            log(`   格式: ⚠️ 纯字符串（非 JSON）`);
+          }
+          log('');
+        } catch (err) {
+          log(`❌ 读取失败: ${key} - ${err.message}\n`);
+        }
+      });
+
+      log('=== 查看完成 ===');
+    }
+
+    // 页面加载时自动显示当前状态
+    window.addEventListener('load', () => {
+      log('🛡️ 紧急修复工具已加载');
+      log('提示: 如果应用崩溃，先点击"清理所有缓存"\n');
+    });
+  </script>
+</body>
+</html>

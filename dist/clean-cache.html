@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>清理缓存 - InFinio</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 600px;
+      margin: 50px auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    .card {
+      background: white;
+      border-radius: 8px;
+      padding: 24px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+    h1 {
+      margin-top: 0;
+      color: #333;
+    }
+    button {
+      background: #0070f3;
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      margin-right: 8px;
+      margin-top: 8px;
+    }
+    button:hover {
+      background: #0051cc;
+    }
+    button.secondary {
+      background: #666;
+    }
+    button.secondary:hover {
+      background: #444;
+    }
+    .status {
+      margin-top: 16px;
+      padding: 12px;
+      border-radius: 4px;
+      display: none;
+    }
+    .status.success {
+      background: #d4edda;
+      color: #155724;
+      display: block;
+    }
+    .status.error {
+      background: #f8d7da;
+      color: #721c24;
+      display: block;
+    }
+    ul {
+      margin: 16px 0;
+      padding-left: 24px;
+    }
+    li {
+      margin: 8px 0;
+      color: #666;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🔧 清理缓存工具</h1>
+    <p>如果角色与场景页面闪退,可以尝试清理以下缓存数据:</p>
+
+    <ul>
+      <li>角色图片生成任务</li>
+      <li>场景图片生成任务</li>
+      <li>分镜图生成任务</li>
+      <li>剧本拆解缓存</li>
+      <li>自定义画风设置</li>
+    </ul>
+
+    <div>
+      <button onclick="cleanAll()">清理所有缓存</button>
+      <button onclick="cleanGenerating()" class="secondary">仅清理生成任务</button>
+      <button onclick="cleanPhase1()" class="secondary">清理拆解缓存</button>
+    </div>
+
+    <div id="status" class="status"></div>
+  </div>
+
+  <script>
+    function showStatus(message, isSuccess = true) {
+      const status = document.getElementById('status');
+      status.textContent = message;
+      status.className = 'status ' + (isSuccess ? 'success' : 'error');
+      setTimeout(() => {
+        status.className = 'status';
+      }, 3000);
+    }
+
+    function cleanAll() {
+      try {
+        const keys = [
+          'char-image-model',
+          'char-view-mode',
+          'custom-art-style-prompt',
+          'generating-storyboard-tasks',
+          'phase1-results',
+          'decompose-meta',
+          'charImg-generating',
+          'sceneImg-generating',
+          'charDesc-generating',
+          'sceneDesc-generating',
+        ];
+
+        let cleaned = 0;
+        keys.forEach(key => {
+          if (localStorage.getItem(key)) {
+            localStorage.removeItem(key);
+            cleaned++;
+          }
+        });
+
+        showStatus(`✅ 已清理 ${cleaned} 项缓存数据,请重启应用`);
+      } catch (err) {
+        showStatus('❌ 清理失败: ' + err.message, false);
+      }
+    }
+
+    function cleanGenerating() {
+      try {
+        const keys = [
+          'generating-storyboard-tasks',
+          'charImg-generating',
+          'sceneImg-generating',
+          'charDesc-generating',
+          'sceneDesc-generating',
+        ];
+
+        let cleaned = 0;
+        keys.forEach(key => {
+          if (localStorage.getItem(key)) {
+            localStorage.removeItem(key);
+            cleaned++;
+          }
+        });
+
+        showStatus(`✅ 已清理 ${cleaned} 项生成任务,请刷新页面`);
+      } catch (err) {
+        showStatus('❌ 清理失败: ' + err.message, false);
+      }
+    }
+
+    function cleanPhase1() {
+      try {
+        const keys = ['phase1-results', 'decompose-meta'];
+
+        let cleaned = 0;
+        keys.forEach(key => {
+          if (localStorage.getItem(key)) {
+            localStorage.removeItem(key);
+            cleaned++;
+          }
+        });
+
+        showStatus(`✅ 已清理 ${cleaned} 项拆解缓存,请刷新页面`);
+      } catch (err) {
+        showStatus('❌ 清理失败: ' + err.message, false);
+      }
+    }
+  </script>
+</body>
+</html>

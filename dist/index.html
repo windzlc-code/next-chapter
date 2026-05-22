@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>InFinio-一站式智能体自动化平台</title>
+    <meta
+      name="description"
+      content="InFinio-一站式智能体自动化平台，在同一个首页会话中完成剧本创作、改编、视频生成与项目续接。"
+    />
+    <meta name="author" content="Lovable" />
+    <link rel="icon" type="image/png" href="./assets/favicon-CrAQSw7K-CrAQSw7K-CrAQSw7K-CrAQSw7K-CrAQSw7K-CrAQSw7K-CrAQSw7K-CrAQSw7K-CrAQSw7K-CrAQSw7K-CrAQSw7K-CrAQSw7K-CrAQSw7K-CrAQSw7K.png" />
+
+    <meta property="og:type" content="website" />
+    <meta
+      property="og:image"
+      content="https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/d65822fa-5879-4a2b-897f-e324ef64e564/id-preview-012e185e--e8c939f5-d9ab-466d-b579-7794e8e80b02.lovable.app-1771232679974.png"
+    />
+    <meta property="og:title" content="InFinio-一站式智能体自动化平台" />
+    <meta
+      property="og:description"
+      content="在同一个首页会话中完成剧本创作、改编、视频生成与历史项目续接。"
+    />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:site" content="@Lovable" />
+    <meta
+      name="twitter:image"
+      content="https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/d65822fa-5879-4a2b-897f-e324ef64e564/id-preview-012e185e--e8c939f5-d9ab-466d-b579-7794e8e80b02.lovable.app-1771232679974.png"
+    />
+    <meta name="twitter:title" content="InFinio-一站式智能体自动化平台" />
+    <meta
+      name="twitter:description"
+      content="在同一个首页会话中完成剧本创作、改编、视频生成与历史项目续接。"
+    />
+    <style>
+      html,
+      body {
+        margin: 0;
+        min-height: 100%;
+        background: #090b11;
+        color: #f8fafc;
+      }
+
+      body {
+        font-family:
+          "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+
+      #root {
+        min-height: 100vh;
+      }
+
+      #boot-splash {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background:
+          radial-gradient(circle at top, rgba(124, 146, 255, 0.18), transparent 42%),
+          linear-gradient(180deg, #0b0d13 0%, #090b11 100%);
+      }
+
+      #boot-splash-card {
+        width: min(420px, calc(100vw - 48px));
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 28px;
+        background: rgba(255, 255, 255, 0.04);
+        padding: 28px;
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.32);
+        -webkit-backdrop-filter: blur(20px);
+                backdrop-filter: blur(20px);
+      }
+
+      #boot-splash-brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        color: rgba(226, 232, 240, 0.92);
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.22em;
+      }
+
+      #boot-splash-brand::before {
+        content: "";
+        width: 12px;
+        height: 12px;
+        border-radius: 999px;
+        background: #7c92ff;
+        animation: boot-pulse 1.8s ease-in-out infinite;
+      }
+
+      #boot-splash-title {
+        margin-top: 20px;
+        font-size: 26px;
+        font-weight: 600;
+        line-height: 1.25;
+        color: #fff;
+      }
+
+      #boot-splash-copy {
+        margin-top: 12px;
+        font-size: 14px;
+        line-height: 1.8;
+        color: #cbd5e1;
+      }
+
+      #boot-splash-progress {
+        margin-top: 24px;
+        height: 2px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.08);
+      }
+
+      #boot-splash-progress::after {
+        content: "";
+        display: block;
+        width: 32%;
+        height: 100%;
+        border-radius: 999px;
+        background: #7c92ff;
+        animation: boot-progress 1.8s ease-in-out infinite;
+      }
+
+      @keyframes boot-pulse {
+        0%,
+        100% {
+          opacity: 0.55;
+          transform: scale(0.92);
+        }
+        50% {
+          opacity: 1;
+          transform: scale(1);
+        }
+      }
+
+      @keyframes boot-progress {
+        0% {
+          transform: translateX(-10%);
+        }
+        50% {
+          transform: translateX(120%);
+        }
+        100% {
+          transform: translateX(240%);
+        }
+      }
+    </style>
+    <script type="module" crossorigin src="./assets/index-BHcpob6m.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-DmdiBRgp.css">
+  </head>
+
+  <body>
+    <div id="boot-splash" aria-hidden="true">
+      <div id="boot-splash-card">
+        <div id="boot-splash-brand">INFINIO</div>
+        <div id="boot-splash-title">正在恢复首页工作台</div>
+        <div id="boot-splash-copy">正在加载当前会话、最近项目和模型设置，首屏准备完成后会自动进入主页。</div>
+        <div id="boot-splash-progress"></div>
+      </div>
+    </div>
+    <div id="root"></div>
+  </body>
+</html>
