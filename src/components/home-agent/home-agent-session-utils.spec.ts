@@ -642,6 +642,43 @@ describe("mergeRecentProjectsWithSessionSnapshots", () => {
     ]);
   });
 
+  it("surfaces full-auto session-only history cards so mode switching keeps automation history visible", () => {
+    const visibleManual = createSnapshot({
+      projectId: "visible-manual",
+      title: "Visible Manual",
+      automationMode: "manual",
+      updatedAt: "2026-04-08T00:01:00.000Z",
+    });
+    const fullAutoSessionSnapshot = createSnapshot({
+      projectId: "full-auto-session-only",
+      title: "Full Auto Session Only",
+      automationMode: "full-auto",
+      updatedAt: "2026-04-08T00:09:00.000Z",
+    });
+
+    const merged = mergeRecentProjectsWithSessionSnapshots({
+      recentProjects: [visibleManual],
+      recentProjectSessions: [
+        createSession({
+          sessionId: "session-full-auto-only",
+          projectId: "full-auto-session-only",
+          automationMode: "full-auto",
+          currentProjectSnapshot: fullAutoSessionSnapshot,
+        }),
+      ],
+      currentProjectSnapshot: visibleManual,
+      currentSessionProjectId: "visible-manual",
+    });
+
+    expect(merged.map((project) => project.projectId)).toEqual([
+      "full-auto-session-only",
+      "visible-manual",
+    ]);
+    expect(merged.find((project) => project.projectId === "full-auto-session-only")?.automationMode).toBe(
+      "full-auto",
+    );
+  });
+
   it("does not let stale non-current session previews rewrite archived history card labels", () => {
     const archivedVideo = createSnapshot({
       projectId: "archived-video-1",

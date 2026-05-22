@@ -623,9 +623,17 @@ export function mergeRecentProjectsWithSessionSnapshots(params: {
       sessionProjectId === currentSessionProjectIdNormalized ||
       sessionProjectId === currentSnapshotProjectId ||
       snapshotSourceProjectId === currentSessionProjectIdNormalized;
+    const isFullAutoSessionOnlySnapshot =
+      !previousSnapshot &&
+      resolveEffectiveProjectAutomationMode({
+        snapshot,
+        recentProjectSessions,
+        currentProjectSnapshot,
+      }) === "full-auto";
     const shouldSurfaceMissingSnapshot =
       isCurrentSessionSnapshot ||
-      (!previousSnapshot && sessionProjectId === currentSnapshotProjectId);
+      (!previousSnapshot && sessionProjectId === currentSnapshotProjectId) ||
+      isFullAutoSessionOnlySnapshot;
 
     if (!shouldSurfaceMissingSnapshot) {
       continue;
