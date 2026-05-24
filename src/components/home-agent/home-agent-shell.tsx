@@ -2151,7 +2151,7 @@ const VideoQaFeedbackRail = memo(function VideoQaFeedbackRail({
       ? `参考图 ${qaModel.referenceItems.length} 项`
       : "等待最新质检反馈";
   const railSecondarySummary = `待复核 ${qaModel.pendingReviewCount} · 待修复 ${qaModel.activeRepairCount}`;
-  const headerHintLabel = "右侧专用";
+  const headerHintLabel = "跟随任务板";
 
   return (
     <aside
@@ -2315,6 +2315,7 @@ export const ActiveConversationShell = memo(function ActiveConversationShell({
   onRegenerateAssistant,
   onCreationGuidePick,
   workflowProgress,
+  videoWorkflowTaskBoard,
   directBatchReviewTrigger,
   directSingleReviewTrigger,
   hasUnreadMessage,
@@ -2336,6 +2337,7 @@ export const ActiveConversationShell = memo(function ActiveConversationShell({
   trackClassName: string;
   snapshot?: ConversationProjectSnapshot | null;
   workflowProgress?: ComposerWorkflowProgress | null;
+  videoWorkflowTaskBoard?: VideoWorkflowTaskBoard | null;
   onArtifactAction?: (
     value: string,
     label: string,
@@ -2388,6 +2390,35 @@ export const ActiveConversationShell = memo(function ActiveConversationShell({
 
   const showFullAutoChecklist = Boolean(fullAutoRun?.plan && fullAutoRun.status !== "idle");
   const showVideoQaRail = Boolean(snapshot?.projectKind === "video");
+  const showVideoTaskBoard = Boolean(videoWorkflowTaskBoard?.items.length);
+  const [showResponsiveUtilityRail, setShowResponsiveUtilityRail] = useState(false);
+  const [topTaskBoardExpanded, setTopTaskBoardExpanded] = useState(
+    Boolean(videoWorkflowTaskBoard?.items.length) &&
+      !videoWorkflowTaskBoard.items.every((item) => item.state === "completed"),
+  );
+  const topTaskBoardStageKey = videoWorkflowTaskBoard
+    ? `${videoWorkflowTaskBoard.stage}:${videoWorkflowTaskBoard.items.map((item) => item.id).join("|")}`
+    : "";
+  const topTaskBoardCompleted = Boolean(
+    videoWorkflowTaskBoard?.items.length &&
+      videoWorkflowTaskBoard.items.every((item) => item.state === "completed"),
+  );
+
+  useEffect(() => {
+    if (!videoWorkflowTaskBoard?.items.length) return;
+    setTopTaskBoardExpanded(!topTaskBoardCompleted);
+  }, [topTaskBoardCompleted, topTaskBoardStageKey, videoWorkflowTaskBoard?.items.length]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      return;
+    }
+    const query = window.matchMedia("(max-width: 1279px)");
+    const syncResponsiveRail = () => setShowResponsiveUtilityRail(query.matches);
+    syncResponsiveRail();
+    query.addEventListener("change", syncResponsiveRail);
+    return () => query.removeEventListener("change", syncResponsiveRail);
+  }, []);
 
   useEffect(() => {
     const handler = (event: Event) => {
@@ -2411,7 +2442,7 @@ export const ActiveConversationShell = memo(function ActiveConversationShell({
           onToggleCollapsed={() => handleFullAutoChecklistCollapsedChange(!resolvedFullAutoChecklistCollapsed)}
         />
       ) : null}
-      {showFullAutoRail || showVideoQaRail ? (
+      {showFullAutoRail || showVideoTaskBoard || showVideoQaRail ? (
         <div
           data-testid="conversation-utility-rail"
           className={cn(
@@ -2426,16 +2457,44 @@ export const ActiveConversationShell = memo(function ActiveConversationShell({
                 }
               : {
                   right: 8,
+                  width: 320,
                 }
           }
         >
-          {showFullAutoRail ? <FullAutoProgressRail run={fullAutoRun!} onStop={onStopFullAuto} /> : null}
+          {showVideoTaskBoard ? (
+            <div className="pointer-events-auto w-full">
+              <VideoWorkflowTaskBoardPanel
+                board={videoWorkflowTaskBoard!}
+                activeTheme
+                expanded={topTaskBoardExpanded}
+                onToggleExpanded={() => setTopTaskBoardExpanded((value) => !value)}
+                heightClassName=""
+                showAllItems
+              />
+            </div>
+          ) : null}
           {showVideoQaRail ? (
             <VideoQaFeedbackRail
               snapshot={snapshot}
-              stretchToColumn={Boolean(desktopUtilityColumnLayout)}
+              stretchToColumn
             />
           ) : null}
+          {showFullAutoRail ? <FullAutoProgressRail run={fullAutoRun!} onStop={onStopFullAuto} /> : null}
+        </div>
+      ) : null}
+      {showResponsiveUtilityRail && (showVideoTaskBoard || showVideoQaRail) ? (
+        <div className="mb-3 flex flex-col gap-3 px-4 xl:hidden">
+          {showVideoTaskBoard ? (
+            <VideoWorkflowTaskBoardPanel
+              board={videoWorkflowTaskBoard!}
+              activeTheme
+              expanded={topTaskBoardExpanded}
+              onToggleExpanded={() => setTopTaskBoardExpanded((value) => !value)}
+              heightClassName=""
+              showAllItems
+            />
+          ) : null}
+          {showVideoQaRail ? <VideoQaFeedbackRail snapshot={snapshot} stretchToColumn /> : null}
         </div>
       ) : null}
       <ActiveConversationViewport
@@ -2541,6 +2600,7 @@ export interface HomeComposerProps {
   workflowProgress?: ComposerWorkflowProgress | null;
   videoWorkflowTaskBoard?: VideoWorkflowTaskBoard | null;
   suppressFloatingTaskBoard?: boolean;
+  showTaskBoardInline?: boolean;
   qState: unknown | null;
   selectedValues: string[];
   streaming: boolean;
@@ -2845,6 +2905,7 @@ export const HomeComposer = memo(function HomeComposer({
   workflowProgress = null,
   videoWorkflowTaskBoard = null,
   suppressFloatingTaskBoard = false,
+  showTaskBoardInline = true,
   qState,
   selectedValues,
   streaming,
@@ -3512,7 +3573,7 @@ export const HomeComposer = memo(function HomeComposer({
                 }
               }}
             />
-            {videoWorkflowTaskBoard?.items.length ? (
+            {showTaskBoardInline && videoWorkflowTaskBoard?.items.length ? (
               <>
                 {isMobile ? (
                   <div className="mt-3">

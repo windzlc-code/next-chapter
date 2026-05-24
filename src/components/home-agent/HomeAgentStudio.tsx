@@ -8737,7 +8737,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
   }, [runtime.currentVideoProject]);
   const isMediaGenerating = hasPendingMediaMessage || hasRunningVideoGeneration;
 
-  const { idleComposer, activeComposer, workflowProgress } = useHomeAgentComposerBindings({
+  const { idleComposer, activeComposer, workflowProgress, videoWorkflowTaskBoard } = useHomeAgentComposerBindings({
     idle,
     currentProject,
     maintenanceHint,
@@ -9119,6 +9119,7 @@ export default function HomeAgentStudio({ initialUtility, onUtilityChange }: Pro
                 trackClassName={ACTIVE_TRACK_CLASS}
                 snapshot={currentProject}
                 workflowProgress={workflowProgress}
+                videoWorkflowTaskBoard={videoWorkflowTaskBoard}
                 fullAutoRun={runtime.fullAutoRun ?? null}
                 fullAutoChecklistCollapsed={fullAutoChecklistCollapsed}
                 onFullAutoChecklistCollapsedChange={setFullAutoChecklistCollapsed}

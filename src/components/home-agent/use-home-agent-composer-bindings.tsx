@@ -2082,6 +2082,7 @@ export function useHomeAgentComposerBindings(params: {
       question: visibleQuestion,
       workflowProgress,
       videoWorkflowTaskBoard,
+      showTaskBoardInline: false,
       qState,
       selectedValues,
       streaming,
@@ -2229,5 +2230,6 @@ export function useHomeAgentComposerBindings(params: {
     idleComposer,
     activeComposer,
     workflowProgress,
+    videoWorkflowTaskBoard,
   };
 }

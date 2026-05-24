@@ -1094,11 +1094,11 @@ describe("ActiveConversationShell", () => {
   });
 
   it("auto-loads older history while scrolling upward and keeps the scroll host anchored", async () => {
-    const messages: HomeAgentMessage[] = Array.from({ length: 125 }, (_, index) => ({
+    const messages: HomeAgentMessage[] = Array.from({ length: 2025 }, (_, index) => ({
       id: `assistant-${index}`,
       role: "assistant",
       content: `message ${index}`,
-      createdAt: `2026-04-08T00:00:${String(index).padStart(2, "0")}.000Z`,
+      createdAt: new Date(Date.UTC(2026, 3, 8, 0, 0, index)).toISOString(),
       status: "complete",
     }));
 
@@ -1142,7 +1142,7 @@ describe("ActiveConversationShell", () => {
     });
 
     expect(screen.queryByText("message 0")).not.toBeInTheDocument();
-    expect(screen.getByText("message 124")).toBeInTheDocument();
+    expect(screen.getByText("message 2024")).toBeInTheDocument();
 
     await act(async () => {
       scrollTop = 0;
