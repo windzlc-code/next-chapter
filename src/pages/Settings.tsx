@@ -6,7 +6,6 @@ import {
   FolderCog,
   FolderOpen,
   Globe,
-  History,
   Key,
   Loader2,
   Moon,
@@ -44,13 +43,6 @@ import {
   type ApiConfig,
 } from "@/lib/api-config";
 import { readHomeAgentLaunchReadiness, type HomeAgentLaunchReadiness } from "@/lib/home-agent/launch-readiness";
-import {
-  getHistorySettings,
-  MAX_HISTORY_PROJECT_COUNT,
-  MIN_HISTORY_PROJECT_COUNT,
-  saveHistorySettings,
-  type HistorySettings,
-} from "@/lib/home-agent/history-settings";
 import { readStoredAutomationMode, writeStoredAutomationMode } from "@/lib/home-agent/automation-mode";
 import type { AutomationMode } from "@/lib/home-agent/types";
 import { cn } from "@/lib/utils";
@@ -189,7 +181,6 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
   const navigate = useNavigate();
   const { theme, setTheme } = useTheme();
   const [config, setConfig] = useState<ApiConfig>(() => getStoredApiConfig());
-  const [historyCfg, setHistoryCfg] = useState<HistorySettings>(() => getHistorySettings());
   const [automationMode, setAutomationMode] = useState<AutomationMode>(() => readStoredAutomationMode());
   const [defaultStoragePath, setDefaultStoragePath] = useState("");
   const [adminPasswordDialogOpen, setAdminPasswordDialogOpen] = useState(false);
@@ -284,7 +275,6 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
       proxySyncWarning = error instanceof Error ? error.message : String(error);
       console.warn("API config saved locally, but local proxy sync failed:", error);
     }
-    saveHistorySettings(historyCfg);
     writeStoredAutomationMode(automationMode);
     setConfig(getStoredApiConfig());
     void refreshLaunchReadiness();
@@ -688,48 +678,6 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
             </DialogFooter>
           </DialogContent>
         </Dialog>
-
-        <div className="space-y-2.5">
-          <h2 className={sectionTitleClass}>
-            <History className="h-4 w-4" />
-            对话历史
-          </h2>
-          <Card className={cardClass}>
-            <CardContent className={cardContentClass}>
-              <div className="flex items-center justify-between gap-3">
-                <div className="space-y-0.5">
-                  <Label className={embeddedLabelTextClass}>自动删除旧项目</Label>
-                  <p className={embeddedMutedTextClass}>超出数量上限时，按时间从旧到新自动删除（置顶项目不受影响）。</p>
-                </div>
-                <Switch
-                  checked={historyCfg.autoDelete}
-                  onCheckedChange={(checked) => setHistoryCfg((prev) => ({ ...prev, autoDelete: checked }))}
-                  className={SETTINGS_BLUE_VIOLET_SWITCH}
-                />
-              </div>
-              <div>
-                <Label className={embeddedLabelTextClass}>最多保留项目数</Label>
-                <Input
-                  type="number"
-                  min={MIN_HISTORY_PROJECT_COUNT}
-                  max={MAX_HISTORY_PROJECT_COUNT}
-                  step={5}
-                  value={historyCfg.maxCount}
-                  onChange={(e) => {
-                    const v = Number(e.target.value);
-                    if (v >= MIN_HISTORY_PROJECT_COUNT && v <= MAX_HISTORY_PROJECT_COUNT) {
-                      setHistoryCfg((prev) => ({ ...prev, maxCount: v }));
-                    }
-                  }}
-                  className={cn(compactInputClass, "mt-1 w-28")}
-                />
-                <p className={cn("mt-1", embeddedMutedTextClass)}>
-                  范围 {MIN_HISTORY_PROJECT_COUNT} - {MAX_HISTORY_PROJECT_COUNT}，默认 {MAX_HISTORY_PROJECT_COUNT}。
-                </p>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
 
         <div className="space-y-2.5">
           <h2 className={sectionTitleClass}>

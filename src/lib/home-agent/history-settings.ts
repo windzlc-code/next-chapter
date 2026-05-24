@@ -2,6 +2,7 @@ const HISTORY_SETTINGS_KEY = "storyforge-history-settings-v1";
 
 export const MIN_HISTORY_PROJECT_COUNT = 5;
 export const MAX_HISTORY_PROJECT_COUNT = 2000;
+export const DEFAULT_HISTORY_PROJECT_RETENTION_COUNT = 25;
 
 export interface HistorySettings {
   /** 最多保留/显示的历史项目数量。 */
@@ -11,8 +12,8 @@ export interface HistorySettings {
 }
 
 const DEFAULT_HISTORY_SETTINGS: HistorySettings = {
-  maxCount: MAX_HISTORY_PROJECT_COUNT,
-  autoDelete: false,
+  maxCount: DEFAULT_HISTORY_PROJECT_RETENTION_COUNT,
+  autoDelete: true,
 };
 
 function normalizeMaxCount(value: unknown): number {
@@ -31,11 +32,12 @@ export function getHistorySettings(): HistorySettings {
     if (!saved) return { ...DEFAULT_HISTORY_SETTINGS };
     const parsed = JSON.parse(saved) as Partial<HistorySettings>;
     const maxCount = normalizeMaxCount(parsed.maxCount);
-    const isLegacyLimitedConfig = maxCount < MAX_HISTORY_PROJECT_COUNT;
+    const isPreviousDisplayDefault =
+      maxCount === MAX_HISTORY_PROJECT_COUNT && parsed.autoDelete === false;
 
     return {
-      maxCount: isLegacyLimitedConfig ? DEFAULT_HISTORY_SETTINGS.maxCount : maxCount,
-      autoDelete: isLegacyLimitedConfig
+      maxCount: isPreviousDisplayDefault ? DEFAULT_HISTORY_SETTINGS.maxCount : maxCount,
+      autoDelete: isPreviousDisplayDefault
         ? DEFAULT_HISTORY_SETTINGS.autoDelete
         : typeof parsed.autoDelete === "boolean"
           ? parsed.autoDelete
