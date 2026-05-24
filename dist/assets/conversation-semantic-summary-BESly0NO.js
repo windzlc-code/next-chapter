@@ -1,4 +1,4 @@
-import{b as y,c as p}from"./HomeAgentStudio-DfcBocaj.js";import{i as g}from"./index-7Qg1Z41s.js";import"./mermaid-vendor-D2dcGC_6.js";import"./react-vendor-Doq3cs5j.js";import"./ui-vendor-CWS4gctQ.js";import"./HomeAgentStudioBootstrap-qh_eoPs-.js";import"./Home-C0lDSbH4.js";import"./app-framework-CaGRIFD9.js";function j(e){return e.replace(/\r/g,"").split(`
+import{b as y,c as p}from"./HomeAgentStudio-Dr1SOu7a.js";import{i as g}from"./index-f1CHzbUQ.js";import"./mermaid-vendor-D2dcGC_6.js";import"./react-vendor-Doq3cs5j.js";import"./ui-vendor-CWS4gctQ.js";import"./HomeAgentStudioBootstrap-BHn2cndP.js";import"./Home-C0F4QZ08.js";import"./app-framework-CaGRIFD9.js";function j(e){return e.replace(/\r/g,"").split(`
 `).map(t=>t.trimEnd()).join(`
 `).trim()}function $(e){return Array.isArray(e)?e.filter(t=>!!t&&typeof t=="object"&&"type"in t).filter(t=>t.type==="text"&&typeof t.text=="string").map(t=>{var r;return((r=t.text)==null?void 0:r.trim())??""}).filter(Boolean).join(`
 `).trim():""}function P(e){return e.map(t=>`${t.role==="user"?"用户":"Agent"}：${t.content.replace(/\s+/g," ").trim()}`).join(`

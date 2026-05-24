@@ -701,7 +701,7 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
           </Card>
         </div>
 
-        <div className="space-y-2.5">
+        <div className="hidden">
           <h2 className={sectionTitleClass}>
             <FolderOpen className="h-4 w-4" />
             存储位置
@@ -751,7 +751,7 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
           </Card>
         </div>
 
-        <div className="space-y-2.5">
+        <div className="hidden">
           <h2 className={sectionTitleClass}>首帧图片压缩</h2>
           <Card className={cardClass}>
             <CardContent className={embedded ? "pt-5" : "pt-6"}>
@@ -785,7 +785,7 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
           </Card>
         </div>
 
-        <div className="space-y-2.5">
+        <div className="hidden">
           <h2 className={sectionTitleClass}>网络重试</h2>
           <Card className={cardClass}>
             <CardContent className={embedded ? "pt-5" : "pt-6"}>
@@ -819,7 +819,7 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
           </Card>
         </div>
 
-        <Card className={cn("bg-muted/50", embedded && "rounded-[20px] border border-border bg-muted/30 shadow-none")}>
+        <Card className={cn("hidden", "bg-muted/50", embedded && "rounded-[20px] border border-border bg-muted/30 shadow-none")}>
           <CardContent className={embedded ? "pt-5" : "pt-6"}>
             <h3 className={cn("mb-2", embeddedTitleTextClass)}>说明</h3>
             <ul className={cn("space-y-1.5 text-[12.5px] leading-5", embedded ? "text-slate-500" : "text-muted-foreground")}>
