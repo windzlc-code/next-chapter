@@ -539,7 +539,7 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
           </Card>
         </div>
 
-        <div className="hidden">
+        <div className="space-y-2.5">
           <h2 className={sectionTitleClass}>
             <Globe className="h-4 w-4" />
             API 设置
