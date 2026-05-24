@@ -46,9 +46,9 @@ let queuedPersistHandle: number | null = null;
 let queuedPersistNeedsFullBackup = false;
 const STORAGE_LEVELS = ["standard", "compact", "minimal"] as const;
 const PROJECT_SESSION_ENTRY_LIMITS = {
-  standard: 20,
-  compact: 10,
-  minimal: 5,
+  standard: 2000,
+  compact: 2000,
+  minimal: 2000,
 } as const;
 
 type StorageLevel = (typeof STORAGE_LEVELS)[number];
@@ -477,11 +477,11 @@ function scheduleQueuedSessionPersistence(delay = 120): void {
 function messageLimit(level: StorageLevel): { count: number; chars: number } {
   switch (level) {
     case "compact":
-      return { count: 100, chars: 1200 };
+      return { count: 2000, chars: 1200 };
     case "minimal":
-      return { count: 40, chars: 600 };
+      return { count: 2000, chars: 600 };
     default:
-      return { count: 180, chars: 3200 };
+      return { count: 2000, chars: 3200 };
   }
 }
 
@@ -1038,7 +1038,7 @@ function normalizeStudioSession(session: StudioSessionState | null): StudioSessi
   };
 }
 
-const BOOTSTRAP_MESSAGE_COUNT = 12;
+const BOOTSTRAP_MESSAGE_COUNT = 2000;
 const BOOTSTRAP_MESSAGE_CHARS = 900;
 const EMERGENCY_BOOTSTRAP_MESSAGE_COUNT = 4;
 const EMERGENCY_BOOTSTRAP_MESSAGE_CHARS = 280;

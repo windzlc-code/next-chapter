@@ -2,11 +2,14 @@ import * as React from "react";
 import { getAllTasks, type Task } from "@/lib/agent/tools/task-tools";
 import type { ConversationProjectSnapshot, StudioRuntimeState, StudioSessionState } from "@/lib/home-agent/types";
 import { hasSessionResetMarkerForProject } from "@/lib/home-agent/session-store";
-import { resolveSessionProjectIdForSnapshot } from "./home-agent-session-utils";
+import {
+  HOME_AGENT_HISTORY_DISPLAY_LIMIT,
+  resolveSessionProjectIdForSnapshot,
+} from "./home-agent-session-utils";
 
 const { useEffect, useRef } = React;
 const INITIAL_RECENT_PROJECTS_LIMIT = 24;
-const FULL_RECENT_PROJECTS_LIMIT = 160;
+const FULL_RECENT_PROJECTS_LIMIT = HOME_AGENT_HISTORY_DISPLAY_LIMIT;
 
 export function useHomeAgentBootstrapEffects(params: {
   runtime: StudioRuntimeState;

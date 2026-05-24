@@ -55,6 +55,7 @@ import {
   createInitialStudioSeed,
   didSessionScopedProjectSwitch,
   hasSavedSessionContent,
+  HOME_AGENT_HISTORY_DISPLAY_LIMIT,
   mergeRecentProjects,
   qStepKey,
   reconcileRecentProjectsWithStableOrder,
@@ -1198,7 +1199,7 @@ const ACTIVE =
   "继续补充目标、修改意见、素材条件或你想推进的下一步，整个生产都会在这一页完成。";
 const CUSTOM = "也可以跳过上方建议，直接输入你的自定义回答。";
 const TITLE = "InFinio-一站式智能体自动化平台";
-const HOME_RECENT_PROJECTS_LIMIT = 160;
+const HOME_RECENT_PROJECTS_LIMIT = HOME_AGENT_HISTORY_DISPLAY_LIMIT;
 const SIDEBAR_BRAND = "InFinio";
 const DESKTOP_SIDEBAR_WIDTH = 272;
 const DESKTOP_SIDEBAR_COLLAPSED_WIDTH = 80;

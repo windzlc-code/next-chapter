@@ -169,13 +169,13 @@ describe("session-store", () => {
     expect(bootstrap?.rawMessageCount).toBe(18);
     expect(bootstrap?.rawArtifactCount).toBe(7);
     expect(Array.isArray(bootstrap?.session?.messages)).toBe(true);
-    expect(bootstrap.session.messages).toHaveLength(12);
+    expect(bootstrap.session.messages).toHaveLength(18);
     expect(bootstrap.session.currentProjectSnapshot.artifacts).toHaveLength(4);
   });
 
   it("keeps a larger in-browser message window for the active and project-scoped session caches", () => {
     const session = createSession({
-      messages: Array.from({ length: 220 }, (_, index) => ({
+      messages: Array.from({ length: 2200 }, (_, index) => ({
         id: `assistant-${index}`,
         role: "assistant" as const,
         content: `History message ${index} ${"z".repeat(80)}`,
@@ -190,9 +190,9 @@ describe("session-store", () => {
 
     const storedSession = JSON.parse(localStorage.getItem(STUDIO_SESSION_KEY) ?? "null");
     const storedProjectSessions = JSON.parse(localStorage.getItem(STUDIO_PROJECT_SESSIONS_KEY) ?? "null");
-    expect(storedSession?.messages).toHaveLength(180);
-    expect(storedProjectSessions?.["project-1"]?.messages).toHaveLength(180);
-    expect(storedSession.messages[0]?.content).toContain("History message 40");
+    expect(storedSession?.messages).toHaveLength(2000);
+    expect(storedProjectSessions?.["project-1"]?.messages).toHaveLength(2000);
+    expect(storedSession.messages[0]?.content).toContain("History message 200");
   });
 
   it("keeps a compact asset manifest in the bootstrap cache for resource recovery", () => {
@@ -243,7 +243,7 @@ describe("session-store", () => {
 
   it("restores the startup seed from the bootstrap cache without parsing the full session payload", () => {
     const session = createSession({
-      messages: Array.from({ length: 16 }, (_, index) => ({
+      messages: Array.from({ length: 2205 }, (_, index) => ({
         id: `assistant-${index}`,
         role: "assistant" as const,
         content: `Long bootstrap message ${index} ${"y".repeat(240)}`,
@@ -261,7 +261,7 @@ describe("session-store", () => {
     const restored = readStudioSessionBootstrap();
 
     expect(restored.session?.projectId).toBe("project-1");
-    expect(restored.session?.messages).toHaveLength(12);
+    expect(restored.session?.messages).toHaveLength(2000);
     expect(restored.needsHydration).toBe(true);
   });
 

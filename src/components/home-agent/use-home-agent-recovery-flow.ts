@@ -40,7 +40,10 @@ import {
   normalizeWorkflowBoundAskUserQuestionRequest,
   resolveWorkflowBoundComposerQuestion,
 } from "./home-agent-ask-user-question-guard";
-import { resolvePendingWorkflowUploadKind } from "./home-agent-session-utils";
+import {
+  HOME_AGENT_HISTORY_DISPLAY_LIMIT,
+  resolvePendingWorkflowUploadKind,
+} from "./home-agent-session-utils";
 
 const { useCallback, useEffect, useRef, startTransition } = React;
 
@@ -553,7 +556,7 @@ export function useHomeAgentRecoveryFlow(params: {
         (item) => item.projectId === projectId,
       );
       if (shouldRefreshRecentProjects) {
-        void store.listRecentConversationSnapshots(160, { fast: true }).then((items) => {
+        void store.listRecentConversationSnapshots(HOME_AGENT_HISTORY_DISPLAY_LIMIT, { fast: true }).then((items) => {
           if (openProjectVersionRef.current !== openVersion) return;
           const filteredItems = items.filter(
             (item) => item.projectId && !hasSessionResetMarkerForProject(item.projectId),

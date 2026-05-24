@@ -33,9 +33,11 @@ vi.mock("@/lib/home-agent/launch-readiness", () => ({
 }));
 
 vi.mock("@/lib/home-agent/history-settings", () => ({
+  MIN_HISTORY_PROJECT_COUNT: 5,
+  MAX_HISTORY_PROJECT_COUNT: 2000,
   getHistorySettings: () => ({
-    autoDelete: true,
-    maxCount: 50,
+    autoDelete: false,
+    maxCount: 2000,
   }),
   saveHistorySettings: vi.fn(),
 }));

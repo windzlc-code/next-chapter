@@ -14,6 +14,7 @@ import type {
 } from "@/lib/home-agent/types";
 
 const STUDIO_PROJECT_SESSIONS_STORAGE_KEY = "storyforge-home-agent-project-sessions-v1";
+export const HOME_AGENT_HISTORY_DISPLAY_LIMIT = 2000;
 
 export function createInitialStudioSeed(): {
   session: StudioSessionState | null;
@@ -376,7 +377,7 @@ export function areRecentSessionsEquivalent(
 export function upsertRecentProjectSession(
   currentSessions: StudioSessionState[] | undefined,
   nextSession: StudioSessionState,
-  limit = 50,
+  limit = HOME_AGENT_HISTORY_DISPLAY_LIMIT,
 ): StudioSessionState[] {
   const baseSessions = currentSessions ?? [];
   const merged = [
@@ -394,7 +395,7 @@ export function upsertRecentProjectSession(
 export function mergeRecentProjects(
   currentProjects: ConversationProjectSnapshot[],
   nextProject: ConversationProjectSnapshot,
-  limit = 50,
+  limit = HOME_AGENT_HISTORY_DISPLAY_LIMIT,
 ): ConversationProjectSnapshot[] {
   const existingIndex = currentProjects.findIndex((item) => item.projectId === nextProject.projectId);
   const merged =
@@ -669,7 +670,7 @@ export function mergeRecentProjectsWithSessionSnapshots(params: {
     recentProjectSessions = [],
     currentProjectSnapshot = null,
     currentSessionProjectId = null,
-    limit = 50,
+    limit = HOME_AGENT_HISTORY_DISPLAY_LIMIT,
   } = params;
   const sessionSource = getRecentProjectSessionsWithStorageFallback(recentProjectSessions);
 

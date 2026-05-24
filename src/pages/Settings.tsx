@@ -44,7 +44,13 @@ import {
   type ApiConfig,
 } from "@/lib/api-config";
 import { readHomeAgentLaunchReadiness, type HomeAgentLaunchReadiness } from "@/lib/home-agent/launch-readiness";
-import { getHistorySettings, saveHistorySettings, type HistorySettings } from "@/lib/home-agent/history-settings";
+import {
+  getHistorySettings,
+  MAX_HISTORY_PROJECT_COUNT,
+  MIN_HISTORY_PROJECT_COUNT,
+  saveHistorySettings,
+  type HistorySettings,
+} from "@/lib/home-agent/history-settings";
 import { readStoredAutomationMode, writeStoredAutomationMode } from "@/lib/home-agent/automation-mode";
 import type { AutomationMode } from "@/lib/home-agent/types";
 import { cn } from "@/lib/utils";
@@ -705,17 +711,21 @@ export default function Settings({ embedded = false, onClose, onSaved }: Setting
                 <Label className={embeddedLabelTextClass}>最多保留项目数</Label>
                 <Input
                   type="number"
-                  min={5}
-                  max={200}
+                  min={MIN_HISTORY_PROJECT_COUNT}
+                  max={MAX_HISTORY_PROJECT_COUNT}
                   step={5}
                   value={historyCfg.maxCount}
                   onChange={(e) => {
                     const v = Number(e.target.value);
-                    if (v >= 5 && v <= 200) setHistoryCfg((prev) => ({ ...prev, maxCount: v }));
+                    if (v >= MIN_HISTORY_PROJECT_COUNT && v <= MAX_HISTORY_PROJECT_COUNT) {
+                      setHistoryCfg((prev) => ({ ...prev, maxCount: v }));
+                    }
                   }}
                   className={cn(compactInputClass, "mt-1 w-28")}
                 />
-                <p className={cn("mt-1", embeddedMutedTextClass)}>范围 5 – 200，默认 50。</p>
+                <p className={cn("mt-1", embeddedMutedTextClass)}>
+                  范围 {MIN_HISTORY_PROJECT_COUNT} - {MAX_HISTORY_PROJECT_COUNT}，默认 {MAX_HISTORY_PROJECT_COUNT}。
+                </p>
               </div>
             </CardContent>
           </Card>

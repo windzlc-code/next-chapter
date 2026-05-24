@@ -1084,8 +1084,8 @@ const ConversationMessageRow = memo(function ConversationMessageRow({
   );
 });
 
-const TIMELINE_INITIAL_VISIBLE = 80;
-const TIMELINE_LOAD_MORE_STEP = 80;
+const TIMELINE_INITIAL_VISIBLE = 2000;
+const TIMELINE_LOAD_MORE_STEP = 2000;
 const TIMELINE_AUTO_LOAD_TOP_THRESHOLD_PX = 120;
 
 function ArtifactPanelFallback() {

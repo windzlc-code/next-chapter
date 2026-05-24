@@ -3621,7 +3621,7 @@ export async function loadConversationSourceById(
 }
 
 export async function listRecentConversationSnapshots(
-  limit = 8,
+  limit = 2000,
   options?: { fast?: boolean },
 ): Promise<ConversationProjectSnapshot[]> {
   await cleanupResetMarkedConversationArchives();
