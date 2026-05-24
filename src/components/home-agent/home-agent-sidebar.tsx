@@ -2225,7 +2225,7 @@ const SidebarProjectHistory = memo(function SidebarProjectHistory({
         currentProjectSnapshot,
         currentSessionProjectId: currentProjectId,
       }),
-    [automationMode, currentProjectId, currentProjectSnapshot, recentProjectSessions, recentProjects],
+    [currentProjectId, currentProjectSnapshot, recentProjectSessions, recentProjects],
   );
   const [stableProjects, setStableProjects] = useState<ConversationProjectSnapshot[]>(displayProjects);
   const [isSelectMode, setIsSelectMode] = useState(false);
@@ -2233,21 +2233,22 @@ const SidebarProjectHistory = memo(function SidebarProjectHistory({
   const [bulkDeleteConfirmOpen, setBulkDeleteConfirmOpen] = useState(false);
   const [bulkDeletePending, setBulkDeletePending] = useState(false);
   const historySwitchSettleUntilRef = React.useRef(0);
+  const previousAutomationModeRef = React.useRef(automationMode);
   const previousCurrentProjectIdRef = React.useRef(
     typeof currentProjectId === "string" ? currentProjectId.trim() : "",
   );
   const normalizedCurrentProjectIdForRender =
     typeof currentProjectId === "string" ? currentProjectId.trim() : "";
-  if (previousCurrentProjectIdRef.current !== normalizedCurrentProjectIdForRender) {
+  const isAutomationModeSwitchRender = previousAutomationModeRef.current !== automationMode;
+  if (!isAutomationModeSwitchRender && previousCurrentProjectIdRef.current !== normalizedCurrentProjectIdForRender) {
     const settleUntil = Date.now() + 1800;
     historySwitchSettleUntilRef.current = settleUntil;
     writeGlobalHistorySwitchSettleUntil(settleUntil);
     previousCurrentProjectIdRef.current = normalizedCurrentProjectIdForRender;
   }
-  const historySwitchSettleUntil = Math.max(
-    historySwitchSettleUntilRef.current,
-    readGlobalHistorySwitchSettleUntil(),
-  );
+  const historySwitchSettleUntil = isAutomationModeSwitchRender
+    ? 0
+    : Math.max(historySwitchSettleUntilRef.current, readGlobalHistorySwitchSettleUntil());
   const [, setHistorySettleEpoch] = useState(0);
   const isHistorySwitchSettling = Date.now() < historySwitchSettleUntil;
   const stableHistoryContextSnapshot = isHistorySwitchSettling ? null : currentProjectSnapshot;
@@ -2260,6 +2261,15 @@ const SidebarProjectHistory = memo(function SidebarProjectHistory({
     }, delay);
     return () => window.clearTimeout(timer);
   }, [historySwitchSettleUntil, isHistorySwitchSettling]);
+
+  useEffect(() => {
+    if (!isAutomationModeSwitchRender) return;
+    previousAutomationModeRef.current = automationMode;
+    previousCurrentProjectIdRef.current = normalizedCurrentProjectIdForRender;
+    historySwitchSettleUntilRef.current = 0;
+    writeGlobalHistorySwitchSettleUntil(0);
+    setHistorySettleEpoch((value) => value + 1);
+  }, [automationMode, isAutomationModeSwitchRender, normalizedCurrentProjectIdForRender]);
 
   useEffect(() => {
     setIsSelectMode(false);
@@ -2370,6 +2380,10 @@ const SidebarProjectHistory = memo(function SidebarProjectHistory({
   const [stableVisibleProjects, setStableVisibleProjects] =
     useState<ConversationProjectSnapshot[]>(computedVisibleProjects);
   useEffect(() => {
+    if (isAutomationModeSwitchRender) {
+      setStableVisibleProjects(computedVisibleProjects);
+      return;
+    }
     if (Date.now() < Math.max(historySwitchSettleUntilRef.current, readGlobalHistorySwitchSettleUntil())) {
       return;
     }
@@ -2386,11 +2400,14 @@ const SidebarProjectHistory = memo(function SidebarProjectHistory({
             project.derivedStage === next.derivedStage &&
             project.updatedAt === next.updatedAt
           );
-        });
+      });
       return same ? prev : computedVisibleProjects;
     });
-  }, [computedVisibleProjects]);
-  const visibleProjects = isHistorySwitchSettling ? stableVisibleProjects : computedVisibleProjects;
+  }, [computedVisibleProjects, isAutomationModeSwitchRender]);
+  const visibleProjects =
+    isAutomationModeSwitchRender || !isHistorySwitchSettling
+      ? computedVisibleProjects
+      : stableVisibleProjects;
   const activeProjectIndex = useMemo(
     () => visibleProjects.findIndex((project) => project.projectId === currentProjectId),
     [currentProjectId, visibleProjects],

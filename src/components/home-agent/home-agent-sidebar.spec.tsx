@@ -885,6 +885,50 @@ describe("home-agent-sidebar incremental rendering", () => {
     expect(historySection).toHaveClass("flex", "h-full", "flex-col");
   });
 
+  it("refreshes the visible history immediately when automation mode changes during project switch settling", () => {
+    const manualProject = createProjectSnapshot(1, {
+      automationMode: "manual",
+      title: "Manual Project",
+    });
+    const fullAutoProject = createProjectSnapshot(2, {
+      automationMode: "full-auto",
+      title: "Full Auto Project",
+    });
+    const recentProjects = [manualProject, fullAutoProject];
+
+    const { rerender } = renderDesktopSidebar({
+      idle: true,
+      recentProjects,
+      currentProjectId: manualProject.projectId,
+      currentProjectSnapshot: manualProject,
+      automationMode: "manual",
+    });
+
+    expect(readHistoryOrder()).toEqual([manualProject.projectId]);
+
+    rerender(
+      createDesktopSidebarElement({
+        idle: true,
+        recentProjects,
+        currentProjectId: fullAutoProject.projectId,
+        currentProjectSnapshot: fullAutoProject,
+        automationMode: "manual",
+      }),
+    );
+
+    rerender(
+      createDesktopSidebarElement({
+        idle: true,
+        recentProjects,
+        currentProjectId: fullAutoProject.projectId,
+        currentProjectSnapshot: fullAutoProject,
+        automationMode: "full-auto",
+      }),
+    );
+
+    expect(readHistoryOrder()).toEqual([fullAutoProject.projectId]);
+  });
+
   it("shows extraction progress and completion hints on the matching segment video row", async () => {
     const refreshSpy = vi.fn();
     renderDesktopSidebar({
