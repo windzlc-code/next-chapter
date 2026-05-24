@@ -22,7 +22,7 @@ import type { VideoGenerationPrefs, VideoImageGenerationPrefs } from "@/types/pr
 import { cn } from "@/lib/utils";
 import { buildToolbarPopoverPosition } from "./home-agent-toolbar-popover";
 
-const { memo, useEffect, useMemo, useRef, useState } = React;
+const { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } = React;
 
 const PANEL_WIDTH = 380;
 const PANEL_HEIGHT = 560;
@@ -99,6 +99,7 @@ export const HomeImageSettingsPopover = memo(function HomeImageSettingsPopover({
   onDevImageViewModeChange,
 }: HomeImageSettingsPopoverProps) {
   const [open, setOpen] = useState(false);
+  const [positionReady, setPositionReady] = useState(false);
   const [draft, setDraft] = useState<VideoImageGenerationPrefs>(() =>
     applyVideoImageViewModeConstraints(value),
   );
@@ -186,22 +187,22 @@ export const HomeImageSettingsPopover = memo(function HomeImageSettingsPopover({
   const effectiveVideoOutputLabel = `${getVideoGenerationResolutionLabel(normalizedVideoPrefs.resolution)} / ${effectiveAspectRatio}`;
   const previewVideoOutputLabel = effectiveVideoOutputLabel || videoOutputLabel;
 
-  useEffect(() => {
+  const updatePosition = () => {
+    setPosition(
+      buildPopupPosition(
+        shellRef.current?.getBoundingClientRect() ?? null,
+        panelRef.current?.getBoundingClientRect().height ?? PANEL_HEIGHT,
+      ),
+    );
+  };
+
+  useLayoutEffect(() => {
     if (!open) return;
 
     setDraft(applyVideoImageViewModeConstraints(value));
 
-    const updatePosition = () => {
-      const measuredHeight = panelRef.current?.getBoundingClientRect().height ?? PANEL_HEIGHT;
-      setPosition(
-        buildPopupPosition(
-          shellRef.current?.getBoundingClientRect() ?? null,
-          measuredHeight,
-        ),
-      );
-    };
-
     updatePosition();
+    setPositionReady(true);
     window.addEventListener("resize", updatePosition);
     window.addEventListener("scroll", updatePosition, true);
     return () => {
@@ -209,6 +210,12 @@ export const HomeImageSettingsPopover = memo(function HomeImageSettingsPopover({
       window.removeEventListener("scroll", updatePosition, true);
     };
   }, [open, value]);
+
+  useEffect(() => {
+    if (!open) {
+      setPositionReady(false);
+    }
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -232,7 +239,14 @@ export const HomeImageSettingsPopover = memo(function HomeImageSettingsPopover({
         aria-haspopup="dialog"
         aria-expanded={open}
         data-testid="home-image-settings-trigger"
-        onClick={() => setOpen((current) => !current)}
+        onClick={() => {
+          if (open) {
+            setOpen(false);
+            return;
+          }
+          setPositionReady(false);
+          setOpen(true);
+        }}
         className={cn(
           "inline-flex h-8 max-w-[min(30vw,144px)] items-center gap-1.5 rounded-full border px-2.5 text-[12px] transition sm:h-9",
           "border-border bg-muted/50 text-foreground hover:bg-muted",
@@ -256,7 +270,10 @@ export const HomeImageSettingsPopover = memo(function HomeImageSettingsPopover({
                 "fixed z-[73] max-h-[min(82vh,600px)] w-[280px] overflow-y-auto rounded-[24px] border p-1.5 shadow-[0_16px_48px_rgba(0,0,0,0.28)] backdrop-blur-md",
                 "border-border bg-card text-foreground",
               )}
-              style={position}
+              style={{
+                ...position,
+                visibility: positionReady ? "visible" : "hidden",
+              }}
             >
               <div className="space-y-2.5">
                 <div className="px-2.5 pb-0 pt-1 text-muted-foreground">

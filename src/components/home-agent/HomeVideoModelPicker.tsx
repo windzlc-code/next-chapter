@@ -11,7 +11,7 @@ import type { VideoGenerationResolution } from "@/types/project";
 import { cn } from "@/lib/utils";
 import { buildToolbarPopoverPosition } from "./home-agent-toolbar-popover";
 
-const { memo, useEffect, useMemo, useRef, useState } = React;
+const { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } = React;
 
 const PANEL_WIDTH = 288;
 const PANEL_HEIGHT = 356;
@@ -44,6 +44,7 @@ export const HomeVideoModelPicker = memo(function HomeVideoModelPicker({
   onSelectResolution,
 }: HomeVideoModelPickerProps) {
   const [open, setOpen] = useState(false);
+  const [positionReady, setPositionReady] = useState(false);
   const [position, setPosition] = useState<React.CSSProperties>(() => buildPopupPosition(null));
   const shellRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
@@ -54,21 +55,28 @@ export const HomeVideoModelPicker = memo(function HomeVideoModelPicker({
   );
   const resolutions = useMemo(() => listHomeAgentVideoResolutions(), []);
 
-  useEffect(() => {
+  const updatePosition = () => {
+    const measuredHeight = panelRef.current?.getBoundingClientRect().height ?? PANEL_HEIGHT;
+    setPosition(buildPopupPosition(shellRef.current?.getBoundingClientRect() ?? null, measuredHeight));
+  };
+
+  useLayoutEffect(() => {
     if (!open) return;
 
-    const updatePosition = () => {
-      const measuredHeight = panelRef.current?.getBoundingClientRect().height ?? PANEL_HEIGHT;
-      setPosition(buildPopupPosition(shellRef.current?.getBoundingClientRect() ?? null, measuredHeight));
-    };
-
     updatePosition();
+    setPositionReady(true);
     window.addEventListener("resize", updatePosition);
     window.addEventListener("scroll", updatePosition, true);
     return () => {
       window.removeEventListener("resize", updatePosition);
       window.removeEventListener("scroll", updatePosition, true);
     };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) {
+      setPositionReady(false);
+    }
   }, [open]);
 
   useEffect(() => {
@@ -93,7 +101,14 @@ export const HomeVideoModelPicker = memo(function HomeVideoModelPicker({
         aria-haspopup="dialog"
         aria-expanded={open}
         data-testid="home-video-model-picker-trigger"
-        onClick={() => setOpen((current) => !current)}
+        onClick={() => {
+          if (open) {
+            setOpen(false);
+            return;
+          }
+          setPositionReady(false);
+          setOpen(true);
+        }}
         className={cn(
           "inline-flex h-8 max-w-[min(34vw,168px)] items-center gap-1.5 rounded-full border px-2.5 text-[12px] transition sm:h-9",
           "border-border bg-muted/50 text-foreground hover:bg-muted",
@@ -114,7 +129,10 @@ export const HomeVideoModelPicker = memo(function HomeVideoModelPicker({
                 "fixed z-[74] w-[240px] overflow-hidden rounded-[24px] border p-1.5 shadow-[0_16px_48px_rgba(0,0,0,0.28)] backdrop-blur-md",
                 "border-border bg-card text-foreground",
               )}
-              style={position}
+              style={{
+                ...position,
+                visibility: positionReady ? "visible" : "hidden",
+              }}
             >
               <div className="px-2.5 pb-1.5 pt-1 text-muted-foreground">
                 <div className="text-[10px] uppercase tracking-[0.2em]">Video</div>

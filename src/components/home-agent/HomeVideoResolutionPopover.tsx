@@ -12,7 +12,7 @@ import type { VideoGenerationPrefs } from "@/types/project";
 import { cn } from "@/lib/utils";
 import { buildToolbarPopoverPosition } from "./home-agent-toolbar-popover";
 
-const { memo, useEffect, useMemo, useRef, useState } = React;
+const { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } = React;
 
 const PANEL_WIDTH = 320;
 const PANEL_HEIGHT = 248;
@@ -50,14 +50,14 @@ export const HomeVideoResolutionPopover = memo(function HomeVideoResolutionPopov
     [draft.modelKey],
   );
 
-  useEffect(() => {
+  const updatePosition = () => {
+    setPosition(buildPopupPosition(shellRef.current?.getBoundingClientRect() ?? null));
+  };
+
+  useLayoutEffect(() => {
     if (!open) return;
 
     setDraft(normalizeVideoGenerationPrefs(value));
-
-    const updatePosition = () => {
-      setPosition(buildPopupPosition(shellRef.current?.getBoundingClientRect() ?? null));
-    };
 
     updatePosition();
     window.addEventListener("resize", updatePosition);
@@ -90,7 +90,14 @@ export const HomeVideoResolutionPopover = memo(function HomeVideoResolutionPopov
         aria-haspopup="dialog"
         aria-expanded={open}
         data-testid="home-video-resolution-trigger"
-        onClick={() => setOpen((current) => !current)}
+        onClick={() => {
+          if (open) {
+            setOpen(false);
+            return;
+          }
+          updatePosition();
+          setOpen(true);
+        }}
         className={cn(
           "inline-flex h-9 max-w-[min(30vw,128px)] items-center gap-2 rounded-full border px-3 text-[12px] transition sm:h-10",
           activeTheme

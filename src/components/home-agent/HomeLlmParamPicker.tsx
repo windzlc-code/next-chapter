@@ -5,7 +5,7 @@ import { LLM_PARAM_PRESETS, type LlmParamPreset } from "@/lib/home-agent/llm-par
 import { cn } from "@/lib/utils";
 import { buildToolbarPopoverPosition } from "./home-agent-toolbar-popover";
 
-const { memo, useEffect, useRef, useState } = React;
+const { memo, useEffect, useLayoutEffect, useRef, useState } = React;
 
 const PANEL_WIDTH = 260;
 const PANEL_HEIGHT = LLM_PARAM_PRESETS.length * 72 + 80;
@@ -29,6 +29,7 @@ export const HomeLlmParamPicker = memo(function HomeLlmParamPicker({
   onSelect,
 }: HomeLlmParamPickerProps) {
   const [open, setOpen] = useState(false);
+  const [positionReady, setPositionReady] = useState(false);
   const [position, setPosition] = useState<React.CSSProperties>(() => buildPopupPosition(null));
   const shellRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
@@ -36,21 +37,28 @@ export const HomeLlmParamPicker = memo(function HomeLlmParamPicker({
   const selectedPreset: LlmParamPreset =
     LLM_PARAM_PRESETS.find((p) => p.key === selectedKey) ?? LLM_PARAM_PRESETS[1];
 
-  useEffect(() => {
+  const updatePosition = () => {
+    const anchorRect = shellRef.current?.getBoundingClientRect() ?? null;
+    setPosition(buildPopupPosition(anchorRect));
+  };
+
+  useLayoutEffect(() => {
     if (!open) return;
 
-    const updatePosition = () => {
-      const anchorRect = shellRef.current?.getBoundingClientRect() ?? null;
-      setPosition(buildPopupPosition(anchorRect));
-    };
-
     updatePosition();
+    setPositionReady(true);
     window.addEventListener("resize", updatePosition);
     window.addEventListener("scroll", updatePosition, true);
     return () => {
       window.removeEventListener("resize", updatePosition);
       window.removeEventListener("scroll", updatePosition, true);
     };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) {
+      setPositionReady(false);
+    }
   }, [open]);
 
   useEffect(() => {
@@ -72,7 +80,14 @@ export const HomeLlmParamPicker = memo(function HomeLlmParamPicker({
         type="button"
         aria-haspopup="dialog"
         aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          if (open) {
+            setOpen(false);
+            return;
+          }
+          setPositionReady(false);
+          setOpen(true);
+        }}
         title={`LLM 参数：${selectedPreset.label}（temperature ${selectedPreset.temperature}，最大 ${selectedPreset.maxOutputTokens} tokens）`}
         className={cn(
           "inline-flex h-9 items-center gap-1.5 rounded-full border px-2.5 text-[12px] transition sm:h-10",
@@ -95,7 +110,11 @@ export const HomeLlmParamPicker = memo(function HomeLlmParamPicker({
                 "fixed z-[70] overflow-hidden rounded-[20px] border p-1.5 shadow-[0_16px_48px_rgba(0,0,0,0.28)] backdrop-blur-md",
                 "border-border bg-card text-foreground",
               )}
-              style={{ ...position, width: PANEL_WIDTH }}
+              style={{
+                ...position,
+                width: PANEL_WIDTH,
+                visibility: positionReady ? "visible" : "hidden",
+              }}
             >
               <div className="px-2.5 pb-1 pt-1">
                 <div className="text-[9.5px] uppercase tracking-[0.2em] text-muted-foreground">LLM 参数</div>

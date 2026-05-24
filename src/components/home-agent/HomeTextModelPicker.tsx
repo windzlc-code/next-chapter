@@ -4,7 +4,7 @@ import { createPortal } from "react-dom";
 import type { HomeAgentTextModelGroup } from "@/lib/home-agent/text-models";
 import { cn } from "@/lib/utils";
 
-const { memo, useEffect, useMemo, useRef, useState } = React;
+const { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } = React;
 
 type PopupPosition = {
   provider: React.CSSProperties;
@@ -85,6 +85,7 @@ export const HomeTextModelPicker = memo(function HomeTextModelPicker({
   onSelect,
 }: HomeTextModelPickerProps) {
   const [open, setOpen] = useState(false);
+  const [positionReady, setPositionReady] = useState(false);
   const [activeProvider, setActiveProvider] = useState<HomeAgentTextModelGroup["provider"] | null>(null);
   const [positions, setPositions] = useState<PopupPosition>(() => buildPopupPosition(null));
   const shellRef = useRef<HTMLDivElement | null>(null);
@@ -100,6 +101,11 @@ export const HomeTextModelPicker = memo(function HomeTextModelPicker({
     [activeProvider, groups, selectedGroup],
   );
 
+  const updatePosition = () => {
+    const anchorRect = shellRef.current?.getBoundingClientRect() ?? null;
+    setPositions(buildPopupPosition(anchorRect));
+  };
+
   const selectedSummary = useMemo(() => {
     if (!selectedGroup) return selectedLabel;
     const option = selectedGroup.options.find((item) => item.key === selectedKey);
@@ -111,21 +117,23 @@ export const HomeTextModelPicker = memo(function HomeTextModelPicker({
     setActiveProvider((current) => current ?? selectedGroup.provider);
   }, [open, selectedGroup]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) return;
 
-    const updatePosition = () => {
-      const anchorRect = shellRef.current?.getBoundingClientRect() ?? null;
-      setPositions(buildPopupPosition(anchorRect));
-    };
-
     updatePosition();
+    setPositionReady(true);
     window.addEventListener("resize", updatePosition);
     window.addEventListener("scroll", updatePosition, true);
     return () => {
       window.removeEventListener("resize", updatePosition);
       window.removeEventListener("scroll", updatePosition, true);
     };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) {
+      setPositionReady(false);
+    }
   }, [open]);
 
   useEffect(() => {
@@ -153,7 +161,14 @@ export const HomeTextModelPicker = memo(function HomeTextModelPicker({
         type="button"
         aria-haspopup="dialog"
         aria-expanded={open}
-        onClick={() => setOpen((current) => !current)}
+        onClick={() => {
+          if (open) {
+            setOpen(false);
+            return;
+          }
+          setPositionReady(false);
+          setOpen(true);
+        }}
         className={cn(
           "inline-flex h-8 max-w-[min(40vw,196px)] items-center gap-1.5 rounded-full border px-2.5 text-[12px] transition sm:h-9",
           "border-border bg-muted/50 text-foreground hover:bg-muted",
@@ -172,7 +187,10 @@ export const HomeTextModelPicker = memo(function HomeTextModelPicker({
                   "fixed z-[70] w-[224px] overflow-hidden rounded-[24px] border p-1.5 shadow-[0_16px_48px_rgba(0,0,0,0.28)] backdrop-blur-md",
                   "border-border bg-card text-foreground",
                 )}
-                style={positions.provider}
+                style={{
+                  ...positions.provider,
+                  visibility: positionReady ? "visible" : "hidden",
+                }}
               >
                 <div className="px-2.5 pb-1.5 pt-1 text-muted-foreground">
                   <div className="text-[10px] uppercase tracking-[0.2em]">供应商</div>
@@ -220,7 +238,10 @@ export const HomeTextModelPicker = memo(function HomeTextModelPicker({
                     "fixed z-[71] w-[282px] overflow-hidden rounded-[24px] border p-1.5 shadow-[0_16px_48px_rgba(0,0,0,0.28)] backdrop-blur-md",
                     "border-border bg-card text-foreground",
                   )}
-                  style={positions.models}
+                  style={{
+                    ...positions.models,
+                    visibility: positionReady ? "visible" : "hidden",
+                  }}
                 >
                   <div className="px-2.5 pb-1.5 pt-1 text-muted-foreground">
                     <div className="text-[10px] uppercase tracking-[0.2em]">{activeGroup.supplierLabel}</div>
